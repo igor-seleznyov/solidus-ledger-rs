@@ -1,0 +1,32 @@
+server:
+  bind-address: "127.0.0.1"
+  port: 9100
+
+workers:
+  count: 4
+  tcp-rb-capacity: 1024
+
+pipeline:
+  count: 1
+  incoming-rb-capacity: 32768
+  incoming-rb-batch-size: 64
+
+partitions:
+  count: 16
+  initial-accounts-count: 65536
+  partition-rb-capacity: 4096
+  partition-rb-batch-size: 64
+  accounts-assignment-overrides-path: "partitions-accounts-assignment-overrides.yaml"
+
+protocol:
+  metadata-size: 0
+
+batch-accept:
+  all-or-nothing: true
+  partial-reject-by-transfer-sequence-id: false
+
+decision-maker:
+  count: 1
+  transfer-hash-table-capacity: 16384
+  coordinator-rb-capacity: 65536
+  coordinator-rb-batch-size: 128

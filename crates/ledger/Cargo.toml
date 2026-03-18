@@ -1,0 +1,10 @@
+[package]
+name = "ledger"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "../common" }
+ringbuf = { path = "../ringbuf" }
+pipeline = { path = "../pipeline" }
+protocol = { path = "../protocol" }

@@ -1,0 +1,38 @@
+[package]
+name = "solidus-ledger-rs"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = [
+    "crates/common",
+    "crates/config",
+    "crates/ledger",
+    "crates/net",
+    "crates/pipeline",
+    "crates/protocol",
+    "crates/ringbuf",
+    "crates/integration_tests"
+]
+
+[workspace.dependencies]
+mio = { version = "1.1.1", features = ["os-poll", "net"]}
+libc = { version = "0.2.183" }
+uuid = { version = "1.22.0", features = ["serde"] }
+
+[dependencies]
+mio.workspace = true
+net = { path = "crates/net" }
+libc.workspace = true
+uuid.workspace = true
+protocol = { path = "crates/protocol" }
+common = { path = "crates/common" }
+config = { path = "crates/config" }
+pipeline = { path = "crates/pipeline" }
+ringbuf = { path = "crates/ringbuf" }
+ledger = { path = "crates/ledger" }
+integration_tests = { path = "crates/integration_tests" }
+
+[[bin]]
+name = "rust-start"
+path = "src/main.rs"

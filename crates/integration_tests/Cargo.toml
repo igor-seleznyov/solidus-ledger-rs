@@ -1,0 +1,15 @@
+[package]
+name = "integration_tests"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mio = { workspace = true }
+protocol = { path = "../protocol" }
+ringbuf = { path = "../ringbuf" }
+pipeline = { path = "../pipeline" }
+config = { path = "../config" }
+net = { path = "../net" }
+
+[dev-dependencies]
+ledger = { path = "../ledger" }
