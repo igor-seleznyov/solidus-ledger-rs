@@ -1,11 +1,11 @@
 [package]
-name = "ledger"
+name = "storage"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+libc.workspace = true
 common = { path = "../common" }
 ringbuf = { path = "../ringbuf" }
 pipeline = { path = "../pipeline" }
-protocol = { path = "../protocol" }
-storage = { path = "../storage" }
+io-uring.workspace = true

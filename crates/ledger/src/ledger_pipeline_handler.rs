@@ -51,6 +51,8 @@ impl PipelineHandler for LedgerPipelineHandler {
     ) {
         let amount = i64::from_be_bytes(slot.amount);
 
+        let currency = slot.currency;
+
         let (id_hi, id_lo) = raw_u128_to_u64(&slot.transfer_id);
 
         let shard_id = (id_lo as usize) & self.decision_maker_shard_mask;
@@ -68,6 +70,7 @@ impl PipelineHandler for LedgerPipelineHandler {
                 gsn,
                 slot.connection_id,
                 &slot.batch_id,
+                &slot.currency,
                 2, //TODO заглушка, без RuleEngine всегда 2
                 transfer_datetime,
                 &slot.transfer_sequence_id,

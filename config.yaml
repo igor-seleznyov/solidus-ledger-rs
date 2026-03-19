@@ -30,3 +30,10 @@ decision-maker:
   transfer-hash-table-capacity: 16384
   coordinator-rb-capacity: 65536
   coordinator-rb-batch-size: 128
+  flush-done-rb-capacity: 4096
+
+storage:
+  flush-timeout-ms: 2
+  flush-max-buffer-posting-records: 512
+  current-files-directory: "data/ls"
+  previous-files-directory: "data/ls"
