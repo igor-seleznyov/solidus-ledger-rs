@@ -6,3 +6,5 @@ pub mod pipeline_handler;
 pub mod transfer_hash_table_entry;
 pub mod transfer_slot;
 pub mod coordinator_slot;
+pub mod posting_record;
+pub mod in_flight_min_heap;

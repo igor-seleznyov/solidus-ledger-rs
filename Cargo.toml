@@ -12,6 +12,7 @@ members = [
     "crates/pipeline",
     "crates/protocol",
     "crates/ringbuf",
+    "crates/storage",
     "crates/integration_tests"
 ]
 
@@ -19,6 +20,7 @@ members = [
 mio = { version = "1.1.1", features = ["os-poll", "net"]}
 libc = { version = "0.2.183" }
 uuid = { version = "1.22.0", features = ["serde"] }
+io-uring = "0.7.11"
 
 [dependencies]
 mio.workspace = true
@@ -31,6 +33,7 @@ config = { path = "crates/config" }
 pipeline = { path = "crates/pipeline" }
 ringbuf = { path = "crates/ringbuf" }
 ledger = { path = "crates/ledger" }
+storage = { path = "crates/storage" }
 integration_tests = { path = "crates/integration_tests" }
 
 [[bin]]

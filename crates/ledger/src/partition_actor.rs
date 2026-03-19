@@ -206,7 +206,23 @@ mod tests {
 
     static mut TEST_PVT_TAIL: u64 = 0;
 
-    fn account_id(val: u64) -> [u8; 16] {
+/*    fn make_partition_slot(
+        account_id: [u8; 16],
+        amount: i64,
+        entry_type: u8,
+        gsn: u64,
+    ) -> PartitionSlot {
+        let mut slot = PartitionSlot::zeroed();
+        slot.account_id = account_id;
+        slot.amount = amount;
+        slot.entry_type = entry_type;
+        slot.msg_type = MSG_TYPE_PREPARE;
+        slot.gsn = gsn;
+        slot.transfer_id = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        slot
+    }
+
+*/    fn account_id(val: u64) -> [u8; 16] {
         let mut id = [0u8; 16];
         id[8..16].copy_from_slice(&val.to_be_bytes());
         id
@@ -312,6 +328,7 @@ mod tests {
         let partition_accounts_hash_table = PartitionAccountsHashTable::new(64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1).unwrap();
         let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
 
+        // Предварительно создаём аккаунт с балансом
         unsafe {
             let account = actor.partition_accounts_hash_table.get_or_create(0, 1);
             (*account).balance = 1000;
@@ -339,6 +356,7 @@ mod tests {
             (*account).balance = 1000;
         }
 
+        // Три DEBIT подряд
         actor.handle_prepare(&make_partition_slot(account_id(1), 300, ENTRY_TYPE_DEBIT, 1));
         actor.handle_prepare(&make_partition_slot(account_id(1), 400, ENTRY_TYPE_DEBIT, 2));
         // effective = 1000 - 300 - 400 = 300, DEBIT 300 → ОК
@@ -369,8 +387,8 @@ mod tests {
 
         unsafe {
             let account = actor.partition_accounts_hash_table.lookup(0, 1).unwrap();
-            assert_eq!((*account).staged_outcome, 50);
-            assert_eq!((*account).last_gsn, 1);
+            assert_eq!((*account).staged_outcome, 50); // только первый DEBIT
+            assert_eq!((*account).last_gsn, 1); // gsn не обновился при reject
         }
     }
 
@@ -380,6 +398,7 @@ mod tests {
         let partition_accounts_hash_table = PartitionAccountsHashTable::new(64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1).unwrap();
         let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
 
+        // Аккаунт с нулевым балансом
         // CREDIT 500 → staged_income = 500
         actor.handle_prepare(&make_partition_slot(account_id(1), 500, ENTRY_TYPE_CREDIT, 1));
 
@@ -438,6 +457,8 @@ mod tests {
 
         slot.msg_type = MSG_TYPE_ROLLBACK;
         actor.dispatch(&slot);
+
+        // Не упали — OK
     }
 
     #[test]
@@ -463,7 +484,7 @@ mod tests {
     fn prepare_fail_sends_coordinator_message() {
         let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
 
-        // Balance 0, DEBIT 500 → reject
+        // Баланс 0, DEBIT 500 → reject
         let slot = make_partition_slot(account_id(1), 500, ENTRY_TYPE_DEBIT, 1);
         actor.handle_prepare(&slot);
 
@@ -517,8 +538,8 @@ mod tests {
 
         unsafe {
             let account = actor.partition_accounts_hash_table.lookup(0, 1).unwrap();
-            assert_eq!((*account).balance, 700);
-            assert_eq!((*account).staged_income, 0);
+            assert_eq!((*account).balance, 700);        // 500 + 200
+            assert_eq!((*account).staged_income, 0);    // 200 - 200
             assert_eq!((*account).ordinal, 1);
         }
 
@@ -543,9 +564,9 @@ mod tests {
 
         unsafe {
             let account = actor.partition_accounts_hash_table.lookup(0, 1).unwrap();
-            assert_eq!((*account).balance, 1000);
-            assert_eq!((*account).staged_outcome, 0);
-            assert_eq!((*account).ordinal, 0);
+            assert_eq!((*account).balance, 1000);       // не изменился
+            assert_eq!((*account).staged_outcome, 0);   // 300 - 300
+            assert_eq!((*account).ordinal, 0);          // не увеличился
         }
 
         let batch = coordinator_rbs[0].drain_batch(64);
@@ -657,6 +678,7 @@ mod tests {
         let slot = make_commit_slot(account_id(1), 300, ENTRY_TYPE_DEBIT, 42);
         actor.handle_commit(&slot);
 
+        // PVT содержит версию: gsn=42, balance=700
         unsafe {
             let balance = actor.partition_version_table.read_balance(0, 1, 42);
             assert_eq!(balance, Some(700));
