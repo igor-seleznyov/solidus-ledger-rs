@@ -180,7 +180,7 @@ impl DecisionMaker {
                 "[decision-maker {}] COMMITTED gsn={}, entries={}",
                 self.id, (*slot).gsn, entries_count,
             );
-            // TODO После LS flush (шаг 8) — THT remove + response клиенту
+            // После LS flush (шаг 8) — THT remove + response клиенту
             // Пока удаляем сразу (заглушка):
             self.transfer_hash_table.remove(transfer_hash_table_offset);
             return;
@@ -251,6 +251,12 @@ mod tests {
         id
     }
 
+    fn currency() -> [u8; 16] {
+        let mut currency = [0u8; 16];
+        currency[..3].copy_from_slice(b"EUR");
+        currency
+    }
+
     fn make_entry(acc_lo: u64, amount: i64, partition: u32, etype: u8) -> TransferHashTableEntry {
         TransferHashTableEntry {
             account_id_hi: 0,
@@ -283,7 +289,7 @@ mod tests {
                 .collect();
 
         let tht_offset = unsafe {
-            let off = tht.insert(0, 1, 100, 7, &[0u8; 16], 2, 0, &[0u8; 16]);
+            let off = tht.insert(0, 1, 100, 7, &[0u8; 16], &currency(), 2, 0, &[0u8; 16]);
             tht.fill_entry(off, 0, &make_entry(10, 500, 0, ENTRY_TYPE_DEBIT));
             tht.fill_entry(off, 1, &make_entry(20, 500, 1, ENTRY_TYPE_CREDIT));
             tht.publish(off);
@@ -487,7 +493,6 @@ mod tests {
         assert_eq!(debit.gsn, 100);
         assert_eq!(debit.msg_type, MSG_TYPE_COMMIT);
         assert_eq!(debit.transfer_hash_table_offset, tht_offset);
-
         // account_id reconstructed from hi=0, lo=10
         assert_eq!(debit.account_id, account_id(10));
 
