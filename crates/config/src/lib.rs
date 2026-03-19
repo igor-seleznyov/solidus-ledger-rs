@@ -14,6 +14,7 @@ pub struct Config {
     pub protocol: ProtocolConfig,
     pub batch_accept: BatchAcceptConfig,
     pub decision_maker: DecisionMakerConfig,
+    pub storage: StorageConfig,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +70,16 @@ pub struct DecisionMakerConfig {
     pub transfer_hash_table_capacity: usize,
     pub coordinator_rb_capacity: usize,
     pub coordinator_rb_batch_size: usize,
+    pub flush_done_rb_capacity: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct StorageConfig {
+    pub flush_timeout_ms: u64,
+    pub flush_max_buffer_posting_records: usize,
+    pub current_files_directory: String,
+    pub previous_files_directory: String
 }
 
 impl Config {
@@ -107,6 +118,9 @@ impl Config {
         if self.decision_maker.coordinator_rb_batch_size > self.decision_maker.coordinator_rb_capacity {
             return Err("decision-maker.coordinator-rb-batch-size must be <= coordinator-rb-capacity".into());
         }
+        if !self.decision_maker.flush_done_rb_capacity.is_power_of_two() {
+            return Err("decision-maker.flush-done-rb-capacity must be a power of two".into());
+        }
         if self.pipeline.count == 0 {
             return Err("pipeline.count must be > 0".into());
         }
@@ -139,6 +153,18 @@ impl Config {
         }
         if self.pipeline.incoming_rb_batch_size > self.pipeline.incoming_rb_capacity {
             return Err("pipeline.incoming-rb-batch-size must be <= incoming-rb-capacity".into());
+        }
+        if self.storage.flush_timeout_ms == 0 {
+            return Err("storage.flush-timeout-ms must be > 0".into());
+        }
+        if self.storage.flush_max_buffer_posting_records == 0 {
+            return Err("storage.flush-max-buffer-posting-records must be > 0".into());
+        }
+        if self.storage.current_files_directory.is_empty() {
+            return Err("storage.current-files-directory must not be empty".into());
+        }
+        if self.storage.previous_files_directory.is_empty() {
+            return Err("storage.previous-files-directory must not be empty".into());
         }
         if let Some(ref path) = self.partitions.accounts_assignment_overrides_path {
             if path.is_empty() {
@@ -217,6 +243,12 @@ decision-maker:
   transfer-hash-table-capacity: 16384
   coordinator-rb-capacity: 65536
   coordinator-rb-batch-size: 128
+  flush-done-rb-capacity: 4096
+storage:
+  flush-timeout-ms: 2
+  flush-max-buffer-posting-records: 512
+  current-files-directory: \"data/ls\"
+  previous-files-directory: \"data/ls\"
  ";
 
     #[test]
@@ -237,7 +269,13 @@ decision-maker:
         assert_eq!(config.decision_maker.count, 1);
         assert_eq!(config.decision_maker.transfer_hash_table_capacity, 16384);
         assert_eq!(config.decision_maker.coordinator_rb_capacity, 65536);
-        assert_eq!(config.decision_maker.coordinator_rb_batch_size, 128);        assert!(config.batch_accept.all_or_nothing);
+        assert_eq!(config.decision_maker.coordinator_rb_batch_size, 128);
+        assert_eq!(config.decision_maker.flush_done_rb_capacity, 4096);
+        assert_eq!(config.storage.flush_timeout_ms, 2);
+        assert_eq!(config.storage.flush_max_buffer_posting_records, 512);
+        assert_eq!(config.storage.current_files_directory, "data/ls");
+        assert_eq!(config.storage.previous_files_directory, "data/ls");
+        assert!(config.batch_accept.all_or_nothing);
         assert!(!config.batch_accept.partial_reject_by_transfer_sequence_id);
     }
 

@@ -24,6 +24,7 @@ use ledger::partition_overrides::PartitionAssignmentsOverrides;
 use pipeline::partition_slot::PartitionSlot;
 use ledger::transfer_hash_table::TransferHashTable;
 use pipeline::pipeline::Pipeline;
+use ringbuf::arena::Arena;
 
 const PARTITION_SEED_K0: u64 = 0x0123456789ABCDEF;
 const PARTITION_SEED_K1: u64 = 0xFEDCBA9876543210;
@@ -37,6 +38,7 @@ struct FullTestServer {
     addr: String,
     pipeline_rb: Arc<MpscRingBuffer<IncomingSlot>>,
     transfer_hash_tables: Vec<Arc<TransferHashTable>>,
+    _pvt_tails_arena: Arena,
 }
 
 fn start_full_server(batch_accept: BatchAcceptConfig) -> FullTestServer {
@@ -144,6 +146,7 @@ fn start_full_server(batch_accept: BatchAcceptConfig) -> FullTestServer {
         addr,
         pipeline_rb,
         transfer_hash_tables,
+        _pvt_tails_arena: pvt_tails_arena,
     }
 }
 

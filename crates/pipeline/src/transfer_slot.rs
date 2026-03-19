@@ -31,8 +31,9 @@ pub struct TransferSlot {
     pub created_at_ns: u64,
     pub transfer_datetime: u64,
     pub transfer_sequence_id: [u8; 16],
+    pub currency: [u8; 16],
     pub metadata_slot: u32,
-    pub _pad2: [u8; 28],
+    pub _pad2: [u8; 12],
 
     pub entries: [TransferHashTableEntry; INLINE_ENTRIES],
 }
@@ -103,7 +104,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(TransferSlot, created_at_ns), 64);
         assert_eq!(std::mem::offset_of!(TransferSlot, transfer_datetime), 72);
         assert_eq!(std::mem::offset_of!(TransferSlot, transfer_sequence_id), 80);
-        assert_eq!(std::mem::offset_of!(TransferSlot, metadata_slot), 96);
+        assert_eq!(std::mem::offset_of!(TransferSlot, metadata_slot), 112);
         assert_eq!(std::mem::offset_of!(TransferSlot, entries), 128);
     }
 

@@ -15,6 +15,8 @@ use pipeline::pipeline::Pipeline;
 use pipeline::partition_slot::PartitionSlot;
 use pipeline::coordinator_slot::CoordinatorSlot;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
+use storage::io_uring_flush_backend::IoUringFlushBackend;
+use storage::portable_flush_backend::PortableFlushBackend;
 
 fn main() {
     let config = Config::load("config.yaml").expect("Failed to load config");
@@ -157,6 +159,10 @@ fn main() {
                 )
             ).collect();
 
+    let committed_gsn_arena = ringbuf::arena::Arena::new(64)
+        .expect("Failed to create committed gsn arena");
+    let global_committed_gsn: *mut u64 = committed_gsn_arena.as_ptr() as *mut u64;
+    
     let partition_version_table_arena = ringbuf::arena::Arena::new(partitions_count * 64)
         .expect("Failed to create partition version table arena");
     let partition_version_table_tails_base = partition_version_table_arena.as_ptr() as *mut u64;
@@ -220,6 +226,8 @@ fn main() {
             ).expect("Failed to spawn decision-maker thread");
     }
     println!("[main] {} decision maker threads started", decision_maker_shards);
+    
+    
 
     let mut queues = Vec::new();
 

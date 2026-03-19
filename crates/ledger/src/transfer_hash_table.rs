@@ -88,6 +88,7 @@ impl TransferHashTable {
         gsn: u64,
         connection_id: u64,
         batch_id: &[u8; 16],
+        currency: &[u8; 16],
         entries_count: u8,
         transfer_datetime: u64,
         transfer_sequence_id: &[u8; 16],
@@ -106,6 +107,7 @@ impl TransferHashTable {
         inserting.gsn = gsn;
         inserting.connection_id = connection_id;
         inserting.batch_id = *batch_id;
+        inserting.currency = *currency;
         inserting.transfer_datetime = transfer_datetime;
         inserting.transfer_sequence_id = *transfer_sequence_id;
         inserting.ready = 0;
@@ -343,6 +345,11 @@ mod tests {
     const K1: u64 = 0xFEDCBA9876543210;
 
     fn batch_id() -> [u8; 16] { [0u8; 16] }
+    fn currency() -> [u8; 16] { 
+        let mut buf = [0u8; 16];
+        buf[..3].copy_from_slice(b"EUR");
+        buf
+    }
     fn seq_id() -> [u8; 16] { [0u8; 16] }
 
     fn make_entry(acc_lo: u64, amount: i64, partition: u32, etype: u8) -> TransferHashTableEntry {
@@ -379,7 +386,7 @@ mod tests {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
 
         unsafe {
-            let offset = tht.insert(0, 1, 100, 7, &batch_id(), 2, 0, &seq_id());
+            let offset = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
             assert_eq!(tht.count(), 1);
 
             let slot = tht.slot_ptr(offset);
@@ -399,7 +406,7 @@ mod tests {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
 
         unsafe {
-            let offset = tht.insert(0, 1, 100, 7, &batch_id(), 2, 0, &seq_id());
+            let offset = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
 
             tht.fill_entry(offset, 0, &make_entry(10, -500, 0, 1));
             tht.fill_entry(offset, 1, &make_entry(20, 500, 1, 2));
@@ -420,7 +427,7 @@ mod tests {
         let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
 
         unsafe {
-            let offset = tht.insert(0, 1, 100, 7, &batch_id(), 10, 0, &seq_id());
+            let offset = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 10, 0, &seq_id());
 
             for i in 0..8 {
                 tht.fill_entry(offset, i, &make_entry(i as u64 + 10, 100, 0, 1));
@@ -449,8 +456,8 @@ mod tests {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
 
         unsafe {
-            let off1 = tht.insert(0, 1, 100, 7, &batch_id(), 2, 0, &seq_id());
-            let off2 = tht.insert(0, 1, 200, 8, &batch_id(), 2, 0, &seq_id());
+            let off1 = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
+            let off2 = tht.insert(0, 1, 200, 8, &batch_id(), &currency(), 2, 0, &seq_id());
 
             assert_eq!(off1, off2);
             assert_eq!(tht.count(), 1);
@@ -467,7 +474,7 @@ mod tests {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
 
         unsafe {
-            let offset = tht.insert(0, 1, 100, 7, &batch_id(), 2, 0, &seq_id());
+            let offset = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
             tht.remove(offset);
             assert_eq!(tht.count(), 0);
 
@@ -484,7 +491,7 @@ mod tests {
 
         unsafe {
             for i in 1..=10u64 {
-                let off = tht.insert(0, i, i * 100, 0, &batch_id(), 2, 0, &seq_id());
+                let off = tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
                 let slot = tht.slot_ptr(off);
                 assert_eq!((*slot).transfer_id_lo, i);
                 assert_eq!((*slot).gsn, i * 100);
@@ -499,13 +506,13 @@ mod tests {
 
         unsafe {
             for i in 1..=8u64 {
-                let off = tht.insert(0, i, i * 100, 0, &batch_id(), 10, 0, &seq_id());
+                let off = tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 10, 0, &seq_id());
                 tht.fill_overflow(off, 0, &make_entry(i * 10, i as i64 * 1000, 0, 1));
                 tht.publish(off);
             }
 
             for i in 1..=8u64 {
-                let off = tht.insert(0, i, 0, 0, &batch_id(), 0, 0, &seq_id()); // idempotent
+                let off = tht.insert(0, i, 0, 0, &batch_id(), &currency(), 0, 0, &seq_id()); // idempotent
                 let ovf = tht.overflow_ptr(off, 0);
                 assert_eq!(
                     (*ovf).account_id_lo, i * 10,
@@ -522,7 +529,7 @@ mod tests {
 
         unsafe {
             for i in 1..=192u64 {
-                tht.insert(0, i, i, 0, &batch_id(), 2, 0, &seq_id());
+                tht.insert(0, i, i, 0, &batch_id(), &currency(), 2, 0, &seq_id());
             }
         }
 
@@ -546,7 +553,7 @@ mod tests {
         unsafe {
             let mut offsets = Vec::new();
             for i in 1..=10u64 {
-                offsets.push(tht.insert(0, i, i * 100, 0, &batch_id(), 2, 0, &seq_id()));
+                offsets.push(tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 2, 0, &seq_id()));
             }
 
             tht.remove(offsets[4]);
@@ -554,7 +561,7 @@ mod tests {
 
             for i in 1..=10u64 {
                 if i == 5 { continue; }
-                let off = tht.insert(0, i, 0, 0, &batch_id(), 0, 0, &seq_id());
+                let off = tht.insert(0, i, 0, 0, &batch_id(), &currency(), 0, 0, &seq_id());
                 let slot = tht.slot_ptr(off);
                 assert_eq!((*slot).transfer_id_lo, i);
             }
@@ -569,7 +576,7 @@ mod tests {
         unsafe {
             let mut offsets = Vec::new();
             for i in 1..=10u64 {
-                offsets.push(tht.insert(0, i, i * 100, 0, &batch_id(), 2, 0, &seq_id()));
+                offsets.push(tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 2, 0, &seq_id()));
             }
             assert_eq!(tht.count(), 10);
 
@@ -586,7 +593,7 @@ mod tests {
 
         unsafe {
             for i in 1..=5u64 {
-                let off = tht.insert(0, i, i * 100, 0, &batch_id(), 10, 0, &seq_id());
+                let off = tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 10, 0, &seq_id());
                 for j in 0..8 {
                     tht.fill_entry(off, j, &make_entry(i * 100 + j as u64, 100, 0, 1));
                 }
@@ -596,7 +603,7 @@ mod tests {
             }
 
             for i in 6..=10u64 {
-                let off = tht.insert(0, i, i * 100, 0, &batch_id(), 2, 0, &seq_id());
+                let off = tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
                 tht.fill_entry(off, 0, &make_entry(i * 100, -200, 0, 1));
                 tht.fill_entry(off, 1, &make_entry(i * 100 + 1, 200, 1, 2));
                 tht.publish(off);
@@ -605,7 +612,7 @@ mod tests {
             assert_eq!(tht.count(), 10);
 
             for i in 1..=5u64 {
-                let off = tht.insert(0, i, 0, 0, &batch_id(), 0, 0, &seq_id());
+                let off = tht.insert(0, i, 0, 0, &batch_id(), &currency(), 0, 0, &seq_id());
                 let slot = tht.slot_ptr(off);
                 assert_eq!((*slot).entries_count, 10, "transfer {} entries_count", i);
 
@@ -624,7 +631,7 @@ mod tests {
             }
 
             for i in 6..=10u64 {
-                let off = tht.insert(0, i, 0, 0, &batch_id(), 0, 0, &seq_id());
+                let off = tht.insert(0, i, 0, 0, &batch_id(), &currency(), 0, 0, &seq_id());
                 let slot = tht.slot_ptr(off);
                 assert_eq!((*slot).entries_count, 2, "transfer {} entries_count", i);
                 assert_eq!((*slot).entries[0].amount, -200);
@@ -640,7 +647,7 @@ mod tests {
         unsafe {
             let mut offsets = Vec::new();
             for i in 1..=8u64 {
-                let off = tht.insert(0, i, i * 100, 0, &batch_id(), 10, 0, &seq_id());
+                let off = tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 10, 0, &seq_id());
                 tht.fill_overflow(off, 0, &make_entry(i * 10, i as i64 * 1000, 0, 1));
                 tht.publish(off);
                 offsets.push(off);
@@ -651,7 +658,7 @@ mod tests {
 
             for i in 1..=8u64 {
                 if i == 4 { continue; }
-                let off = tht.insert(0, i, 0, 0, &batch_id(), 0, 0, &seq_id());
+                let off = tht.insert(0, i, 0, 0, &batch_id(), &currency(), 0, 0, &seq_id());
                 let ovf = tht.overflow_ptr(off, 0);
                 assert_eq!(
                     (*ovf).account_id_lo, i * 10,
@@ -666,7 +673,7 @@ mod tests {
         let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
 
         unsafe {
-            let off = tht.insert(0, 1, 100, 0, &batch_id(), 8, 0, &seq_id());
+            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 8, 0, &seq_id());
             for i in 0..8 {
                 tht.fill_entry(off, i, &make_entry(i as u64 + 10, 100, 0, 1));
             }
@@ -682,7 +689,7 @@ mod tests {
         let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
 
         unsafe {
-            let off = tht.insert(0, 1, 100, 0, &batch_id(), 9, 0, &seq_id());
+            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 9, 0, &seq_id());
             for i in 0..8 {
                 tht.fill_entry(off, i, &make_entry(i as u64 + 10, 100, 0, 1));
             }
@@ -703,7 +710,7 @@ mod tests {
         let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
 
         unsafe {
-            let off = tht.insert(0, 1, 100, 0, &batch_id(), 10, 0, &seq_id());
+            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 10, 0, &seq_id());
             tht.fill_overflow(off, 0, &make_entry(99, 999, 0, 1));
             tht.publish(off);
 
@@ -720,12 +727,12 @@ mod tests {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
 
         unsafe {
-            let off1 = tht.insert(0, 1, 100, 0, &batch_id(), 2, 0, &seq_id());
+            let off1 = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
             tht.publish(off1);
             tht.remove(off1);
             assert_eq!(tht.count(), 0);
 
-            let off2 = tht.insert(0, 1, 200, 0, &batch_id(), 2, 0, &seq_id());
+            let off2 = tht.insert(0, 1, 200, 0, &batch_id(), &currency(), 2, 0, &seq_id());
             assert_eq!(tht.count(), 1);
 
             let slot = tht.slot_ptr(off2);
@@ -739,7 +746,7 @@ mod tests {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
 
         unsafe {
-            let off = tht.insert(0, 1, 100, 0, &batch_id(), 2, 0, &seq_id());
+            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
             tht.fill_entry(off, 0, &make_entry(10, -500, 0, 1));
 
             let slot = tht.slot_ptr(off);
@@ -753,7 +760,7 @@ mod tests {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
 
         unsafe {
-            let off = tht.insert(0, 1, 100, 0, &batch_id(), 2, 0, &seq_id());
+            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
             tht.fill_entry(off, 0, &make_entry(10, -500, 0, 1));
             tht.fill_entry(off, 1, &make_entry(20, 500, 1, 2));
 
@@ -772,7 +779,7 @@ mod tests {
         let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
 
         unsafe {
-            let off = tht.insert(0, 1, 100, 0, &batch_id(), 10, 0, &seq_id());
+            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 10, 0, &seq_id());
             for i in 0..8 {
                 tht.fill_entry(off, i, &make_entry(i as u64 + 10, 100, 0, 1));
             }
