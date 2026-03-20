@@ -1,4 +1,5 @@
 use common::siphash::siphash13;
+use ringbuf::hash_table_slot_status::{SLOT_FREE, SLOT_OCCUPIED};
 
 pub struct InFlightMinHeap {
     heap: Vec<u64>,
@@ -16,12 +17,13 @@ struct IndexSlot {
     gsn: u64,
     heap_pos: u32,
     psl: u8,
-    _pad: [u8; 3],
+    status: u8,
+    _pad: [u8; 2],
 }
 
 impl IndexSlot {
     fn zeroed() -> Self {
-        Self { gsn: 0, heap_pos: 0, psl: 0, _pad: [0; 3] }
+        Self { gsn: 0, heap_pos: 0, psl: 0, status: SLOT_FREE, _pad: [0; 2] }
     }
 }
 
@@ -144,12 +146,13 @@ impl InFlightMinHeap {
             gsn,
             heap_pos,
             psl: 1,
-            _pad: [0; 3],
+            status: SLOT_OCCUPIED,
+            _pad: [0; 2],
         };
 
         loop {
             let slot = &mut self.index_slots[pos];
-            if slot.psl == 0 {
+            if slot.status == SLOT_FREE {
                 *slot = inserting;
                 self.index_count += 1;
                 return;
@@ -170,7 +173,7 @@ impl InFlightMinHeap {
 
         loop {
             let slot = &self.index_slots[pos];
-            if slot.psl == 0 {
+            if slot.status == SLOT_FREE {
                 return None;
             }
             if slot.psl < psl {
@@ -190,7 +193,7 @@ impl InFlightMinHeap {
 
         loop {
             let slot = &mut self.index_slots[pos];
-            if slot.psl == 0 {
+            if slot.status == SLOT_FREE {
                 return;
             }
             if slot.psl < psl {
@@ -211,7 +214,7 @@ impl InFlightMinHeap {
 
         loop {
             let slot = &self.index_slots[pos];
-            if slot.psl == 0 {
+            if slot.status == SLOT_FREE {
                 return;
             }
             if slot.psl < psl {
@@ -233,7 +236,8 @@ impl InFlightMinHeap {
             self.index_slots[pos].psl -= 1;
             pos = next;
         }
-        self.index_slots[pos] = IndexSlot::zeroed();
+        self.index_slots[pos].status = SLOT_FREE;
+        self.index_slots[pos].psl = 0;
         self.index_count -= 1;
     }
 }

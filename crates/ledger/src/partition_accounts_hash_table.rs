@@ -1,6 +1,7 @@
 use crate::account_slot::AccountSlot;
 use common::siphash::siphash13;
 use ringbuf::arena::Arena;
+use ringbuf::hash_table_slot_status::{SLOT_FREE, SLOT_OCCUPIED};
 
 pub struct PartitionAccountsHashTable {
     #[allow(dead_code)]
@@ -56,6 +57,7 @@ impl PartitionAccountsHashTable {
         inserting.account_id_hi = id_hi;
         inserting.account_id_lo = id_lo;
         inserting.psl = 1;
+        inserting.status = SLOT_OCCUPIED;
 
         let mut result: *mut AccountSlot = std::ptr::null_mut();
 
@@ -63,8 +65,9 @@ impl PartitionAccountsHashTable {
             let slot = unsafe { self.slots.add(pos) };
 
             let slot_psl = unsafe { (*slot).psl };
+            let slot_status = unsafe { (*slot).status };
 
-            if slot_psl == 0 {
+            if slot_status == SLOT_FREE {
                 unsafe { std::ptr::write(slot, inserting); }
                 self.count += 1;
                 return if result.is_null() { slot } else { result };
@@ -100,8 +103,9 @@ impl PartitionAccountsHashTable {
             let slot = unsafe { self.slots.add(pos) };
 
             let slot_psl = unsafe { (*slot).psl };
+            let slot_status = unsafe { (*slot).status };
 
-            if slot_psl == 0 {
+            if slot_status == SLOT_FREE {
                 return None;
             }
 

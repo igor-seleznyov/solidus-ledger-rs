@@ -1,3 +1,5 @@
+use ringbuf::hash_table_slot_status::SLOT_FREE;
+
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct AccountSlot {
@@ -5,7 +7,8 @@ pub struct AccountSlot {
     pub account_id_hi: u64,
     pub account_id_lo: u64,
     pub psl: u8,
-    pub _pad1: [u8; 7],
+    pub status: u8,
+    pub _pad1: [u8; 6],
     pub balance: i64,
     pub staged_income: i64,
     pub staged_outcome: i64,
@@ -37,7 +40,7 @@ impl AccountSlot {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.psl == 0
+        self.status == SLOT_FREE
     }
 }
 

@@ -1,5 +1,6 @@
 use ringbuf::arena::Arena;
 use common::siphash::siphash13;
+use ringbuf::hash_table_slot_status::{SLOT_FREE, SLOT_OCCUPIED};
 use crate::partition_version_table_slot::PartitionVersionTableSlot;
 use crate::version_record::VersionRecord;
 
@@ -74,6 +75,7 @@ impl PartitionVersionTable {
         inserting.account_id_hi = id_hi;
         inserting.account_id_lo = id_lo;
         inserting.psl = 1;
+        inserting.status = SLOT_OCCUPIED;
 
         let mut result: *mut PartitionVersionTableSlot = std::ptr::null_mut();
 
@@ -81,8 +83,9 @@ impl PartitionVersionTable {
             let slot = unsafe { self.slots.add(pos) };
 
             let slot_psl = unsafe{ (*slot).psl };
+            let slot_status = unsafe { (*slot).status };
 
-            if slot_psl == 0 {
+            if slot_status == SLOT_FREE {
                 inserting.psl = psl;
                 unsafe {
                     std::ptr::write(slot, inserting);
@@ -370,8 +373,9 @@ impl PartitionVersionTable {
             let slot = unsafe { self.slots.add(pos) };
 
             let slot_psl = unsafe { (*slot).psl };
+            let slot_status = unsafe { (*slot).status };
 
-            if slot_psl == 0 {
+            if slot_status == SLOT_FREE {
                 return None;
             }
             if slot_psl < psl {
@@ -428,14 +432,19 @@ mod tests {
             pvt.record_version(0, 1, 200, 4500);
             pvt.record_version(0, 1, 300, 4000);
 
+            // committed_gsn=200 → balance at gsn=200
             assert_eq!(pvt.read_balance(0, 1, 200), Some(4500));
 
+            // committed_gsn=100 → balance at gsn=100
             assert_eq!(pvt.read_balance(0, 1, 100), Some(5000));
 
+            // committed_gsn=300 → balance at gsn=300
             assert_eq!(pvt.read_balance(0, 1, 300), Some(4000));
 
+            // committed_gsn=150 → balance at gsn=100 (последний <= 150)
             assert_eq!(pvt.read_balance(0, 1, 150), Some(5000));
 
+            // committed_gsn=50 → нет версий <= 50
             assert_eq!(pvt.read_balance(0, 1, 50), None);
         }
     }
