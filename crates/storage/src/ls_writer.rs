@@ -23,10 +23,15 @@ pub struct LsWriter<T: FlushBackend> {
     flush_done_rb: Arc<MpscRingBuffer<FlushDoneSlot>>,
     global_committed_gsn: *mut u64,
     backend: T,
+    ls_file_path: String,
+    max_ls_file_size: usize,
     in_flight_min_heap: InFlightMinHeap,
     batch_size: usize,
 
-    buffer: Vec<u8>,
+    buffer_arena: ringbuf::arena::Arena,
+    buffer_ptr: *mut u8,
+    buffer_len: usize,
+    buffer_capacity: usize,
     write_offset: u64,
 
     flush_timeout_ms: u64,
@@ -47,47 +52,55 @@ impl<T: FlushBackend> LsWriter<T> {
         ls_writer_rb: Arc<MpscRingBuffer<LsWriterSlot>>,
         flush_done_rb: Arc<MpscRingBuffer<FlushDoneSlot>>,
         global_committed_gsn: *mut u64,
-        mut backend: T,
-        ls_file_path: &str,
+        backend: T,
+        ls_file_path: String,
+        max_ls_file_size: usize,
         in_flight_min_heap_capacity: usize,
         in_flight_min_heap_seed_k0: u64,
         in_flight_min_heap_seed_k1: u64,
         batch_size: usize,
         flush_timeout_ms: u64,
         flush_max_buffer_posting_records: usize,
-    ) -> std::io::Result<LsWriter<T>> {
-        backend.open_ls_file(ls_file_path)?;
-
+    ) -> Self {
         let flush_max_buffer_bytes = flush_max_buffer_posting_records * PostingRecord::SIZE;
+        let buffer_capacity = (flush_max_buffer_bytes * 2 + 4095) & !4095;
+        let buffer_arena = ringbuf::arena::Arena::new(buffer_capacity)
+            .expect("Failed to create LS Writer buffer Arena");
+        let buffer_ptr = buffer_arena.as_ptr();
 
-        Ok(
-            Self {
-                id,
-                ls_writer_rb,
-                flush_done_rb,
-                global_committed_gsn,
-                backend,
-                in_flight_min_heap: InFlightMinHeap::new(
-                    in_flight_min_heap_capacity,
-                    in_flight_min_heap_seed_k0,
-                    in_flight_min_heap_seed_k1,
-                ),
-                batch_size,
-                buffer: Vec::with_capacity(flush_max_buffer_bytes * 2),
-                write_offset: 0, //TODO: read file size on recovery
-                flush_timeout_ms,
-                flush_max_buffer_size: flush_max_buffer_bytes,
-                pending_flush: Vec::with_capacity(256),
-                idle_count: 0,
-                last_flush: Instant::now(),
-                flush_in_flight: false,
-                flush_pending_records: Vec::with_capacity(256),
-                flush_buffer_snapshot_len: 0,
-            }
-        )
+        Self {
+            id,
+            ls_writer_rb,
+            flush_done_rb,
+            global_committed_gsn,
+            backend,
+            ls_file_path,
+            max_ls_file_size,
+            in_flight_min_heap: InFlightMinHeap::new(
+                in_flight_min_heap_capacity,
+                in_flight_min_heap_seed_k0,
+                in_flight_min_heap_seed_k1,
+            ),
+            batch_size,
+            buffer_arena,
+            buffer_ptr,
+            buffer_len: 0,
+            buffer_capacity,
+            write_offset: 0, //TODO: read file size on recovery
+            flush_timeout_ms,
+            flush_max_buffer_size: flush_max_buffer_bytes,
+            pending_flush: Vec::with_capacity(256),
+            idle_count: 0,
+            last_flush: Instant::now(),
+            flush_in_flight: false,
+            flush_pending_records: Vec::with_capacity(256),
+            flush_buffer_snapshot_len: 0,
+        }
     }
 
     pub fn run(&mut self) {
+        self.initialize();
+
         println!("[ls-writer {}] started", self.id);
 
         loop {
@@ -96,7 +109,7 @@ impl<T: FlushBackend> LsWriter<T> {
             if batch.is_empty() {
                 self.poll_and_handle_completions();
 
-                if !self.buffer.is_empty() && !self.flush_in_flight {
+                if self.buffer_len != 0 && !self.flush_in_flight {
                     self.idle_count += 1;
                     if self.idle_count >= CLOCK_CHECK_REPEATS_COUNT_INTERVAL {
                         if self.last_flush.elapsed().as_millis() >= self.flush_timeout_ms as u128 {
@@ -120,23 +133,29 @@ impl<T: FlushBackend> LsWriter<T> {
 
             self.poll_and_handle_completions();
 
-            if self.buffer.len() >= self.flush_max_buffer_size && !self.flush_in_flight {
+            if self.buffer_len >= self.flush_max_buffer_size && !self.flush_in_flight {
                 self.submit_flush();
             }
         }
     }
 
     pub fn submit_flush(&mut self) {
-        if self.buffer.is_empty() || self.flush_in_flight {
+        if self.buffer_len == 0 || self.flush_in_flight {
             return;
         }
 
+        let padded_len = (self.buffer_len + 4095) & !4095;
+
+        let data = unsafe {
+            std::slice::from_raw_parts(self.buffer_ptr, padded_len)
+        };
+
         self.backend
-            .submit_write_and_sync(&self.buffer, self.write_offset)
+            .submit_write_and_sync(data, self.write_offset)
             .expect("Failed to LS submit flush");
 
         self.flush_in_flight = true;
-        self.flush_buffer_snapshot_len = self.buffer.len();
+        self.flush_buffer_snapshot_len = self.buffer_len;
 
         self.flush_pending_records = std::mem::take(&mut self.pending_flush);
 
@@ -156,9 +175,30 @@ impl<T: FlushBackend> LsWriter<T> {
 
         assert!(completion.success, "LS flush failed");
 
-        self.write_offset += self.flush_buffer_snapshot_len as u64;
+        let padded_len = (self.flush_buffer_snapshot_len + 4095) & !4095;
+        self.write_offset += padded_len as u64;
 
-        self.buffer.drain(..self.flush_buffer_snapshot_len);
+        let remaining = self.buffer_len - self.flush_buffer_snapshot_len;
+        if remaining > 0 {
+            unsafe {
+                std::ptr::copy(
+                    self.buffer_ptr.add(self.flush_buffer_snapshot_len),
+                    self.buffer_ptr,
+                    remaining,
+                );
+            }
+        }
+        self.buffer_len = remaining;
+
+        if remaining < self.buffer_capacity {
+            unsafe {
+                std::ptr::write_bytes(
+                    self.buffer_ptr.add(remaining),
+                    0,
+                    self.flush_buffer_snapshot_len,
+                );
+            }
+        }
 
         for pending in self.flush_pending_records.drain(..) {
             self.in_flight_min_heap.remove(pending.gsn);
@@ -192,7 +232,14 @@ impl<T: FlushBackend> LsWriter<T> {
                         PostingRecord::SIZE,
                     )
                 };
-                self.buffer.extend_from_slice(posting_bytes);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        posting_bytes.as_ptr(),
+                        self.buffer_ptr.add(self.buffer_len),
+                        PostingRecord::SIZE,
+                    );
+                    self.buffer_len += PostingRecord::SIZE;
+                }
             }
             LS_MSG_FLUSH_MARKER => {
                 self.pending_flush.push(
@@ -206,6 +253,21 @@ impl<T: FlushBackend> LsWriter<T> {
             }
             _ => {}
         }
+    }
+
+    fn initialize(&mut self) {
+        self.backend
+            .open_ls_file(&self.ls_file_path)
+            .expect("Failed to open LS file");
+
+        self.backend
+            .fallocate(self.max_ls_file_size)
+            .expect("Failed to fallocate LS file");
+
+        println!(
+            "[ls-writer {}] initialized: file={}, max_size={}MB",
+            self.id, self.ls_file_path, self.max_ls_file_size / (1024 * 1024),
+        );
     }
 
     fn maybe_advance_committed_gsn(&self) {
@@ -258,6 +320,10 @@ mod tests {
             Ok(())
         }
 
+        fn fallocate(&mut self, size: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
         fn submit_write_and_sync(&mut self, data: &[u8], offset: u64) -> std::io::Result<()> {
             let len = data.len();
             self.written.push((data.to_vec(), offset));
@@ -275,7 +341,6 @@ mod tests {
         fn close(&mut self) {}
     }
 
-
     static mut TEST_COMMITTED_GSN: u64 = 0;
 
     fn make_writer() -> LsWriter<MockFlushBackend> {
@@ -289,19 +354,23 @@ mod tests {
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
 
-        LsWriter::new(
+        let mut writer = LsWriter::new(
             0,
             ls_writer_rb,
             flush_done_rb,
             committed_gsn_ptr,
             MockFlushBackend::new(),
-            "test.ls",
+            "test.ls".to_string(),
+            0,
             64,
-            K0, K1,
+            K0,
+            K1,
             64,
             2,
             512,
-        ).unwrap()
+        );
+        writer.initialize();
+        writer
     }
 
     fn make_writer_with_flush_done_rb() -> (
@@ -319,16 +388,20 @@ mod tests {
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
 
-        let writer = LsWriter::new(
+        let mut writer = LsWriter::new(
             0,
             ls_writer_rb,
             flush_done_rb,
             committed_gsn_ptr,
             MockFlushBackend::new(),
-            "test.ls",
-            64, K0, K1,
+            "test.ls".to_string(),
+            0,
+            64,
+            K0,
+            K1,
             64, 2, 512,
-        ).unwrap();
+        );
+        writer.initialize();
 
         (writer, flush_done_rb_clone)
     }
@@ -368,10 +441,9 @@ mod tests {
         slot
     }
 
-    // --- Tests
 
     #[test]
-    fn new_opens_file() {
+    fn initialize_opens_file() {
         let writer = make_writer();
         assert!(writer.backend.open_called);
     }
@@ -379,7 +451,7 @@ mod tests {
     #[test]
     fn new_initializes_empty_state() {
         let writer = make_writer();
-        assert_eq!(writer.buffer.len(), 0);
+        assert_eq!(writer.buffer_len, 0);
         assert_eq!(writer.write_offset, 0);
         assert!(!writer.flush_in_flight);
         assert_eq!(writer.flush_buffer_snapshot_len, 0);
@@ -416,7 +488,7 @@ mod tests {
 
         writer.process_message(&make_posting_slot(100, 500));
 
-        assert_eq!(writer.buffer.len(), PostingRecord::SIZE); // 128 байт
+        assert_eq!(writer.buffer_len, PostingRecord::SIZE);
     }
 
     #[test]
@@ -427,7 +499,7 @@ mod tests {
         writer.process_message(&make_posting_slot(200, 300));
         writer.process_message(&make_posting_slot(300, 100));
 
-        assert_eq!(writer.buffer.len(), PostingRecord::SIZE * 3); // 384 байт
+        assert_eq!(writer.buffer_len, PostingRecord::SIZE * 3); // 384 байт
     }
 
     #[test]
@@ -449,8 +521,9 @@ mod tests {
         writer.submit_flush();
 
         assert_eq!(writer.backend.written.len(), 1);
-        assert_eq!(writer.backend.written[0].0.len(), PostingRecord::SIZE);
-        assert_eq!(writer.backend.written[0].1, 0); // offset = 0 (первая запись)
+        assert_eq!(writer.backend.written[0].0.len() % 4096, 0);
+        assert!(writer.backend.written[0].0.len() >= PostingRecord::SIZE);
+        assert_eq!(writer.backend.written[0].1, 0);
     }
 
     #[test]
@@ -494,7 +567,6 @@ mod tests {
 
         writer.process_message(&make_posting_slot(100, 500));
         writer.submit_flush();
-
         writer.process_message(&make_posting_slot(200, 300));
         writer.submit_flush();
 
@@ -509,12 +581,12 @@ mod tests {
         writer.submit_flush();
 
         assert_eq!(writer.write_offset, 0);
-        assert_eq!(writer.buffer.len(), PostingRecord::SIZE);
+        assert_eq!(writer.buffer_len, PostingRecord::SIZE);
 
         writer.poll_and_handle_completions();
 
-        assert_eq!(writer.write_offset, PostingRecord::SIZE as u64);
-        assert_eq!(writer.buffer.len(), 0);
+        assert_eq!(writer.write_offset, 4096);
+        assert_eq!(writer.buffer_len, 0);
         assert!(!writer.flush_in_flight);
     }
 
@@ -607,13 +679,14 @@ mod tests {
         writer.submit_flush();
 
         assert_eq!(writer.backend.written.len(), 1);
-        assert_eq!(writer.backend.written[0].0.len(), PostingRecord::SIZE * 3);
+        assert_eq!(writer.backend.written[0].0.len() % 4096, 0);
+        assert!(writer.backend.written[0].0.len() >= PostingRecord::SIZE);
 
         writer.poll_and_handle_completions();
 
         assert!(writer.in_flight_min_heap.is_empty());
-        assert_eq!(writer.buffer.len(), 0);
-        assert_eq!(writer.write_offset, (PostingRecord::SIZE * 3) as u64);
+        assert_eq!(writer.buffer_len, 0);
+        assert_eq!(writer.write_offset, 4096);
     }
 
     #[test]
@@ -627,7 +700,7 @@ mod tests {
         writer.submit_flush();
         writer.poll_and_handle_completions();
 
-        assert_eq!(writer.write_offset, PostingRecord::SIZE as u64);
+        assert_eq!(writer.write_offset, 4096);
 
         writer.process_message(&make_add_to_heap_slot(200));
         writer.process_message(&make_posting_slot(200, 300));
@@ -636,11 +709,12 @@ mod tests {
         writer.submit_flush();
 
         assert_eq!(writer.backend.written.len(), 2);
-        assert_eq!(writer.backend.written[1].1, PostingRecord::SIZE as u64);
+        assert_eq!(writer.backend.written[0].0.len() % 4096, 0);
+        assert!(writer.backend.written[0].0.len() >= PostingRecord::SIZE);
 
         writer.poll_and_handle_completions();
 
-        assert_eq!(writer.write_offset, (PostingRecord::SIZE * 2) as u64);
+        assert_eq!(writer.write_offset, 8192);
     }
 
     #[test]
@@ -665,11 +739,11 @@ mod tests {
         writer.process_message(&make_posting_slot(200, 300));
         writer.process_message(&make_posting_slot(300, 100));
 
-        assert_eq!(writer.buffer.len(), PostingRecord::SIZE * 3);
+        assert_eq!(writer.buffer_len, PostingRecord::SIZE * 3);
 
         writer.poll_and_handle_completions();
 
-        assert_eq!(writer.buffer.len(), PostingRecord::SIZE * 2);
+        assert_eq!(writer.buffer_len, PostingRecord::SIZE * 2);
         assert!(!writer.flush_in_flight);
     }
 

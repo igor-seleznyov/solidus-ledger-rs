@@ -1,3 +1,4 @@
+use ringbuf::hash_table_slot_status::SLOT_FREE;
 use crate::version_record::VersionRecord;
 
 pub const INLINE_VERSIONS: usize = 8;
@@ -8,7 +9,8 @@ pub struct PartitionVersionTableSlot {
     pub account_id_hi: u64,
     pub account_id_lo: u64,
     pub psl: u8,
-    pub _pad: [u8; 3],
+    pub status: u8,
+    pub _pad: [u8; 2],
     pub count: u32,
     pub inline: [VersionRecord; INLINE_VERSIONS],
     pub overflow: u32,
@@ -23,7 +25,7 @@ impl PartitionVersionTableSlot {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.psl == 0
+        self.status == SLOT_FREE
     }
 }
 

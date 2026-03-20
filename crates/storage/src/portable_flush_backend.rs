@@ -40,6 +40,10 @@ impl FlushBackend for PortableFlushBackend {
         self.fd = fd;
         Ok(())
     }
+    
+    fn fallocate(&mut self, _size: usize) -> std::io::Result<()> {
+        Ok(())
+    }
 
     fn submit_write_and_sync(&mut self, data: &[u8], offset: u64) -> std::io::Result<()> {
         assert!(self.fd >= 0, "LS file not opened");
@@ -78,7 +82,7 @@ impl FlushBackend for PortableFlushBackend {
     fn poll_completion(&mut self) -> Option<FlushCompletion> {
         self.pending_completion.take()
     }
-    
+
     fn close(&mut self) {
         if self.fd >= 0 {
             unsafe { libc::close(self.fd) };

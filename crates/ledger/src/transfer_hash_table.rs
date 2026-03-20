@@ -5,6 +5,7 @@ use common::siphash::siphash13;
 use mem_barrier::release_store_u8;
 use pipeline::transfer_slot::TransferSlot;
 use pipeline::transfer_hash_table_entry::TransferHashTableEntry;
+use ringbuf::hash_table_slot_status::{SLOT_DELETED, SLOT_FREE, SLOT_OCCUPIED};
 
 pub struct TransferHashTable {
     #[allow(dead_code)]
@@ -116,6 +117,7 @@ impl TransferHashTable {
         inserting.rollback_success_count = 0;
         inserting.confirmed_count = 0;
         inserting.failed_count = 0;
+        inserting.status = SLOT_OCCUPIED;
 
         let mut inserting_overflow = [TransferHashTableEntry::zeroed(); 8];
 
@@ -124,8 +126,9 @@ impl TransferHashTable {
         loop {
             let slot = unsafe { self.slots.add(pos) };
             let slot_psl = unsafe { (*slot).psl };
+            let slot_status = unsafe { (*slot).status };
 
-            if slot_psl == 0 {
+            if slot_status == SLOT_FREE || slot_status == SLOT_DELETED {
                 inserting.psl = psl;
                 unsafe {
                     std::ptr::copy_nonoverlapping(&inserting, slot, 1);
@@ -156,7 +159,8 @@ impl TransferHashTable {
             let slot_transfer_id_hi = unsafe { (*slot).transfer_id_hi };
             let slot_transfer_id_lo = unsafe { (*slot).transfer_id_lo };
 
-            if slot_fingerprint == fp
+            if slot_status == SLOT_OCCUPIED
+                && slot_fingerprint == fp
                 && slot_transfer_id_hi == id_hi
                 && slot_transfer_id_lo == id_lo {
                 return pos as u32
@@ -172,8 +176,8 @@ impl TransferHashTable {
                 if self.overflow_per_slot > 0
                     && (slot_entries_count > 8 || inserting.entries_count > 8) {
                     unsafe {
-                    self.swap_overflow(pos, &mut inserting_overflow);
-                        }
+                        self.swap_overflow(pos, &mut inserting_overflow);
+                    }
                 }
 
                 psl = inserting.psl;
@@ -291,46 +295,11 @@ impl TransferHashTable {
     }
 
     pub unsafe fn remove(&self, offset: u32) {
-        let mut pos = offset as usize;
-
-        loop {
-            let next = (pos + 1) & self.mask;
-            let next_slot = unsafe { self.slots.add(next) };
-            let next_slot_psl = unsafe { (*next_slot).psl };
-
-            if next_slot_psl <= 1 {
-                break;
-            }
-
-            unsafe {
-                std::ptr::copy_nonoverlapping(next_slot, self.slots.add(pos), 1);
-                (*self.slots.add(pos)).psl -= 1;
-            }
-
-            let slot_entries_count = unsafe { (*self.slots.add(pos)).entries_count };
-
-            if self.overflow_per_slot > 0 && slot_entries_count > 8 {
-                let src = unsafe { self.overflow_base.add(next * self.overflow_per_slot) };
-                let dest = unsafe { self.overflow_base.add(pos * self.overflow_per_slot) };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src, dest, self.overflow_per_slot);
-                }
-            }
-
-            pos = next;
-        }
+        let slot = unsafe { self.slots.add(offset as usize) };
 
         unsafe {
-            std::ptr::write_bytes(self.slots.add(pos), 0, 1);
-        }
-        if self.overflow_per_slot > 0 {
-            let overflow_ptr = unsafe { self.overflow_base.add(pos * self.overflow_per_slot) };
-            unsafe {
-                std::ptr::write_bytes(overflow_ptr, 0, self.overflow_per_slot);
-            }
-        }
-
-        unsafe {
+            (*slot).status = SLOT_DELETED;
+            (*slot).ready = 0;
             *self.count.get() -= 1;
         }
     }
@@ -479,7 +448,7 @@ mod tests {
             assert_eq!(tht.count(), 0);
 
             let slot = tht.slot_ptr(offset);
-            assert_eq!((*slot).psl, 0);
+            assert_eq!((*slot).status, SLOT_DELETED);
         }
     }
 
@@ -544,29 +513,6 @@ mod tests {
         }
 
         assert!(max_psl < 20, "PSL too high: {}", max_psl);
-    }
-
-    #[test]
-    fn remove_with_backward_shift() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
-
-        unsafe {
-            let mut offsets = Vec::new();
-            for i in 1..=10u64 {
-                offsets.push(tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 2, 0, &seq_id()));
-            }
-
-            tht.remove(offsets[4]);
-            assert_eq!(tht.count(), 9);
-
-            for i in 1..=10u64 {
-                if i == 5 { continue; }
-                let off = tht.insert(0, i, 0, 0, &batch_id(), &currency(), 0, 0, &seq_id());
-                let slot = tht.slot_ptr(off);
-                assert_eq!((*slot).transfer_id_lo, i);
-            }
-            assert_eq!(tht.count(), 9);
-        }
     }
 
     #[test]
@@ -641,34 +587,6 @@ mod tests {
     }
 
     #[test]
-    fn remove_overflow_with_backward_shift() {
-        let tht = TransferHashTable::new(16, K0, K1, 12).unwrap();
-
-        unsafe {
-            let mut offsets = Vec::new();
-            for i in 1..=8u64 {
-                let off = tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 10, 0, &seq_id());
-                tht.fill_overflow(off, 0, &make_entry(i * 10, i as i64 * 1000, 0, 1));
-                tht.publish(off);
-                offsets.push(off);
-            }
-
-            tht.remove(offsets[3]);
-            assert_eq!(tht.count(), 7);
-
-            for i in 1..=8u64 {
-                if i == 4 { continue; }
-                let off = tht.insert(0, i, 0, 0, &batch_id(), &currency(), 0, 0, &seq_id());
-                let ovf = tht.overflow_ptr(off, 0);
-                assert_eq!(
-                    (*ovf).account_id_lo, i * 10,
-                    "overflow corrupted after remove for transfer {}", i,
-                );
-            }
-        }
-    }
-
-    #[test]
     fn exactly_8_entries_no_overflow() {
         let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
 
@@ -702,23 +620,6 @@ mod tests {
             let ovf = tht.overflow_ptr(off, 0);
             assert_eq!((*ovf).account_id_lo, 18);
             assert_eq!((*ovf).amount, 900);
-        }
-    }
-
-    #[test]
-    fn remove_clears_overflow() {
-        let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
-
-        unsafe {
-            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 10, 0, &seq_id());
-            tht.fill_overflow(off, 0, &make_entry(99, 999, 0, 1));
-            tht.publish(off);
-
-            tht.remove(off);
-
-            let ovf = tht.overflow_ptr(off, 0);
-            assert_eq!((*ovf).account_id_lo, 0);
-            assert_eq!((*ovf).amount, 0);
         }
     }
 
@@ -798,6 +699,44 @@ mod tests {
             let e9 = tht.get_entry(off, 9);
             assert_eq!(e9.account_id_lo, 19);
             assert_eq!(e9.amount, 300);
+        }
+    }
+
+    #[test]
+    fn remove_marks_as_deleted() {
+        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+
+        unsafe {
+            let offset = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
+            tht.publish(offset);
+            tht.remove(offset);
+
+            assert_eq!(tht.count(), 0);
+
+            let slot = tht.slot_ptr(offset);
+            assert_eq!((*slot).status, SLOT_DELETED);
+            assert_eq!((*slot).ready, 0);
+            assert!((*slot).psl > 0);
+        }
+    }
+
+    #[test]
+    fn insert_reuses_deleted_slot() {
+        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+
+        unsafe {
+            let off1 = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
+            tht.publish(off1);
+            tht.remove(off1);
+            assert_eq!(tht.count(), 0);
+
+            let off2 = tht.insert(0, 1, 200, 0, &batch_id(), &currency(), 2, 0, &seq_id());
+            assert_eq!(tht.count(), 1);
+            assert_eq!(off1, off2);
+
+            let slot = tht.slot_ptr(off2);
+            assert_eq!((*slot).gsn, 200);
+            assert_eq!((*slot).status, SLOT_OCCUPIED);
         }
     }
 }
