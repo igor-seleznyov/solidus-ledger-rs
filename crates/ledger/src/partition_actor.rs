@@ -12,6 +12,8 @@ use pipeline::partition_slot::{
 use crate::partition_accounts_hash_table::PartitionAccountsHashTable;
 use protocol::consts::{ REJECT_INSUFFICIENT_FUNDS, RESULT_SUCCESS };
 use common::mem_barrier::{release_store_u64, release_store_u8};
+use storage::ls_writer_slot::{LsWriterSlot, LS_MSG_POSTING};
+use crate::account_slot::AccountSlot;
 use crate::partition_version_table::PartitionVersionTable;
 
 pub struct PartitionActor {
@@ -21,6 +23,7 @@ pub struct PartitionActor {
     partition_version_table: PartitionVersionTable,
     coordinator_rbs: Vec<Arc<MpscRingBuffer<CoordinatorSlot>>>,
     partition_version_table_tail: *mut u64,
+    ls_writer_rbs: Vec<Arc<MpscRingBuffer<LsWriterSlot>>>,
     batch_size: usize,
 }
 
@@ -32,6 +35,7 @@ impl PartitionActor {
         partition_version_table: PartitionVersionTable,
         coordinator_rbs: Vec<Arc<MpscRingBuffer<CoordinatorSlot>>>,
         partition_version_table_tail: *mut u64,
+        ls_writer_rbs: Vec<Arc<MpscRingBuffer<LsWriterSlot>>>,
         batch_size: usize,
     ) -> Self {
         Self {
@@ -41,6 +45,7 @@ impl PartitionActor {
             partition_version_table,
             coordinator_rbs,
             partition_version_table_tail,
+            ls_writer_rbs,
             batch_size,
         }
     }
@@ -103,34 +108,38 @@ impl PartitionActor {
     fn handle_prepare(&mut self, slot: &PartitionSlot) {
         let (id_hi, id_lo) = raw_u128_to_u64(&slot.account_id);
 
-        unsafe {
-            let account = self.partition_accounts_hash_table.get_or_create(id_hi, id_lo);
-            
-            match slot.entry_type {
-                ENTRY_TYPE_DEBIT => {
-                    let effective = (*account).balance
+        let account = unsafe { self.partition_accounts_hash_table.get_or_create(id_hi, id_lo) };
+
+        match slot.entry_type {
+            ENTRY_TYPE_DEBIT => {
+                let effective = unsafe {
+                    (*account).balance
                         + (*account).staged_income
-                        - (*account).staged_outcome;
-                    
-                    if effective >= slot.amount {
+                        - (*account).staged_outcome
+                };
+
+                if effective >= slot.amount {
+                    unsafe {
                         (*account).staged_outcome += slot.amount;
                         (*account).last_gsn = slot.gsn;
-                        self.send_coordinator_response(slot, COORD_PREPARE_SUCCESS, RESULT_SUCCESS);
-                    } else {
-                        self.send_coordinator_response(slot, COORD_PREPARE_FAIL, REJECT_INSUFFICIENT_FUNDS);
                     }
+                    self.send_coordinator_response(slot, COORD_PREPARE_SUCCESS, RESULT_SUCCESS);
+                } else {
+                    self.send_coordinator_response(slot, COORD_PREPARE_FAIL, REJECT_INSUFFICIENT_FUNDS);
                 }
-                ENTRY_TYPE_CREDIT => {
+            }
+            ENTRY_TYPE_CREDIT => {
+                unsafe {
                     (*account).staged_income += slot.amount;
                     (*account).last_gsn = slot.gsn;
-                    self.send_coordinator_response(slot, COORD_PREPARE_SUCCESS, RESULT_SUCCESS);
                 }
-                _=> {
-                    println!(
-                        "[partition-actor {}] unknown entry_type={}, gsn={}",
-                        self.id, slot.entry_type, slot.gsn
-                    );
-                }
+                self.send_coordinator_response(slot, COORD_PREPARE_SUCCESS, RESULT_SUCCESS);
+            }
+            _ => {
+                println!(
+                    "[partition-actor {}] unknown entry_type={}, gsn={}",
+                    self.id, slot.entry_type, slot.gsn
+                );
             }
         }
     }
@@ -138,32 +147,44 @@ impl PartitionActor {
     fn handle_commit(&mut self, slot: &PartitionSlot) {
         let (id_hi, id_lo) = raw_u128_to_u64(&slot.account_id);
 
-        unsafe {
-            let account = self.partition_accounts_hash_table.get_or_create(id_hi, id_lo);
+        let account = unsafe { self.partition_accounts_hash_table.get_or_create(id_hi, id_lo) };
 
-            match slot.entry_type {
-                ENTRY_TYPE_DEBIT => {
+        match slot.entry_type {
+            ENTRY_TYPE_DEBIT => {
+                unsafe {
                     (*account).balance -= slot.amount;
                     (*account).staged_outcome -= slot.amount;
                 }
-                ENTRY_TYPE_CREDIT => {
+            }
+            ENTRY_TYPE_CREDIT => {
+                unsafe {
                     (*account).balance += slot.amount;
                     (*account).staged_income -= slot.amount;
                 }
-                _=> {}
             }
+            _ => {}
+        }
 
+        unsafe {
             (*account).ordinal += 1;
             (*account).last_gsn = slot.gsn;
-
-            let new_balance = (*account).balance;
-            self.partition_version_table.record_version(
-                id_hi, id_lo, slot.gsn, new_balance,
-            );
-
-            let tail = std::ptr::read(self.partition_version_table_tail);
-            release_store_u64(self.partition_version_table_tail, tail + 1);
         }
+
+        let new_balance = unsafe { (*account).balance };
+
+        unsafe {
+        self.partition_version_table.record_version(
+                id_hi, id_lo, slot.gsn, new_balance,
+            )
+        };
+
+        let tail = unsafe { std::ptr::read(self.partition_version_table_tail) };
+
+        unsafe {
+          release_store_u64(self.partition_version_table_tail, tail + 1);
+        };
+
+        self.send_posting_record(slot, account);
 
         self.send_coordinator_response(slot, COORD_COMMIT_SUCCESS, RESULT_SUCCESS);
     }
@@ -188,6 +209,41 @@ impl PartitionActor {
         }
 
         self.send_coordinator_response(slot, COORD_ROLLBACK_SUCCESS, RESULT_SUCCESS);
+    }
+
+    fn send_posting_record(&self, partition_slot: &PartitionSlot, account: *mut AccountSlot) {
+        let shard_id = partition_slot.shard_id as usize;
+        let mut claimed = self.ls_writer_rbs[shard_id].claim();
+        let ls_slot = claimed.as_mut();
+
+        ls_slot.msg_type = LS_MSG_POSTING;
+        ls_slot.gsn = partition_slot.gsn;
+
+        let (posting_transfer_id_hi, posting_transfer_id_lo) = raw_u128_to_u64(&partition_slot.transfer_id);
+        (ls_slot.posting.transfer_id_hi, ls_slot.posting.transfer_id_lo) = (posting_transfer_id_hi, posting_transfer_id_lo);
+
+        let (posting_account_id_hi, posting_account_id_lo) = raw_u128_to_u64(&partition_slot.account_id);
+        (ls_slot.posting.account_id_hi, ls_slot.posting.account_id_lo) = (posting_account_id_hi, posting_account_id_lo);
+
+        ls_slot.posting.gsn = partition_slot.gsn;
+        ls_slot.posting.amount = partition_slot.amount;
+        ls_slot.posting.entry_type = partition_slot.entry_type;
+        ls_slot.posting.sign = if partition_slot.entry_type == ENTRY_TYPE_DEBIT { -1 } else { 1 };
+
+        ls_slot.posting.ordinal = unsafe { (*account).ordinal };
+        ls_slot.posting.prev_posting_record_offset = unsafe { (*account).ls_offset };
+
+        ls_slot.posting.timestamp_ns = 0;// TODO: from THT
+        ls_slot.posting.transfer_sequence_id = [0u8; 16];// TODO: from THT
+        ls_slot.posting.currency = [0u8; 16];// TODO: from THT
+        ls_slot.posting.transfer_posting_records_count = 0;// TODO: from THT entries_count
+
+        unsafe {
+            ls_slot.posting.compute_checksum();
+        }
+
+        claimed.publish();
+
     }
 }
 
@@ -239,12 +295,21 @@ mod tests {
         let paht = PartitionAccountsHashTable::new(
             64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1,
         ).unwrap();
+        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
+        let ls_writer_rbs = vec![ls_writer_rb.clone()];
         let pvt = PartitionVersionTable::new(64, PARTITION_VERSION_TABLE_K0, PARTITION_VERSION_TABLE_K1).unwrap();
         unsafe { TEST_PVT_TAIL = 0; }
         let pvt_tail = unsafe { &raw mut TEST_PVT_TAIL };
 
         let actor = PartitionActor::new(
-            0, Arc::clone(&rb), paht, pvt, coordinator_rbs.clone(), pvt_tail, 64
+            0,
+            Arc::clone(&rb),
+            paht,
+            pvt,
+            coordinator_rbs.clone(),
+            pvt_tail,
+            ls_writer_rbs,
+            64
         );
         (actor, rb, coordinator_rbs)
     }

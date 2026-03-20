@@ -25,6 +25,8 @@ use pipeline::partition_slot::PartitionSlot;
 use ledger::transfer_hash_table::TransferHashTable;
 use pipeline::pipeline::Pipeline;
 use ringbuf::arena::Arena;
+use storage::flush_done_slot::FlushDoneSlot;
+use storage::ls_writer_slot::LsWriterSlot;
 
 const PARTITION_SEED_K0: u64 = 0x0123456789ABCDEF;
 const PARTITION_SEED_K1: u64 = 0xFEDCBA9876543210;
@@ -71,10 +73,21 @@ fn start_full_server(batch_accept: BatchAcceptConfig) -> FullTestServer {
     // Overrides
     let overrides = PartitionAssignmentsOverrides::empty();
 
+    let ls_writer_rbs: Vec<Arc<MpscRingBuffer<LsWriterSlot>>> = (0..dm_shards)
+        .map(|_| Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()))
+        .collect();
+
+    let flush_done_rbs: Vec<Arc<MpscRingBuffer<FlushDoneSlot>>> = (0..dm_shards)
+        .map(|_| Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()))
+        .collect();
+
+    let actor_ls_writer_rbs_source: Vec<Arc<MpscRingBuffer<LsWriterSlot>>> =
+        ls_writer_rbs.iter().map(Arc::clone).collect();
+
     // Handler
     let handler = LedgerPipelineHandler::new(
         PARTITION_SEED_K0, PARTITION_SEED_K1, partitions_num,
-        overrides, transfer_hash_tables.clone(), dm_shards,
+        overrides, transfer_hash_tables.clone(), ls_writer_rbs, dm_shards,
     );
 
     // Incoming RB
@@ -101,10 +114,13 @@ fn start_full_server(batch_accept: BatchAcceptConfig) -> FullTestServer {
         let actor_coord_rbs: Vec<Arc<MpscRingBuffer<CoordinatorSlot>>> =
             coordinator_rbs.iter().map(Arc::clone).collect();
 
+        let actor_ls_writer_rbs: Vec<Arc<MpscRingBuffer<LsWriterSlot>>> =
+            actor_ls_writer_rbs_source.iter().map(Arc::clone).collect();
+
         thread::spawn(move || {
             let mut actor = PartitionActor::new(
                 i, actor_rb, paht, pvt, actor_coord_rbs,
-                pvt_tail_addr as *mut u64, 64,
+                pvt_tail_addr as *mut u64, actor_ls_writer_rbs, 64,
             );
             actor.run();
         });
@@ -117,8 +133,11 @@ fn start_full_server(batch_accept: BatchAcceptConfig) -> FullTestServer {
         let dm_prbs: Vec<Arc<MpscRingBuffer<PartitionSlot>>> =
             dm_partition_rbs.iter().map(Arc::clone).collect();
 
+        let dm_ls_writer_rb = Arc::clone(&actor_ls_writer_rbs_source[i]);
+        let dm_flush_done_rb = Arc::clone(&flush_done_rbs[i]);
+
         thread::spawn(move || {
-            let mut dm = DecisionMaker::new(i, dm_coord_rb, dm_tht, dm_prbs, 64);
+            let mut dm = DecisionMaker::new(i, dm_coord_rb, dm_tht, dm_prbs, dm_ls_writer_rb, dm_flush_done_rb, 64);
             dm.run();
         });
     }
@@ -640,8 +659,12 @@ fn start_server(batch_accept: BatchAcceptConfig) -> TestServer {
         Arc::new(TransferHashTable::new(64, K0, K1, 8).unwrap())
     ];
 
+    let ls_writer_rbs: Vec<Arc<MpscRingBuffer<LsWriterSlot>>> = vec![
+        Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap())
+    ];
+
     let handler = LedgerPipelineHandler::new(
-        PARTITION_SEED_K0, PARTITION_SEED_K1, partitions_num, overrides, tht, 1
+        PARTITION_SEED_K0, PARTITION_SEED_K1, partitions_num, overrides, tht, ls_writer_rbs, 1
     );
 
     let pipeline_rb = Arc::new(

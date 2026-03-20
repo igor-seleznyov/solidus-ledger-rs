@@ -79,7 +79,8 @@ pub struct StorageConfig {
     pub flush_timeout_ms: u64,
     pub flush_max_buffer_posting_records: usize,
     pub current_files_directory: String,
-    pub previous_files_directory: String
+    pub previous_files_directory: String,
+    pub max_ls_file_size_mb: usize,
 }
 
 impl Config {
@@ -166,6 +167,9 @@ impl Config {
         if self.storage.previous_files_directory.is_empty() {
             return Err("storage.previous-files-directory must not be empty".into());
         }
+        if self.storage.max_ls_file_size_mb == 0 {
+            return Err("storage.max-ls-file-size-mb must be > 0".into());
+        }
         if let Some(ref path) = self.partitions.accounts_assignment_overrides_path {
             if path.is_empty() {
                 return Err("partitions.accounts-assignment-overrides-path must not be empty if specified".into());
@@ -249,6 +253,7 @@ storage:
   flush-max-buffer-posting-records: 512
   current-files-directory: \"data/ls\"
   previous-files-directory: \"data/ls\"
+  max-ls-file-size-mb: 256
  ";
 
     #[test]
@@ -275,6 +280,7 @@ storage:
         assert_eq!(config.storage.flush_max_buffer_posting_records, 512);
         assert_eq!(config.storage.current_files_directory, "data/ls");
         assert_eq!(config.storage.previous_files_directory, "data/ls");
+        assert_eq!(config.storage.max_ls_file_size_mb, 256);
         assert!(config.batch_accept.all_or_nothing);
         assert!(!config.batch_accept.partial_reject_by_transfer_sequence_id);
     }
