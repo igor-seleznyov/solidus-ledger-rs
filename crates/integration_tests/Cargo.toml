@@ -10,6 +10,8 @@ ringbuf = { path = "../ringbuf" }
 pipeline = { path = "../pipeline" }
 config = { path = "../config" }
 net = { path = "../net" }
+ledger = { path = "../ledger" }
+storage = { path = "../storage" }
 
 [dev-dependencies]
 ledger = { path = "../ledger" }

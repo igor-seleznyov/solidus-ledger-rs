@@ -15,7 +15,9 @@ use pipeline::pipeline::Pipeline;
 use pipeline::partition_slot::PartitionSlot;
 use pipeline::coordinator_slot::CoordinatorSlot;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
+use storage::flush_done_slot::FlushDoneSlot;
 use storage::io_uring_flush_backend::IoUringFlushBackend;
+use storage::ls_writer_slot::LsWriterSlot;
 use storage::portable_flush_backend::PortableFlushBackend;
 
 fn main() {
@@ -123,12 +125,32 @@ fn main() {
     let decision_maker_transfer_hash_tables: Vec<Arc<TransferHashTable>> =
         transfer_hash_tables.iter().map(Arc::clone).collect();
 
+    let ls_writer_rbs_source: Vec<Arc<MpscRingBuffer<LsWriterSlot>>> = (0..decision_maker_shards)
+        .map(
+            |_| Arc::new(
+                MpscRingBuffer::<LsWriterSlot>::new(config.decision_maker.flush_done_rb_capacity)
+                    .expect("Failed to create LS Writer Ring Buffer")
+            )
+        ).collect();
+
+    let flush_done_rbs: Vec<Arc<MpscRingBuffer<FlushDoneSlot>>> = (0..decision_maker_shards)
+        .map(
+            |_| Arc::new(
+                MpscRingBuffer::<FlushDoneSlot>::new(config.decision_maker.flush_done_rb_capacity)
+                    .expect("Failed to create Flush Done Ring Buffer")
+            )
+        ).collect();
+
+    let handler_ls_writer_rbs: Vec<Arc<MpscRingBuffer<LsWriterSlot>>> =
+        ls_writer_rbs_source.iter().map(Arc::clone).collect();
+
     let handler = LedgerPipelineHandler::new(
         partition_seed_k0,
         partition_seed_k1,
         partitions_count,
         overrides,
         transfer_hash_tables,
+        handler_ls_writer_rbs,
         decision_maker_shards,
     );
 
@@ -185,6 +207,9 @@ fn main() {
         let actor_coordinator_rbs: Vec<Arc<MpscRingBuffer<CoordinatorSlot>>> =
             coordinator_rbs.iter().map(Arc::clone).collect();
 
+        let actor_ls_writer_rbs: Vec<Arc<MpscRingBuffer<LsWriterSlot>>> =
+            ls_writer_rbs_source.iter().map(Arc::clone).collect();
+
         thread::Builder::new()
             .name(format!("partition-{}", i))
             .spawn(
@@ -196,6 +221,7 @@ fn main() {
                         partition_version_table,
                         actor_coordinator_rbs,
                         partition_version_table_tail_addr as *mut u64,
+                        actor_ls_writer_rbs,
                         partition_rb_batch,
                     );
                     actor.run();
@@ -210,6 +236,9 @@ fn main() {
         let decision_maker_partition_rbs: Vec<Arc<MpscRingBuffer<PartitionSlot>>> =
             decision_maker_partition_rbs.iter().map(Arc::clone).collect();
 
+        let dm_ls_writer_rb = Arc::clone(&ls_writer_rbs_source[i]);
+        let dm_flush_done_rb = Arc::clone(&flush_done_rbs[i]);
+
         thread::Builder::new()
             .name(format!("decision-maker-{}", i))
             .spawn(
@@ -219,6 +248,8 @@ fn main() {
                         decision_maker_coordinator_rb,
                         decision_transfer_hash_table,
                         decision_maker_partition_rbs,
+                        dm_ls_writer_rb,
+                        dm_flush_done_rb,
                         coordinator_rb_batch_size,
                     );
                     decision_maker.run();

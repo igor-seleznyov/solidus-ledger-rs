@@ -1,3 +1,4 @@
+use ringbuf::hash_table_slot_status::{SLOT_FREE, SLOT_MIGRATING};
 use crate::transfer_hash_table_entry::TransferHashTableEntry;
 
 pub const INLINE_ENTRIES: usize = 8;
@@ -26,7 +27,8 @@ pub struct TransferSlot {
     pub commit_success_count: u8,
     pub rollback_success_count: u8,
     pub has_metadata: u8,
-    pub _pad1: [u8; 5],
+    pub status: u8,
+    pub _pad1: [u8; 4],
 
     pub created_at_ns: u64,
     pub transfer_datetime: u64,
@@ -46,7 +48,7 @@ impl TransferSlot {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.psl == 0
+        self.status == SLOT_FREE
     }
 }
 
