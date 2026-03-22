@@ -21,12 +21,15 @@ mio = { version = "1.1.1", features = ["os-poll", "net"]}
 libc = { version = "0.2.183" }
 uuid = { version = "1.22.0", features = ["serde"] }
 io-uring = "0.7.11"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+sha2 = "0.10.9"
 
 [dependencies]
 mio.workspace = true
 net = { path = "crates/net" }
 libc.workspace = true
 uuid.workspace = true
+ed25519-dalek.workspace = true
 protocol = { path = "crates/protocol" }
 common = { path = "crates/common" }
 config = { path = "crates/config" }
@@ -35,6 +38,7 @@ ringbuf = { path = "crates/ringbuf" }
 ledger = { path = "crates/ledger" }
 storage = { path = "crates/storage" }
 integration_tests = { path = "crates/integration_tests" }
+sha2.workspace = true
 
 [[bin]]
 name = "rust-start"

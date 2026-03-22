@@ -214,7 +214,7 @@ mod tests {
         let path = temp_path("aligned");
         let mut backend = IoUringFlushBackend::new().unwrap();
         backend.open_ls_file(&path).unwrap();
-        backend.fallocate(1024 * 1024).unwrap(); // 1MB pre-allocate
+        backend.fallocate(1024 * 1024).unwrap();
 
         let arena = ringbuf::arena::Arena::new(4096).unwrap();
         let ptr = arena.as_ptr();
@@ -240,7 +240,7 @@ mod tests {
         assert!(contents.len() >= 4096);
         assert_eq!(contents[0], 0xAB);
         assert_eq!(contents[127], 0xAB);
-        assert_eq!(contents[128], 0x00); // padding
+        assert_eq!(contents[128], 0x00);
 
         fs::remove_file(&path).ok();
     }
@@ -250,11 +250,9 @@ mod tests {
         let path = temp_path("fallocate");
         let mut backend = IoUringFlushBackend::new().unwrap();
         backend.open_ls_file(&path).unwrap();
-        backend.fallocate(256 * 1024 * 1024).unwrap(); // 256MB
+        backend.fallocate(256 * 1024 * 1024).unwrap();
 
         let metadata = fs::metadata(&path).unwrap();
-        // fallocate may or may not update file size depending on filesystem
-        // but allocated blocks should be >= 256MB
         backend.close();
 
         fs::remove_file(&path).ok();

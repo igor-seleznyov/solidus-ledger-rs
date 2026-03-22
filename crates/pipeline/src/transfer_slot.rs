@@ -27,8 +27,9 @@ pub struct TransferSlot {
     pub commit_success_count: u8,
     pub rollback_success_count: u8,
     pub has_metadata: u8,
+    pub prepare_success_bitmap: u8,
     pub status: u8,
-    pub _pad1: [u8; 4],
+    pub _pad1: [u8; 3],
 
     pub created_at_ns: u64,
     pub transfer_datetime: u64,
@@ -103,6 +104,9 @@ mod tests {
         assert_eq!(std::mem::offset_of!(TransferSlot, batch_id), 40);
         assert_eq!(std::mem::offset_of!(TransferSlot, commit_success_count), 56);
         assert_eq!(std::mem::offset_of!(TransferSlot, rollback_success_count), 57);
+        assert_eq!(std::mem::offset_of!(TransferSlot, has_metadata), 58);
+        assert_eq!(std::mem::offset_of!(TransferSlot, prepare_success_bitmap), 59);
+        assert_eq!(std::mem::offset_of!(TransferSlot, status), 60);
         assert_eq!(std::mem::offset_of!(TransferSlot, created_at_ns), 64);
         assert_eq!(std::mem::offset_of!(TransferSlot, transfer_datetime), 72);
         assert_eq!(std::mem::offset_of!(TransferSlot, transfer_sequence_id), 80);
