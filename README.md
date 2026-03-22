@@ -167,23 +167,31 @@ data/ikey/
 
 ## Project Status
 
-Actively developed. Implemented:
+Actively developed. See [Implementation Steps](steps.md) for the full plan.
+
+**Completed:**
 - Network layer (mio, binary protocol, batch validation)
 - Pipeline with sequencer and routing
-- Partition Actors with balance checking
-- Decision Maker with 2PC protocol
-- Transaction Hash Table for in-flight transfer tracking
+- Partition Actors with balance checking (PAHT, Robin Hood hashing)
+- Decision Maker with 2PC protocol (THT, Hopscotch hashing)
 - Partition Version Table for durable balance queries
-- LS Writer with group commit
+- LS Writer with group commit, io_uring backend, O_DIRECT
+- CRC32C hardware-accelerated (SSE4.2)
+- Ed25519 signing with SHA-256 hash chain
 
-In progress:
-- io_uring backend
-- Ed25519 signing + Key Management
-- Metadata (LS-META)
-- Indexes and file rotation
-- Snapshots and recovery
-- TLS
+**In progress (Step 8):**
+- LS/LS-SIGN file headers
+
+**Planned:**
+- LS metadata (LS-META files)
+- LS file rotation and indexes
+- Snapshots and crash recovery
+- Rule Engine (configurable chart-of-accounts)
+- TLS (rustls over mio)
+- Deduplication (IdempotencyCheck)
+- Key Management (KEK/DEK/Shamir)
 - SHM transport
+- Distributed replication (Raft / VSR)
 
 ---
 
@@ -236,18 +244,29 @@ partitions:
   initial-accounts-count: 65536
   partition-rb-capacity: 4096
   partition-rb-batch-size: 64
+  # accounts-assignment-overrides-path: "overrides.yaml"
+
+protocol:
+  metadata-size: 0
+
+batch-accept:
+  all-or-nothing: true
+  partial-reject-by-transfer-sequence-id: false
 
 decision-maker:
   count: 1
   transfer-hash-table-capacity: 16384
   coordinator-rb-capacity: 65536
   coordinator-rb-batch-size: 128
+  flush-done-rb-capacity: 4096
 
 storage:
   flush-timeout-ms: 2
   flush-max-buffer-posting-records: 512
   current-files-directory: "data/ls"
   previous-files-directory: "data/ls"
+  max-ls-file-size-mb: 256
+  signing-enabled: false
 ```
 
 ---
