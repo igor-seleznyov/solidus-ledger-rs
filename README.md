@@ -178,12 +178,12 @@ Actively developed. See [Implementation Steps](steps.md) for the full plan.
 - LS Writer with group commit, io_uring backend, O_DIRECT
 - CRC32C hardware-accelerated (SSE4.2)
 - Ed25519 signing with SHA-256 hash chain
+- LS/LS-SIGN file headers with CRC32C checksums
 
 **In progress (Step 8):**
-- LS/LS-SIGN file headers
+- LS metadata infrastructure (LS-META files, MetaRecord, dual buffer)
 
 **Planned:**
-- LS metadata (LS-META files)
 - LS file rotation and indexes
 - Snapshots and crash recovery
 - Rule Engine (configurable chart-of-accounts)

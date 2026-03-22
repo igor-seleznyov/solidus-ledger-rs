@@ -9,6 +9,9 @@ use crate::flush_backend::FlushBackend;
 use common::mem_barrier::release_store_u64;
 use crate::sig_record::SigRecord;
 use crate::signing_state::SigningState;
+use crate::ls_file_header::{LsFileHeader};
+use crate::ls_sign_file_header::LsSignFileHeader;
+use crate::consts::LS_FILE_PAGE_SIZE;
 
 const CLOCK_CHECK_REPEATS_COUNT_INTERVAL: u32 = 100_000;
 
@@ -50,6 +53,8 @@ pub struct LsWriter<T: FlushBackend> {
     sign_fd: i32,
     sign_buffer: Vec<u8>,
     sign_write_offset: u64,
+    partition_count: u16,
+    file_seq: u64,
 }
 
 impl<T: FlushBackend> LsWriter<T> {
@@ -68,6 +73,7 @@ impl<T: FlushBackend> LsWriter<T> {
         flush_timeout_ms: u64,
         flush_max_buffer_posting_records: usize,
         signing_state: Option<SigningState>,
+        partition_count: u16,
     ) -> Self {
         let flush_max_buffer_bytes = flush_max_buffer_posting_records * PostingRecord::SIZE;
         let buffer_capacity = (flush_max_buffer_bytes * 2 + 4095) & !4095;
@@ -106,6 +112,8 @@ impl<T: FlushBackend> LsWriter<T> {
             sign_fd: -1,
             sign_buffer: Vec::with_capacity(256 * SigRecord::SIZE),
             sign_write_offset: 0,
+            partition_count,
+            file_seq: 0,
         }
     }
 
@@ -363,7 +371,39 @@ impl<T: FlushBackend> LsWriter<T> {
             .fallocate(self.max_ls_file_size)
             .expect("Failed to fallocate LS file");
 
-        if self.signing_state.is_none() {
+        let public_key_hash = match &self.signing_state {
+            Some(signing) => {
+                let pub_key_bytes = signing.public_key_bytes();
+                unsafe {
+                    common::crc32c::crc32c(pub_key_bytes.as_ptr(), pub_key_bytes.len())
+                }
+            }
+            None => 0
+        };
+
+        let header = LsFileHeader::new(
+            self.signing_state.is_some(),
+            self.partition_count,
+            self.max_ls_file_size as u64,
+            self.file_seq,
+            public_key_hash,
+        );
+
+        let header_page = header.to_page();
+        self.backend
+            .submit_write_and_sync(&header_page, 0)
+            .expect("Failed to submit LS file header");
+
+        loop {
+            if let Some(completion) = self.backend.poll_completion() {
+                assert!(completion.success, "LS file header write failed");
+                break;
+            }
+        }
+
+        self.write_offset = LsFileHeader::DATA_OFFSET as u64;
+
+        if self.signing_state.is_some() {
             let sign_path = format!("{}.sign", self.ls_file_path);
             let c_path = std::ffi::CString::new(sign_path.as_str()).unwrap();
             let fd = unsafe {
@@ -373,13 +413,40 @@ impl<T: FlushBackend> LsWriter<T> {
                     0o644,
                 )
             };
-            assert!(fd >= 0, "Failed to open ls_sign file");
+            assert!(fd >= 0, "Failed to open ls_sign file: {}", sign_path);
             self.sign_fd = fd;
+
+            let signing = self.signing_state.as_ref().unwrap();
+            let sign_header = LsSignFileHeader::new(
+                SigningState::ALGORITHM_ED25519,
+                0,
+                self.file_seq,
+                signing.public_key_bytes(),
+                *signing.last_tx_hash(),
+            );
+
+            let sign_header_page = sign_header.to_page();
+            let written = unsafe {
+                libc::pwrite(
+                    self.sign_fd,
+                    sign_header_page.as_ptr() as *const libc::c_void,
+                    sign_header_page.len(),
+                    0,
+                )
+            };
+            assert_eq!(written as usize, LS_FILE_PAGE_SIZE, "ls_sign header pwrite failed");
+
+            let sync_result = unsafe { libc::fdatasync(self.sign_fd) };
+            assert_eq!(sync_result, 0, "ls_sign header fdatasync failed");
         }
 
         println!(
-            "[ls-writer {}] initialized: file={}, max_size={}MB",
-            self.id, self.ls_file_path, self.max_ls_file_size / (1024 * 1024),
+            "[ls-writer {}] initialized: file={}, max_size={}MB, signing={}, data_offset={}",
+            self.id,
+            self.ls_file_path,
+            self.max_ls_file_size / (1024 * 1024),
+            if self.signing_state.is_some() { "enabled" } else { "disabled" },
+            self.write_offset,
         );
     }
 
@@ -429,6 +496,8 @@ mod tests {
     use crate::flush_done_slot::FlushDoneSlot;
     use crate::ls_writer::LsWriter;
     use crate::ls_writer_slot::{LsWriterSlot, LS_MSG_ADD_TO_HEAP, LS_MSG_FLUSH_MARKER, LS_MSG_POSTING, LS_MSG_REMOVE_FROM_HEAP};
+    use crate::ls_file_header::LsFileHeader;
+    use crate::ls_sign_file_header::LsSignFileHeader;
 
     const K0: u64 = 0x0123456789ABCDEF;
     const K1: u64 = 0xFEDCBA9876543210;
@@ -477,6 +546,7 @@ mod tests {
         fn close(&mut self) {}
     }
 
+
     static mut TEST_COMMITTED_GSN: u64 = 0;
 
     fn make_writer() -> LsWriter<MockFlushBackend> {
@@ -505,6 +575,7 @@ mod tests {
             2,
             512,
             None,
+            16,
         );
         writer.initialize();
         writer
@@ -538,11 +609,13 @@ mod tests {
             K1,
             64, 2, 512,
             None,
+            16,
         );
         writer.initialize();
 
         (writer, flush_done_rb_clone)
     }
+
 
     fn make_add_to_heap_slot(gsn: u64) -> LsWriterSlot {
         let mut slot = LsWriterSlot::zeroed();
@@ -604,6 +677,7 @@ mod tests {
             64, K0, K1,
             64, 2, 512,
             Some(signing),
+            16,
         );
         writer.initialize();
         writer
@@ -641,17 +715,20 @@ mod tests {
     fn initialize_opens_file() {
         let writer = make_writer();
         assert!(writer.backend.open_called);
+        assert_eq!(writer.backend.written.len(), 1);
+        assert_eq!(writer.backend.written[0].1, 0);
+        assert_eq!(writer.backend.written[0].0.len(), 4096);
     }
 
     #[test]
     fn new_initializes_empty_state() {
         let writer = make_writer();
         assert_eq!(writer.buffer_len, 0);
-        assert_eq!(writer.write_offset, 0);
+        assert_eq!(writer.write_offset, LS_FILE_PAGE_SIZE as u64);
         assert!(!writer.flush_in_flight);
         assert_eq!(writer.flush_buffer_snapshot_len, 0);
         assert_eq!(writer.pending_flush.len(), 0);
-        assert_eq!(writer.flush_pending_records.len(), 0);
+        assert_eq!(writer.flush_pending_records.len(), 0)
     }
 
     #[test]
@@ -715,10 +792,10 @@ mod tests {
 
         writer.submit_flush();
 
-        assert_eq!(writer.backend.written.len(), 1);
-        assert_eq!(writer.backend.written[0].0.len() % 4096, 0);
-        assert!(writer.backend.written[0].0.len() >= PostingRecord::SIZE);
-        assert_eq!(writer.backend.written[0].1, 0);
+        assert_eq!(writer.backend.written.len(), 2);
+        assert_eq!(writer.backend.written[1].0.len() % LS_FILE_PAGE_SIZE, 0);
+        assert!(writer.backend.written[1].0.len() >= PostingRecord::SIZE);
+        assert_eq!(writer.backend.written[1].1, LsFileHeader::DATA_OFFSET as u64);
     }
 
     #[test]
@@ -753,7 +830,7 @@ mod tests {
         writer.submit_flush();
 
         assert!(!writer.flush_in_flight);
-        assert_eq!(writer.backend.written.len(), 0);
+        assert_eq!(writer.backend.written.len(), 1);
     }
 
     #[test]
@@ -766,7 +843,7 @@ mod tests {
         writer.process_message(&make_posting_slot(200, 300));
         writer.submit_flush();
 
-        assert_eq!(writer.backend.written.len(), 1);
+        assert_eq!(writer.backend.written.len(), 2);
     }
 
     #[test]
@@ -776,12 +853,12 @@ mod tests {
         writer.process_message(&make_posting_slot(100, 500));
         writer.submit_flush();
 
-        assert_eq!(writer.write_offset, 0);
+        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64);
         assert_eq!(writer.buffer_len, PostingRecord::SIZE);
 
         writer.poll_and_handle_completions();
 
-        assert_eq!(writer.write_offset, 4096);
+        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64);
         assert_eq!(writer.buffer_len, 0);
         assert!(!writer.flush_in_flight);
     }
@@ -874,15 +951,15 @@ mod tests {
 
         writer.submit_flush();
 
-        assert_eq!(writer.backend.written.len(), 1);
-        assert_eq!(writer.backend.written[0].0.len() % 4096, 0);
-        assert!(writer.backend.written[0].0.len() >= PostingRecord::SIZE);
+        assert_eq!(writer.backend.written.len(), 2);
+        assert_eq!(writer.backend.written[1].0.len() % LS_FILE_PAGE_SIZE, 0);
+        assert!(writer.backend.written[1].0.len() >= PostingRecord::SIZE * 3);
 
         writer.poll_and_handle_completions();
 
         assert!(writer.in_flight_min_heap.is_empty());
         assert_eq!(writer.buffer_len, 0);
-        assert_eq!(writer.write_offset, 4096);
+        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64);
     }
 
     #[test]
@@ -896,7 +973,7 @@ mod tests {
         writer.submit_flush();
         writer.poll_and_handle_completions();
 
-        assert_eq!(writer.write_offset, 4096);
+        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64);
 
         writer.process_message(&make_add_to_heap_slot(200));
         writer.process_message(&make_posting_slot(200, 300));
@@ -904,13 +981,12 @@ mod tests {
 
         writer.submit_flush();
 
-        assert_eq!(writer.backend.written.len(), 2);
-        assert_eq!(writer.backend.written[0].0.len() % 4096, 0);
-        assert!(writer.backend.written[0].0.len() >= PostingRecord::SIZE);
+        assert_eq!(writer.backend.written.len(), 3);
+        assert_eq!(writer.backend.written[2].1, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64);
 
         writer.poll_and_handle_completions();
 
-        assert_eq!(writer.write_offset, 8192);
+        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64 + LS_FILE_PAGE_SIZE as u64);
     }
 
     #[test]
@@ -919,7 +995,7 @@ mod tests {
 
         writer.poll_and_handle_completions();
 
-        assert_eq!(writer.write_offset, 0);
+        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64);
         assert!(!writer.flush_in_flight);
     }
 
@@ -954,5 +1030,79 @@ mod tests {
 
         let committed = unsafe { *writer.global_committed_gsn };
         assert_eq!(committed, 199);
+    }
+
+    #[test]
+    fn ls_file_header_layout() {
+        assert_eq!(LsFileHeader::SIZE, 128);
+        assert_eq!(std::mem::size_of::<LsFileHeader>(), 128);
+
+        assert_eq!(std::mem::offset_of!(LsFileHeader, magic), 0);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, format_version), 8);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, file_type), 10);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, signing_enabled), 11);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, partition_count), 12);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, metadata_enabled), 14);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, created_at_ns), 16);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, record_size), 24);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, data_offset), 28);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, max_file_size), 32);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, file_seq), 40);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, rules_count), 48);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, rules_checksum), 52);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, public_key_hash), 56);
+        assert_eq!(std::mem::offset_of!(LsFileHeader, checksum), 124);
+    }
+
+    #[test]
+    fn ls_sign_file_header_layout() {
+        assert_eq!(LsSignFileHeader::SIZE, 128);
+        assert_eq!(std::mem::size_of::<LsSignFileHeader>(), 128);
+
+        assert_eq!(std::mem::offset_of!(LsSignFileHeader, magic), 0);
+        assert_eq!(std::mem::offset_of!(LsSignFileHeader, format_version), 8);
+        assert_eq!(std::mem::offset_of!(LsSignFileHeader, file_type), 10);
+        assert_eq!(std::mem::offset_of!(LsSignFileHeader, algorithm), 11);
+        assert_eq!(std::mem::offset_of!(LsSignFileHeader, key_version), 12);
+        assert_eq!(std::mem::offset_of!(LsSignFileHeader, created_at_ns), 16);
+        assert_eq!(std::mem::offset_of!(LsSignFileHeader, linked_ls_file_seq), 24);
+        assert_eq!(std::mem::offset_of!(LsSignFileHeader, public_key), 32);
+        assert_eq!(std::mem::offset_of!(LsSignFileHeader, public_key), 32);
+        assert_eq!(std::mem::offset_of!(LsSignFileHeader, genesis_hash), 64);
+        assert_eq!(std::mem::offset_of!(LsSignFileHeader, checksum), 120);
+    }
+
+    #[test]
+    fn ls_file_header_checksum() {
+        let header = LsFileHeader::new(false, 16, 256 * 1024 * 1024, 0, 0);
+
+        assert_ne!(header.checksum, 0);
+        assert!(unsafe { header.verify_checksum() });
+    }
+
+    #[test]
+    fn ls_file_header_to_page() {
+        let header = LsFileHeader::new(true, 16, 256 * 1024 * 1024, 1, 0x12345678);
+        let page = header.to_page();
+
+        assert_eq!(page.len(), 4096);
+        let magic = u64::from_le_bytes(page[0..8].try_into().unwrap());
+        assert_eq!(magic, crate::ls_file_header::LS_FILE_MAGIC);
+        assert!(page[128..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn initialize_writes_header_at_offset_zero() {
+        let writer = make_writer();
+
+        assert!(!writer.backend.written.is_empty());
+        let (data, offset) = &writer.backend.written[0];
+        assert_eq!(*offset, 0);
+        assert_eq!(data.len(), 4096);
+
+        let magic = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        assert_eq!(magic, crate::ls_file_header::LS_FILE_MAGIC);
+
+        assert_eq!(writer.write_offset, 4096);
     }
 }
