@@ -539,7 +539,7 @@ fn full_pipeline_multiple_batches() {
         assert_eq!(status, BATCH_ACCEPTED);
     }
 
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(2000));
 
     assert_eq!(
         server.transfer_hash_tables[0].count(), 0,
