@@ -234,12 +234,10 @@ mod tests {
     fn single_claim_publish_read_release() {
         let rb = SpscRingBuffer::<TestSlot>::new(16).unwrap();
 
-        // Пишем
         let mut claimed = rb.claim();
         claimed.as_mut().value = 42;
         claimed.publish();
 
-        // Читаем
         let read = rb.try_read().expect("should have data");
         assert_eq!(read.as_ref().value, 42);
         read.release();
@@ -270,21 +268,18 @@ mod tests {
     fn fill_and_drain() {
         let rb = SpscRingBuffer::<TestSlot>::new(16).unwrap();
 
-        // Заполняем все 16 слотов
         for i in 0..16u64 {
             let mut claimed = rb.claim();
             claimed.as_mut().value = i;
             claimed.publish();
         }
 
-        // Читаем все 16
         for i in 0..16u64 {
             let read = rb.try_read().expect("should have data");
             assert_eq!(read.as_ref().value, i);
             read.release();
         }
 
-        // Буфер снова пуст
         assert!(rb.try_read().is_none());
     }
 
@@ -292,8 +287,6 @@ mod tests {
     fn wrap_around() {
         let rb = SpscRingBuffer::<TestSlot>::new(4).unwrap();
 
-        // Пишем и читаем 20 элементов через буфер размером 4
-        // Это 5 полных оборотов — проверяем корректность sequence protocol
         for i in 0..20u64 {
             let mut claimed = rb.claim();
             claimed.as_mut().value = i;
@@ -309,14 +302,12 @@ mod tests {
     fn batch_claim_and_drain() {
         let rb = SpscRingBuffer::<TestSlot>::new(16).unwrap();
 
-        // Claim batch из 4 слотов
         let mut batch = rb.claim_batch(4);
         for i in 0..batch.len() {
             batch.slot_mut(i).value = (i * 10) as u64;
         }
         batch.publish();
 
-        // Drain batch
         let drain = rb.drain_batch(16);
         assert_eq!(drain.len(), 4);
         for i in 0..drain.len() {
@@ -324,7 +315,6 @@ mod tests {
         }
         drain.release();
 
-        // Буфер пуст
         let drain = rb.drain_batch(16);
         assert!(drain.is_empty());
     }
@@ -333,7 +323,6 @@ mod tests {
     fn batch_wrap_around() {
         let rb = SpscRingBuffer::<TestSlot>::new(4).unwrap();
 
-        // Заполняем 3 слота и читаем — сдвигаем позицию
         for i in 0..3u64 {
             let mut claimed = rb.claim();
             claimed.as_mut().value = i;
@@ -343,7 +332,6 @@ mod tests {
         assert_eq!(drain.len(), 3);
         drain.release();
 
-        // Теперь claim batch из 4 — должен обернуться через конец буфера
         let mut batch = rb.claim_batch(4);
         for i in 0..4 {
             batch.slot_mut(i).value = (i + 100) as u64;
@@ -362,14 +350,12 @@ mod tests {
     fn drain_partial_ready() {
         let rb = SpscRingBuffer::<TestSlot>::new(16).unwrap();
 
-        // Пишем 5 элементов
         for i in 0..5u64 {
             let mut claimed = rb.claim();
             claimed.as_mut().value = i;
             claimed.publish();
         }
 
-        // Drain с max_count=16 — должен вернуть только 5
         let drain = rb.drain_batch(16);
         assert_eq!(drain.len(), 5);
         drain.release();

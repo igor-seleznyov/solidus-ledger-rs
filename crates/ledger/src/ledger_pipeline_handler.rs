@@ -75,7 +75,7 @@ impl PipelineHandler for LedgerPipelineHandler {
                 slot.connection_id,
                 &slot.batch_id,
                 &slot.currency,
-                2, //TODO заглушка, без RuleEngine всегда 2
+                2,
                 transfer_datetime,
                 &slot.transfer_sequence_id,
             )
@@ -130,6 +130,7 @@ impl PipelineHandler for LedgerPipelineHandler {
             debit_partition,
             transfer_hash_table_offset,
             shard_id as u8,
+            0,
         );
 
         self.send_prepare(
@@ -142,6 +143,7 @@ impl PipelineHandler for LedgerPipelineHandler {
             credit_partition,
             transfer_hash_table_offset,
             shard_id as u8,
+            1,
         );
     }
 }
@@ -158,6 +160,7 @@ impl LedgerPipelineHandler {
         partition_id: usize,
         transfer_hash_table_offset: u32,
         shard_id: u8,
+        entry_index: u8,
     ) {
         let partition_id = match self.overrides.get(account_id) {
             Some(id) => id,
@@ -192,6 +195,7 @@ impl LedgerPipelineHandler {
         slot.msg_type = MSG_TYPE_PREPARE;
         slot.shard_id = shard_id;
         slot.transfer_hash_table_offset = transfer_hash_table_offset;
+        slot.entry_index = entry_index;
         claimed.publish();
     }
 
@@ -208,6 +212,7 @@ impl LedgerPipelineHandler {
 
 #[cfg(test)]
 mod tests {
+    use common::u64_pair_to_bytes::u64_pair_to_bytes;
     use super::*;
     use pipeline::incoming_slot::IncomingSlot;
 
@@ -242,9 +247,7 @@ mod tests {
     }
 
     fn account_id(val: u64) -> [u8; 16] {
-        let mut id = [0u8; 16];
-        id[8..16].copy_from_slice(&val.to_be_bytes());
-        id
+        u64_pair_to_bytes(0, val)
     }
 
     #[test]

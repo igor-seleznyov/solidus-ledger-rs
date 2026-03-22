@@ -5,3 +5,4 @@ pub mod raw_u128_to_u64;
 pub mod radix_sort;
 pub mod mem_barrier;
 pub mod crc32c;
+pub mod u64_pair_to_bytes;

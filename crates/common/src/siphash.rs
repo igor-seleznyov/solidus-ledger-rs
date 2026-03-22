@@ -75,19 +75,16 @@ mod tests {
 
     #[test]
     fn non_zero() {
-        // Нулевой вход не должен давать нулевой hash
         let h = siphash13(0, 0, 0, 0);
         assert_ne!(h, 0);
     }
 
     #[test]
     fn distribution() {
-        // Проверяем что hash'и распределены по всем 64 битам
         let mut or_all: u64 = 0;
         for i in 0..1000u64 {
             or_all |= siphash13(42, 43, i, i * 7);
         }
-        // После 1000 hash'ей все 64 бита должны быть задеты
         assert_eq!(or_all, u64::MAX, "poor distribution: not all bits set");
     }
 }

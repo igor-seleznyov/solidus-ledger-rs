@@ -81,6 +81,7 @@ pub struct StorageConfig {
     pub current_files_directory: String,
     pub previous_files_directory: String,
     pub max_ls_file_size_mb: usize,
+    pub signing_enabled: bool,
 }
 
 impl Config {
@@ -254,6 +255,7 @@ storage:
   current-files-directory: \"data/ls\"
   previous-files-directory: \"data/ls\"
   max-ls-file-size-mb: 256
+  signing-enabled: true
  ";
 
     #[test]

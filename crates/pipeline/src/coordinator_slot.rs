@@ -12,7 +12,7 @@ pub struct CoordinatorSlot {
     pub msg_type: u8,
     pub shard_id: u8,
     pub reason: u8,
-    pub _pad1: u8,
+    pub entry_index: u8,
     pub partition_id: u32,
     pub transfer_hash_table_offset: u32,
     pub _pad2: [u8; 4],
@@ -39,7 +39,7 @@ impl CoordinatorSlot {
             msg_type: 0,
             shard_id: 0,
             reason: 0,
-            _pad1: 0,
+            entry_index: 0,
             partition_id: 0,
             transfer_hash_table_offset: 0,
             _pad2: [0u8; 4],
@@ -82,6 +82,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CoordinatorSlot, msg_type), 8);
         assert_eq!(std::mem::offset_of!(CoordinatorSlot, shard_id), 9);
         assert_eq!(std::mem::offset_of!(CoordinatorSlot, reason), 10);
+        assert_eq!(std::mem::offset_of!(CoordinatorSlot, entry_index), 11);
         assert_eq!(std::mem::offset_of!(CoordinatorSlot, partition_id), 12);
         assert_eq!(std::mem::offset_of!(CoordinatorSlot, transfer_hash_table_offset), 16);
         assert_eq!(std::mem::offset_of!(CoordinatorSlot, transfer_id_hi), 24);
@@ -104,6 +105,7 @@ mod tests {
         assert_eq!(slot.partition_id, 0);
         assert_eq!(slot.shard_id, 0);
         assert_eq!(slot.reason, 0);
+        assert_eq!(slot.entry_index, 0);
         assert_eq!(slot.transfer_hash_table_offset, 0);
         assert_eq!(slot.transfer_id_hi, 0);
         assert_eq!(slot.transfer_id_lo, 0);

@@ -432,19 +432,14 @@ mod tests {
             pvt.record_version(0, 1, 200, 4500);
             pvt.record_version(0, 1, 300, 4000);
 
-            // committed_gsn=200 → balance at gsn=200
             assert_eq!(pvt.read_balance(0, 1, 200), Some(4500));
 
-            // committed_gsn=100 → balance at gsn=100
             assert_eq!(pvt.read_balance(0, 1, 100), Some(5000));
 
-            // committed_gsn=300 → balance at gsn=300
             assert_eq!(pvt.read_balance(0, 1, 300), Some(4000));
 
-            // committed_gsn=150 → balance at gsn=100 (последний <= 150)
             assert_eq!(pvt.read_balance(0, 1, 150), Some(5000));
 
-            // committed_gsn=50 → нет версий <= 50
             assert_eq!(pvt.read_balance(0, 1, 50), None);
         }
     }
@@ -475,8 +470,8 @@ mod tests {
             let slot = pvt.lookup(0, 1).unwrap();
             assert_eq!((*slot).count, 8);
 
-            assert_eq!(pvt.read_balance(0, 1, 800), Some(600)); // 1000 - 8*50
-            assert_eq!(pvt.read_balance(0, 1, 100), Some(950)); // 1000 - 1*50
+            assert_eq!(pvt.read_balance(0, 1, 800), Some(600));
+            assert_eq!(pvt.read_balance(0, 1, 100), Some(950));
         }
     }
 
@@ -532,8 +527,8 @@ mod tests {
 
             assert_eq!(pvt.read_balance(0, 1, 2000), Some(20000));
             assert_eq!(pvt.read_balance(0, 1, 100), Some(1000));
-            assert_eq!(pvt.read_balance(0, 1, 900), Some(9000));  // overflow block 1
-            assert_eq!(pvt.read_balance(0, 1, 1700), Some(17000)); // overflow block 2
+            assert_eq!(pvt.read_balance(0, 1, 900), Some(9000));
+            assert_eq!(pvt.read_balance(0, 1, 1700), Some(17000));
         }
     }
 
@@ -594,10 +589,10 @@ mod tests {
             pvt.compact(0, 1, 200);
 
             let slot = pvt.lookup(0, 1).unwrap();
-            assert_eq!((*slot).count, 1); // только gsn=200
+            assert_eq!((*slot).count, 1);
 
             assert_eq!(pvt.read_balance(0, 1, 200), Some(900));
-            assert_eq!(pvt.read_balance(0, 1, 100), None); // удалён
+            assert_eq!(pvt.read_balance(0, 1, 100), None);
         }
     }
 

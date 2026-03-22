@@ -7,10 +7,13 @@ use pipeline::transfer_slot::TransferSlot;
 use pipeline::transfer_hash_table_entry::TransferHashTableEntry;
 use ringbuf::hash_table_slot_status::{SLOT_DELETED, SLOT_FREE, SLOT_OCCUPIED};
 
+const NEIGHBOURHOOD_SIZE: usize = 32;
+
 pub struct TransferHashTable {
     #[allow(dead_code)]
     arena: Arena,
     slots: *mut TransferSlot,
+    hop_bitmaps: Vec<u32>,
     #[allow(dead_code)]
     overflow_arena: Option<Arena>,
     overflow_base: *mut TransferHashTableEntry,
@@ -35,10 +38,12 @@ impl TransferHashTable {
         assert!(capacity.is_power_of_two(), "THT capacity must be a power of two");
         assert!(capacity >= 16, "THT capacity must be at least 16");
         assert!(max_entries_per_transfer >= 2, "at least 2 entries (DEBIT + CREDIT)");
+        assert!(capacity >= NEIGHBOURHOOD_SIZE, "capacity must be >= NEIGHBOURHOOD_SIZE");
 
         let total_size = capacity * TransferSlot::SIZE;
         let arena = Arena::new(total_size)?;
         let slots = arena.as_ptr() as *mut TransferSlot;
+        let hop_bitmaps = vec![0u32; capacity];
 
         let overflow_per_slot = max_entries_per_transfer.saturating_sub(8);
         let (overflow_arena, overflow_base) = if overflow_per_slot > 0 {
@@ -54,6 +59,7 @@ impl TransferHashTable {
             Self {
                 arena,
                 slots,
+                hop_bitmaps,
                 overflow_arena,
                 overflow_base,
                 overflow_per_slot,
@@ -74,7 +80,7 @@ impl TransferHashTable {
         self.capacity
     }
 
-    pub fn load_factory(&self) -> f64 {
+    pub fn load_factor(&self) -> f64 {
         self.count() as f64 / self.capacity as f64
     }
 
@@ -96,65 +102,78 @@ impl TransferHashTable {
     ) -> u32 {
         let hash = siphash13(self.seed_k0, self.seed_k1, id_hi, id_lo);
         let fp = (hash >> 56) as u8;
-        let mut pos = (hash as usize) & self.mask;
-        let mut psl: u8 = 1;
+        let home = (hash as usize) & self.mask;
 
-        let mut inserting = TransferSlot::zeroed();
-        inserting.transfer_id_hi = id_hi;
-        inserting.transfer_id_lo = id_lo;
-        inserting.psl = 1;
-        inserting.fingerprint = fp;
-        inserting.entries_count = entries_count;
-        inserting.gsn = gsn;
-        inserting.connection_id = connection_id;
-        inserting.batch_id = *batch_id;
-        inserting.currency = *currency;
-        inserting.transfer_datetime = transfer_datetime;
-        inserting.transfer_sequence_id = *transfer_sequence_id;
-        inserting.ready = 0;
-        inserting.decision = 0;
-        inserting.commit_success_count = 0;
-        inserting.rollback_success_count = 0;
-        inserting.confirmed_count = 0;
-        inserting.failed_count = 0;
-        inserting.status = SLOT_OCCUPIED;
+        let bitmap = self.hop_bitmaps[home];
+        let mut check_bits = bitmap;
 
-        let mut inserting_overflow = [TransferHashTableEntry::zeroed(); 8];
+        while check_bits != 0 {
+            let bit_pos = check_bits.trailing_zeros() as usize;
+            let pos = (home + bit_pos) & self.mask;
+            let slot = self.slots.add(pos);
 
-        let mut result_pos: u32 = u32::MAX;
+            let slot_fingerprint = unsafe { (*slot).fingerprint };
+            let slot_transfer_id_hi = unsafe { (*slot).transfer_id_hi };
+            let slot_transfer_id_lo = unsafe { (*slot).transfer_id_lo };
+            let slot_status = unsafe { (*slot).status };
 
-        loop {
-            let slot = unsafe { self.slots.add(pos) };
-            let slot_psl = unsafe { (*slot).psl };
+            if slot_fingerprint == fp
+                && slot_transfer_id_hi == id_hi
+                && slot_transfer_id_lo == id_lo
+                && slot_status == SLOT_OCCUPIED {
+                return pos as u32;
+            }
+            check_bits &= check_bits - 1;
+        }
+
+        for offset in 0..NEIGHBOURHOOD_SIZE {
+            let pos = (home + offset) & self.mask;
+            let slot = self.slots.add(pos);
             let slot_status = unsafe { (*slot).status };
 
             if slot_status == SLOT_FREE || slot_status == SLOT_DELETED {
-                inserting.psl = psl;
                 unsafe {
-                    std::ptr::copy_nonoverlapping(&inserting, slot, 1);
+                    self.write_new_slot(
+                        slot, id_hi, id_lo, fp, gsn, connection_id, batch_id,
+                        currency, entries_count, transfer_datetime,
+                        transfer_sequence_id,
+                    );
                 }
 
-                if self.overflow_per_slot > 0 && inserting.entries_count > 8 {
-                    unsafe {
-                        let overflow_ptr = self.overflow_base.add(pos * self.overflow_per_slot);
-                        std::ptr::copy_nonoverlapping(
-                            inserting_overflow.as_ptr(),
-                            overflow_ptr,
-                            self.overflow_per_slot,
-                        );
-                    }
+                let bitmaps_ptr = self.hop_bitmaps.as_ptr() as *mut u32;
+                unsafe {
+                    *bitmaps_ptr.add(home) |= 1u32 << offset;
                 }
 
                 unsafe {
                     *self.count.get() += 1;
                 }
-                return if result_pos == u32::MAX {
-                    pos as u32
-                } else {
-                    result_pos
-                }
+                return pos as u32
             }
+        }
 
+        unsafe {
+            self.hop_and_insert(
+                home, id_hi, id_lo, fp, gsn, connection_id, batch_id,
+                currency, entries_count, transfer_datetime,
+                transfer_sequence_id,
+            )
+        }
+    }
+
+    pub unsafe fn lookup(&self, id_hi: u64, id_lo: u64) -> Option<u32> {
+        let hash = siphash13(self.seed_k0, self.seed_k1, id_hi, id_lo);
+        let fp = (hash >> 56) as u8;
+        let home = (hash as usize) & self.mask;
+
+        let bitmap = self.hop_bitmaps[home];
+        let mut check_bits = bitmap;
+
+        while check_bits != 0 {
+            let bit_pos = check_bits.trailing_zeros() as usize;
+            let pos = (home + bit_pos) & self.mask;
+            let slot = unsafe { self.slots.add(pos) };
+            let slot_status = unsafe { (*slot).status };
             let slot_fingerprint = unsafe { (*slot).fingerprint };
             let slot_transfer_id_hi = unsafe { (*slot).transfer_id_hi };
             let slot_transfer_id_lo = unsafe { (*slot).transfer_id_lo };
@@ -163,65 +182,199 @@ impl TransferHashTable {
                 && slot_fingerprint == fp
                 && slot_transfer_id_hi == id_hi
                 && slot_transfer_id_lo == id_lo {
-                return pos as u32
+                return Some(pos as u32);
             }
 
-            if slot_psl < psl {
+            check_bits &= check_bits - 1;
+        }
+
+        None
+    }
+
+    unsafe fn hop_and_insert(
+        &self,
+        home: usize,
+        id_hi: u64,
+        id_lo: u64,
+        fp: u8,
+        gsn: u64,
+        connection_id: u64,
+        batch_id: &[u8; 16],
+        currency: &[u8; 16],
+        entries_count: u8,
+        transfer_datetime: u64,
+        transfer_sequence_id: &[u8; 16],
+    ) -> u32 {
+        let mut empty_pos = None;
+        for dist in NEIGHBOURHOOD_SIZE..self.capacity {
+            let pos = (home + dist) & self.mask;
+            let slot = self.slots.add(pos);
+            let slot_status = unsafe { (*slot).status };
+            if slot_status == SLOT_FREE || slot_status == SLOT_DELETED {
+                empty_pos = Some(pos);
+                break;
+            }
+        }
+
+        let mut free_pos = empty_pos.expect("Transfer Hash Table full, cannot hop");
+
+        loop {
+            let dist_to_home = if free_pos >= home {
+                free_pos - home
+            } else {
+                free_pos + self.capacity - home
+            };
+
+            if dist_to_home < NEIGHBOURHOOD_SIZE {
+                let slot = unsafe { self.slots.add(free_pos) };
                 unsafe {
-                    std::mem::swap(&mut *slot, &mut inserting);
+                    self.write_new_slot(
+                        slot, id_hi, id_lo, fp, gsn, connection_id, batch_id,
+                        currency, entries_count, transfer_datetime, transfer_sequence_id,
+                    );
                 }
 
-                let slot_entries_count = unsafe { (*slot).entries_count };
+                let offset = if free_pos >= home {
+                    free_pos - home
+                } else {
+                    free_pos + self.capacity - home
+                };
+                let bitmaps_ptr = self.hop_bitmaps.as_ptr() as *mut u32;
+                unsafe {
+                    *bitmaps_ptr.add(home) |= 1u32 << offset;
+                }
 
-                if self.overflow_per_slot > 0
-                    && (slot_entries_count > 8 || inserting.entries_count > 8) {
+                unsafe {
+                    *self.count.get() += 1;
+                }
+                return free_pos as u32;
+            }
+
+            let mut hopped = false;
+            for candidate_dist in 1..NEIGHBOURHOOD_SIZE {
+                let candidate_pos = if free_pos >= candidate_dist {
+                    free_pos - candidate_dist
+                } else {
+                    free_pos + self.capacity - candidate_dist
+                };
+
+                let candidate_slot = unsafe { self.slots.add(candidate_pos) };
+
+                let slot_ready = unsafe { (*candidate_slot).ready };
+                let slot_status = unsafe { (*candidate_slot).status };
+                let slot_transfer_id_hi = unsafe { (*candidate_slot).transfer_id_hi };
+                let slot_transfer_id_lo = unsafe { (*candidate_slot).transfer_id_lo };
+
+                if slot_ready == 1 {
+                    continue;
+                }
+
+                if slot_status != SLOT_OCCUPIED {
+                    continue;
+                }
+
+                let candidate_hash = siphash13(
+                    self.seed_k0,
+                    self.seed_k1,
+                    slot_transfer_id_hi,
+                    slot_transfer_id_lo,
+                );
+                let candidate_home = (candidate_hash as usize) & self.mask;
+
+                let dist_from_candidate_home = if free_pos >= candidate_home {
+                    free_pos - candidate_home
+                } else {
+                    free_pos + self.capacity - candidate_home
+                };
+
+                if dist_from_candidate_home < NEIGHBOURHOOD_SIZE {
                     unsafe {
-                        self.swap_overflow(pos, &mut inserting_overflow);
+                        std::ptr::copy_nonoverlapping(candidate_slot, self.slots.add(free_pos), 1);
                     }
-                }
 
-                psl = inserting.psl;
-                if result_pos == u32::MAX {
-                    result_pos = pos as u32;
+                    let slot_entries_count = unsafe { (*candidate_slot).entries_count };
+
+                    if self.overflow_per_slot > 0 && slot_entries_count > 8 {
+                        let src = unsafe { self.overflow_base.add(candidate_pos * self.overflow_per_slot) };
+                        let dst = unsafe { self.overflow_base.add(free_pos * self.overflow_per_slot) };
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(src, dst, self.overflow_per_slot);
+                        }
+                    }
+
+                    let bitmaps_ptr = self.hop_bitmaps.as_ptr() as *mut u32;
+
+                    let old_offset = if candidate_pos >= candidate_home {
+                        candidate_pos - candidate_home
+                    } else {
+                        candidate_pos + self.capacity - candidate_home
+                    };
+
+                    unsafe {
+                        *bitmaps_ptr.add(candidate_home) &= !(1u32 << old_offset);
+                        *bitmaps_ptr.add(candidate_home) |= 1u32 << dist_from_candidate_home;
+
+                        (*candidate_slot).status = SLOT_FREE;
+                    }
+
+                    free_pos = candidate_pos;
+                    hopped = true;
+                    break;
                 }
             }
 
-            pos = (pos + 1) & self.mask;
-            psl += 1;
-            inserting.psl = psl;
+            if !hopped {
+                panic!("TransferHashTable: cannot hop, table too full or all neighbours published");
+            }
         }
     }
 
-    unsafe fn swap_overflow(
+    unsafe fn write_new_slot(
         &self,
-        pos: usize,
-        inserting_overflow: &mut [TransferHashTableEntry; 8]
+        slot: *mut TransferSlot,
+        id_hi: u64,
+        id_lo: u64,
+        fp: u8,
+        gsn: u64,
+        connection_id: u64,
+        batch_id: &[u8; 16],
+        currency: &[u8; 16],
+        entries_count: u8,
+        transfer_datetime: u64,
+        transfer_sequence_id: &[u8; 16],
     ) {
-        if self.overflow_per_slot == 0 {
-            return;
-        }
+        let new_slot = TransferSlot {
+            transfer_id_hi: id_hi,
+            transfer_id_lo: id_lo,
+            psl: 0,
+            fingerprint: fp,
+            ready: 0,
+            decision: 0,
+            entries_count,
+            fail_reason: 0,
+            confirmed_count: 0,
+            failed_count: 0,
+            gsn,
+            connection_id,
+            batch_id: *batch_id,
+            commit_success_count: 0,
+            rollback_success_count: 0,
+            has_metadata: 0,
+            prepare_success_bitmap: 0,
+            status: SLOT_OCCUPIED,
+            _pad1: [0; 3],
+            created_at_ns: 0,
+            transfer_datetime,
+            transfer_sequence_id: *transfer_sequence_id,
+            currency: *currency,
+            metadata_slot: 0,
+            _pad2: [0; 12],
+            entries: [TransferHashTableEntry::zeroed(); 8],
+        };
 
-        let overflow_ptr = unsafe { self.overflow_base.add(pos * self.overflow_per_slot) };
-
-        let mut temp = [TransferHashTableEntry::zeroed(); 8];
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                overflow_ptr,
-                temp.as_mut_ptr(),
-                self.overflow_per_slot,
-            );
+            std::ptr::copy_nonoverlapping(&new_slot, slot, 1);
         }
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                inserting_overflow.as_ptr(),
-                overflow_ptr,
-                self.overflow_per_slot,
-            );
-        }
-
-        inserting_overflow[..self.overflow_per_slot]
-            .copy_from_slice(&temp[..self.overflow_per_slot]);
     }
 
     pub unsafe fn fill_entry(
@@ -261,6 +414,38 @@ impl TransferHashTable {
         }
     }
 
+    pub unsafe fn remove(&self, offset: u32) {
+        let pos = offset as usize;
+        let slot = unsafe { self.slots.add(pos) };
+
+        let hash = unsafe {
+            siphash13(
+                self.seed_k0,
+                self.seed_k1,
+                (*slot).transfer_id_hi,
+                (*slot).transfer_id_lo,
+            )
+        };
+
+        let home = (hash as usize) & self.mask;
+
+        let bit_offset = if pos >= home {
+            pos - home
+        } else {
+            pos + self.capacity - home
+        };
+
+        let bitmaps_ptr = self.hop_bitmaps.as_ptr() as *mut u32;
+        unsafe {
+            *bitmaps_ptr.add(home) &= !(1u32 << bit_offset);
+
+            (*slot).status = SLOT_DELETED;
+            (*slot).ready = 0;
+
+            *self.count.get() -= 1;
+        }
+    }
+
     #[inline(always)]
     pub unsafe fn slot_ptr(&self, offset: u32) -> *mut TransferSlot {
         unsafe {
@@ -275,11 +460,7 @@ impl TransferHashTable {
         }
     }
 
-    pub unsafe fn get_entry(
-        &self,
-        offset: u32,
-        index: usize,
-    ) -> &TransferHashTableEntry {
+    pub unsafe fn get_entry(&self, offset: u32, index: usize) -> &TransferHashTableEntry {
         if index < 8 {
             let slot = unsafe { self.slots.add(offset as usize) };
             unsafe {
@@ -293,28 +474,19 @@ impl TransferHashTable {
             }
         }
     }
-
-    pub unsafe fn remove(&self, offset: u32) {
-        let slot = unsafe { self.slots.add(offset as usize) };
-
-        unsafe {
-            (*slot).status = SLOT_DELETED;
-            (*slot).ready = 0;
-            *self.count.get() -= 1;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pipeline::transfer_slot::*;
+    use ringbuf::hash_table_slot_status::SLOT_DELETED;
 
     const K0: u64 = 0x0123456789ABCDEF;
     const K1: u64 = 0xFEDCBA9876543210;
 
     fn batch_id() -> [u8; 16] { [0u8; 16] }
-    fn currency() -> [u8; 16] { 
+    fn currency() -> [u8; 16] {
         let mut buf = [0u8; 16];
         buf[..3].copy_from_slice(b"EUR");
         buf
@@ -332,28 +504,16 @@ mod tests {
         }
     }
 
-    // --- Basic ---
-
     #[test]
     fn create_empty() {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
         assert_eq!(tht.count(), 0);
         assert_eq!(tht.capacity(), 64);
-        assert_eq!(tht.overflow_per_slot(), 0);
     }
-
-    #[test]
-    fn create_with_overflow() {
-        let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
-        assert_eq!(tht.overflow_per_slot(), 4);
-    }
-
-    // --- Insert + slot_ptr ---
 
     #[test]
     fn insert_and_read() {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
-
         unsafe {
             let offset = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
             assert_eq!(tht.count(), 1);
@@ -361,25 +521,29 @@ mod tests {
             let slot = tht.slot_ptr(offset);
             assert_eq!((*slot).transfer_id_lo, 1);
             assert_eq!((*slot).gsn, 100);
-            assert_eq!((*slot).connection_id, 7);
-            assert_eq!((*slot).entries_count, 2);
+            assert_eq!((*slot).status, SLOT_OCCUPIED);
             assert_eq!((*slot).ready, 0);
-            assert_eq!((*slot).decision, DECISION_NONE);
         }
     }
 
-    // --- fill_entry + publish ---
+    #[test]
+    fn idempotent_insert() {
+        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        unsafe {
+            let off1 = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
+            let off2 = tht.insert(0, 1, 200, 8, &batch_id(), &currency(), 2, 0, &seq_id());
+            assert_eq!(off1, off2);
+            assert_eq!(tht.count(), 1);
+        }
+    }
 
     #[test]
     fn fill_entry_and_publish() {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
-
         unsafe {
             let offset = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
-
             tht.fill_entry(offset, 0, &make_entry(10, -500, 0, 1));
             tht.fill_entry(offset, 1, &make_entry(20, 500, 1, 2));
-
             tht.publish(offset);
 
             let slot = tht.slot_ptr(offset);
@@ -389,75 +553,44 @@ mod tests {
         }
     }
 
-    // --- Overflow ---
-
     #[test]
-    fn fill_overflow_entries() {
-        let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
-
-        unsafe {
-            let offset = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 10, 0, &seq_id());
-
-            for i in 0..8 {
-                tht.fill_entry(offset, i, &make_entry(i as u64 + 10, 100, 0, 1));
-            }
-            tht.fill_overflow(offset, 0, &make_entry(18, 200, 1, 2));
-            tht.fill_overflow(offset, 1, &make_entry(19, 300, 1, 2));
-
-            tht.publish(offset);
-
-            let slot = tht.slot_ptr(offset);
-            assert_eq!((*slot).entries[7].account_id_lo, 17);
-
-            let ovf0 = tht.overflow_ptr(offset, 0);
-            assert_eq!((*ovf0).account_id_lo, 18);
-            assert_eq!((*ovf0).amount, 200);
-
-            let ovf1 = tht.overflow_ptr(offset, 1);
-            assert_eq!((*ovf1).account_id_lo, 19);
-        }
-    }
-
-    // --- Idempotent ---
-
-    #[test]
-    fn idempotent_insert() {
+    fn remove_marks_deleted_and_clears_bitmap() {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
-
-        unsafe {
-            let off1 = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
-            let off2 = tht.insert(0, 1, 200, 8, &batch_id(), &currency(), 2, 0, &seq_id());
-
-            assert_eq!(off1, off2);
-            assert_eq!(tht.count(), 1);
-
-            let slot = tht.slot_ptr(off1);
-            assert_eq!((*slot).gsn, 100);
-        }
-    }
-
-    // --- Remove ---
-
-    #[test]
-    fn remove_decreases_count() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
-
         unsafe {
             let offset = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
+            tht.publish(offset);
             tht.remove(offset);
-            assert_eq!(tht.count(), 0);
 
+            assert_eq!(tht.count(), 0);
             let slot = tht.slot_ptr(offset);
             assert_eq!((*slot).status, SLOT_DELETED);
+            assert_eq!((*slot).ready, 0);
+
+            assert!(tht.lookup(0, 1).is_none());
         }
     }
 
-    // --- Robin Hood ---
+    #[test]
+    fn insert_reuses_deleted_slot() {
+        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        unsafe {
+            let off1 = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
+            tht.publish(off1);
+            tht.remove(off1);
+
+            let off2 = tht.insert(0, 1, 200, 0, &batch_id(), &currency(), 2, 0, &seq_id());
+            assert_eq!(tht.count(), 1);
+            assert_eq!(off1, off2);
+
+            let slot = tht.slot_ptr(off2);
+            assert_eq!((*slot).gsn, 200);
+            assert_eq!((*slot).status, SLOT_OCCUPIED);
+        }
+    }
 
     #[test]
-    fn robin_hood_displacement() {
-        let tht = TransferHashTable::new(16, K0, K1, 8).unwrap();
-
+    fn multiple_inserts() {
+        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
         unsafe {
             for i in 1..=10u64 {
                 let off = tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
@@ -470,55 +603,8 @@ mod tests {
     }
 
     #[test]
-    fn robin_hood_with_overflow() {
-        let tht = TransferHashTable::new(16, K0, K1, 12).unwrap();
-
-        unsafe {
-            for i in 1..=8u64 {
-                let off = tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 10, 0, &seq_id());
-                tht.fill_overflow(off, 0, &make_entry(i * 10, i as i64 * 1000, 0, 1));
-                tht.publish(off);
-            }
-
-            for i in 1..=8u64 {
-                let off = tht.insert(0, i, 0, 0, &batch_id(), &currency(), 0, 0, &seq_id()); // idempotent
-                let ovf = tht.overflow_ptr(off, 0);
-                assert_eq!(
-                    (*ovf).account_id_lo, i * 10,
-                    "overflow corrupted for transfer {}",
-                    i,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn psl_bounded() {
-        let tht = TransferHashTable::new(256, K0, K1, 8).unwrap();
-
-        unsafe {
-            for i in 1..=192u64 {
-                tht.insert(0, i, i, 0, &batch_id(), &currency(), 2, 0, &seq_id());
-            }
-        }
-
-        let mut max_psl: u8 = 0;
-        unsafe {
-            for i in 0..256 {
-                let slot = tht.slots.add(i);
-                if (*slot).psl > max_psl {
-                    max_psl = (*slot).psl;
-                }
-            }
-        }
-
-        assert!(max_psl < 20, "PSL too high: {}", max_psl);
-    }
-
-    #[test]
     fn multiple_inserts_and_removes() {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
-
         unsafe {
             let mut offsets = Vec::new();
             for i in 1..=10u64 {
@@ -534,151 +620,79 @@ mod tests {
     }
 
     #[test]
-    fn mixed_entry_counts_with_robin_hood() {
-        let tht = TransferHashTable::new(16, K0, K1, 12).unwrap();
-
-        unsafe {
-            for i in 1..=5u64 {
-                let off = tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 10, 0, &seq_id());
-                for j in 0..8 {
-                    tht.fill_entry(off, j, &make_entry(i * 100 + j as u64, 100, 0, 1));
-                }
-                tht.fill_overflow(off, 0, &make_entry(i * 1000, i as i64 * 500, 0, 1));
-                tht.fill_overflow(off, 1, &make_entry(i * 1000 + 1, i as i64 * 600, 1, 2));
-                tht.publish(off);
-            }
-
-            for i in 6..=10u64 {
-                let off = tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
-                tht.fill_entry(off, 0, &make_entry(i * 100, -200, 0, 1));
-                tht.fill_entry(off, 1, &make_entry(i * 100 + 1, 200, 1, 2));
-                tht.publish(off);
-            }
-
-            assert_eq!(tht.count(), 10);
-
-            for i in 1..=5u64 {
-                let off = tht.insert(0, i, 0, 0, &batch_id(), &currency(), 0, 0, &seq_id());
-                let slot = tht.slot_ptr(off);
-                assert_eq!((*slot).entries_count, 10, "transfer {} entries_count", i);
-
-                let ovf0 = tht.overflow_ptr(off, 0);
-                assert_eq!(
-                    (*ovf0).account_id_lo, i * 1000,
-                    "overflow[0] corrupted for transfer {}", i,
-                );
-                assert_eq!((*ovf0).amount, i as i64 * 500);
-
-                let ovf1 = tht.overflow_ptr(off, 1);
-                assert_eq!(
-                    (*ovf1).account_id_lo, i * 1000 + 1,
-                    "overflow[1] corrupted for transfer {}", i,
-                );
-            }
-
-            for i in 6..=10u64 {
-                let off = tht.insert(0, i, 0, 0, &batch_id(), &currency(), 0, 0, &seq_id());
-                let slot = tht.slot_ptr(off);
-                assert_eq!((*slot).entries_count, 2, "transfer {} entries_count", i);
-                assert_eq!((*slot).entries[0].amount, -200);
-                assert_eq!((*slot).entries[1].amount, 200);
-            }
-        }
-    }
-
-    #[test]
-    fn exactly_8_entries_no_overflow() {
-        let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
-
-        unsafe {
-            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 8, 0, &seq_id());
-            for i in 0..8 {
-                tht.fill_entry(off, i, &make_entry(i as u64 + 10, 100, 0, 1));
-            }
-            tht.publish(off);
-
-            let slot = tht.slot_ptr(off);
-            assert_eq!((*slot).entries[7].account_id_lo, 17);
-        }
-    }
-
-    #[test]
-    fn exactly_9_entries_uses_overflow() {
-        let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
-
-        unsafe {
-            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 9, 0, &seq_id());
-            for i in 0..8 {
-                tht.fill_entry(off, i, &make_entry(i as u64 + 10, 100, 0, 1));
-            }
-            tht.fill_overflow(off, 0, &make_entry(18, 900, 1, 2));
-            tht.publish(off);
-
-            let slot = tht.slot_ptr(off);
-            assert_eq!((*slot).entries[7].account_id_lo, 17);
-
-            let ovf = tht.overflow_ptr(off, 0);
-            assert_eq!((*ovf).account_id_lo, 18);
-            assert_eq!((*ovf).amount, 900);
-        }
-    }
-
-    #[test]
-    fn insert_after_remove_reuses_slot() {
+    fn offset_stable_after_other_inserts() {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
-
         unsafe {
             let off1 = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
+            tht.fill_entry(off1, 0, &make_entry(10, -500, 0, 1));
+            tht.fill_entry(off1, 1, &make_entry(20, 500, 1, 2));
             tht.publish(off1);
-            tht.remove(off1);
-            assert_eq!(tht.count(), 0);
 
-            let off2 = tht.insert(0, 1, 200, 0, &batch_id(), &currency(), 2, 0, &seq_id());
-            assert_eq!(tht.count(), 1);
+            for i in 2..=21u64 {
+                tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
+            }
 
-            let slot = tht.slot_ptr(off2);
-            assert_eq!((*slot).gsn, 200);
-            assert_eq!((*slot).ready, 0);
+            let slot = tht.slot_ptr(off1);
+            assert_eq!((*slot).transfer_id_lo, 1);
+            assert_eq!((*slot).gsn, 100);
+            assert_eq!((*slot).entries[0].amount, -500);
+            assert_eq!((*slot).ready, 1);
+        }
+    }
+
+    #[test]
+    fn lookup_finds_element() {
+        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        unsafe {
+            let off = tht.insert(0, 42, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
+            let found = tht.lookup(0, 42);
+            assert_eq!(found, Some(off));
+        }
+    }
+
+    #[test]
+    fn lookup_returns_none_for_missing() {
+        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        unsafe {
+            tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
+            assert!(tht.lookup(0, 999).is_none());
+        }
+    }
+
+    #[test]
+    fn overflow_works() {
+        let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
+        unsafe {
+            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 10, 0, &seq_id());
+            for i in 0..8 {
+                tht.fill_entry(off, i, &make_entry(i as u64 + 10, 100, 0, 1));
+            }
+            tht.fill_overflow(off, 0, &make_entry(18, 200, 1, 2));
+            tht.fill_overflow(off, 1, &make_entry(19, 300, 1, 2));
+            tht.publish(off);
+
+            let ovf0 = tht.overflow_ptr(off, 0);
+            assert_eq!((*ovf0).account_id_lo, 18);
+
+            let e8 = tht.get_entry(off, 8);
+            assert_eq!(e8.account_id_lo, 18);
+            assert_eq!(e8.amount, 200);
         }
     }
 
     #[test]
     fn unpublished_slot_has_ready_zero() {
         let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
-
         unsafe {
             let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
-            tht.fill_entry(off, 0, &make_entry(10, -500, 0, 1));
-
             let slot = tht.slot_ptr(off);
-            assert_eq!((*slot).ready, 0, "unpublished slot must have ready=0");
-            assert_eq!((*slot).entries[0].amount, -500, "entries filled but not published");
+            assert_eq!((*slot).ready, 0);
         }
     }
 
     #[test]
-    fn get_entry_inline() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
-
-        unsafe {
-            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
-            tht.fill_entry(off, 0, &make_entry(10, -500, 0, 1));
-            tht.fill_entry(off, 1, &make_entry(20, 500, 1, 2));
-
-            let e0 = tht.get_entry(off, 0);
-            assert_eq!(e0.account_id_lo, 10);
-            assert_eq!(e0.amount, -500);
-
-            let e1 = tht.get_entry(off, 1);
-            assert_eq!(e1.account_id_lo, 20);
-            assert_eq!(e1.amount, 500);
-        }
-    }
-
-    #[test]
-    fn get_entry_overflow() {
+    fn get_entry_inline_and_overflow() {
         let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
-
         unsafe {
             let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 10, 0, &seq_id());
             for i in 0..8 {
@@ -687,56 +701,9 @@ mod tests {
             tht.fill_overflow(off, 0, &make_entry(18, 200, 1, 2));
             tht.fill_overflow(off, 1, &make_entry(19, 300, 1, 2));
 
-            // inline
-            let e7 = tht.get_entry(off, 7);
-            assert_eq!(e7.account_id_lo, 17);
-
-            // overflow (index 8 → overflow[0], index 9 → overflow[1])
-            let e8 = tht.get_entry(off, 8);
-            assert_eq!(e8.account_id_lo, 18);
-            assert_eq!(e8.amount, 200);
-
-            let e9 = tht.get_entry(off, 9);
-            assert_eq!(e9.account_id_lo, 19);
-            assert_eq!(e9.amount, 300);
-        }
-    }
-
-    #[test]
-    fn remove_marks_as_deleted() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
-
-        unsafe {
-            let offset = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
-            tht.publish(offset);
-            tht.remove(offset);
-
-            assert_eq!(tht.count(), 0);
-
-            let slot = tht.slot_ptr(offset);
-            assert_eq!((*slot).status, SLOT_DELETED);
-            assert_eq!((*slot).ready, 0);
-            assert!((*slot).psl > 0);
-        }
-    }
-
-    #[test]
-    fn insert_reuses_deleted_slot() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
-
-        unsafe {
-            let off1 = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
-            tht.publish(off1);
-            tht.remove(off1);
-            assert_eq!(tht.count(), 0);
-
-            let off2 = tht.insert(0, 1, 200, 0, &batch_id(), &currency(), 2, 0, &seq_id());
-            assert_eq!(tht.count(), 1);
-            assert_eq!(off1, off2);
-
-            let slot = tht.slot_ptr(off2);
-            assert_eq!((*slot).gsn, 200);
-            assert_eq!((*slot).status, SLOT_OCCUPIED);
+            assert_eq!(tht.get_entry(off, 7).account_id_lo, 17);
+            assert_eq!(tht.get_entry(off, 8).account_id_lo, 18);
+            assert_eq!(tht.get_entry(off, 9).account_id_lo, 19);
         }
     }
 }

@@ -3,7 +3,6 @@ use common::crc32c::crc32c;
 #[repr(C, align(64))]
 #[derive(Copy, Clone)]
 pub struct PostingRecord {
-    // ═══ Cache line 0: identity + amounts ═══
     pub transfer_id_hi: u64,
     pub transfer_id_lo: u64,
     pub account_id_hi: u64,
@@ -13,7 +12,6 @@ pub struct PostingRecord {
     pub amount: i64,
     pub prev_posting_record_offset: u64,
 
-    // ═══ Cache line 1: timestamps + metadata + checksum ═══
     pub timestamp_ns: u64,
     pub transfer_sequence_id: [u8; 16],
     pub currency: [u8; 16],
@@ -26,6 +24,8 @@ pub struct PostingRecord {
 
 impl PostingRecord {
     pub const SIZE: usize = 128;
+
+    pub const SIZE_WITHOUT_CHECKSUM: usize = PostingRecord::SIZE - std::mem::size_of::<u32>();
 
     pub fn zeroed() -> Self {
         unsafe { std::mem::zeroed() }
