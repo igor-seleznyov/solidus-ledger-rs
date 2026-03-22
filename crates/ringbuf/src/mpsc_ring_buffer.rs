@@ -275,7 +275,6 @@ mod tests {
         let t1 = thread::spawn(move || {
             for i in 0..count_per_writer {
                 let mut claimed = rb1.claim();
-                // Writer 1 пишет значения 1_000_000 + i
                 claimed.as_mut().value = 1_000_000 + i;
                 claimed.publish();
             }
@@ -284,7 +283,6 @@ mod tests {
         let rb2 = Arc::clone(&rb);
         let t2 = thread::spawn(move || {
             for i in 0..count_per_writer {
-                // Writer 2 пишет значения 2_000_000 + i
                 let mut claimed = rb2.claim();
                 claimed.as_mut().value = 2_000_000 + i;
                 claimed.publish();
@@ -294,7 +292,6 @@ mod tests {
         t1.join().unwrap();
         t2.join().unwrap();
 
-        // Читаем все 200 значений
         let mut values: Vec<u64> = Vec::new();
         let total = count_per_writer * 2;
         for _ in 0..total {
@@ -308,25 +305,20 @@ mod tests {
             }
         }
 
-        // Буфер пуст
         assert!(rb.try_read().is_none());
 
-        // Все 200 значений получены
         assert_eq!(values.len(), total as usize);
 
-        // Все значения от writer 1 присутствуют
         let w1: Vec<u64> = values.iter().copied()
             .filter(|v| *v >= 1_000_000 && *v < 2_000_000)
             .collect();
         assert_eq!(w1.len(), count_per_writer as usize);
 
-        // Все значения от writer 2 присутствуют
         let w2: Vec<u64> = values.iter().copied()
             .filter(|v| *v >= 2_000_000 && *v < 3_000_000)
             .collect();
         assert_eq!(w2.len(), count_per_writer as usize);
 
-        // Порядок внутри каждого writer сохранён (FIFO per writer)
         for pair in w1.windows(2) {
             assert!(pair[0] < pair[1], "writer 1 order violated: {} >= {}", pair[0], pair[1]);
         }

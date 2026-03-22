@@ -47,16 +47,6 @@ impl <H: PipelineHandler> Pipeline<H> {
                 let slot = batch.slot(i);
                 let gsn = self.sequencer.next();
 
-/*                println!(
-                    "[pipeline {}] GSN={} transfer_id={:02X?} amount={} debit={:02X?} credit={:02X?}",
-                    self.id,
-                    gsn,
-                    &slot.transfer_id[..4],
-                    i64::from_be_bytes(slot.amount),
-                    &slot.debit_account_id[..4],
-                    &slot.credit_account_id[..4],
-                );
-*/
                 self.handler.handle(slot, gsn, &self.partition_rb);
             }
 

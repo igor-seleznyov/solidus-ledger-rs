@@ -1,14 +1,6 @@
 use std::sync::atomic::{fence, Ordering};
 use crate::sequence_mem_barrier::write_sequence_volatile;
 
-/// # Safety
-///
-/// The implementing type should:
-/// 1. be `#[repr(C, align(64))]`
-/// 2. has field `sequence: u64` on offset 0 (the first field)
-/// 3. Not contains pointers and types with Drop
-///
-/// undefined behavior if used in Ring Buffer.
 pub unsafe trait Slot: Copy + Sized {
     fn sequence(&self) -> u64;
 

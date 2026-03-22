@@ -12,6 +12,7 @@ config = { path = "../config" }
 net = { path = "../net" }
 ledger = { path = "../ledger" }
 storage = { path = "../storage" }
+common = { path = "../common" }
 
 [dev-dependencies]
 ledger = { path = "../ledger" }

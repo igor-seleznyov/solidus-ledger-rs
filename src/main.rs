@@ -116,7 +116,7 @@ fn main() {
                         transfer_hash_table_capacity,
                         transfer_hash_table_seed_k0,
                         transfer_hash_table_seed_k1,
-                        2, // TODO max_entries_per_transfer, заглушка для RuleEngine
+                        2,
                     ).expect("Failed to create transfer hash table"),
                 )
             }

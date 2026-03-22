@@ -18,7 +18,7 @@ pub struct PartitionSlot {
     pub entry_type: u8,
     pub msg_type: u8,
     pub shard_id: u8,
-    pub _pad: u8,
+    pub entry_index: u8,
     pub transfer_hash_table_offset: u32,
 }
 
@@ -43,7 +43,7 @@ impl PartitionSlot {
             entry_type: 0,
             msg_type: 0,
             shard_id: 0,
-            _pad: 0,
+            entry_index: 0,
             transfer_hash_table_offset: 0,
         }
     }
@@ -86,6 +86,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(PartitionSlot, entry_type), 56);
         assert_eq!(std::mem::offset_of!(PartitionSlot, msg_type), 57);
         assert_eq!(std::mem::offset_of!(PartitionSlot, shard_id), 58);
+        assert_eq!(std::mem::offset_of!(PartitionSlot, entry_index), 59);
         assert_eq!(std::mem::offset_of!(PartitionSlot, transfer_hash_table_offset), 60);
     }
 
@@ -107,6 +108,7 @@ mod tests {
         assert_eq!(slot.entry_type, 0);
         assert_eq!(slot.msg_type, 0);
         assert_eq!(slot.shard_id, 0);
+        assert_eq!(slot.entry_index, 0);
         assert_eq!(slot.transfer_hash_table_offset, 0);
     }
 

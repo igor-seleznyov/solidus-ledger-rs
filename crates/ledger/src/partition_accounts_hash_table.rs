@@ -235,7 +235,7 @@ mod tests {
     fn high_load_factor() {
         let capacity = 64;
         let mut paht = PartitionAccountsHashTable::new(capacity, K0, K1).unwrap();
-        let fill = (capacity as f64 * 0.75) as u64;  // 48 аккаунтов
+        let fill = (capacity as f64 * 0.75) as u64;
 
         unsafe {
             for i in 1..=fill {
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn psl_bounded() {
         let mut paht = PartitionAccountsHashTable::new(256, K0, K1).unwrap();
-        let fill = 192u64;  // 75% load factor
+        let fill = 192u64;
 
         unsafe {
             for i in 1..=fill {
@@ -298,7 +298,6 @@ mod tests {
             assert_eq!((*found).staged_income, 200);
             assert_eq!((*found).staged_outcome, 50);
 
-            // Effective balance = balance + staged_income - staged_outcome
             let effective = (*found).balance + (*found).staged_income - (*found).staged_outcome;
             assert_eq!(effective, 1150);
         }

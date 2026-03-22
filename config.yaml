@@ -38,3 +38,4 @@ storage:
   current-files-directory: "data/ls"
   previous-files-directory: "data/ls"
   max-ls-file-size-mb: 256
+  signing-enabled: false

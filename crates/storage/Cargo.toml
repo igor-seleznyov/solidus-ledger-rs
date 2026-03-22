@@ -9,3 +9,5 @@ common = { path = "../common" }
 ringbuf = { path = "../ringbuf" }
 pipeline = { path = "../pipeline" }
 io-uring.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
