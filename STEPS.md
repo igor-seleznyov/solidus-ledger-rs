@@ -67,8 +67,8 @@ Framing, handshake, batch validation, codec.
 - 8-5: DM integration — PostingRecords + FlushMarker to LS Writer RB, Flush Done reception ✅
 - 8-6-1: CRC32C hw-accelerated (SSE4.2) + Ed25519 (ed25519-dalek) + SHA256 chain + SigningState + SigRecord (192 bytes) ✅
 - 8-6-2: Signing integration with LS Writer — ls_sign file, sign_batch, fdatasync ordering ✅
-- 8-7: LSFileHeader (128 bytes) + LSSignFileHeader + file creation/open ← current substep
-- 8-8: LS metadata — ls_meta file, MetaRecord, dual buffer, fdatasync ordering
+- 8-7: LSFileHeader (128 bytes) + LSSignFileHeader + file creation/open ✅
+- 8-8: LS metadata — ls_meta file, MetaRecord, dual buffer, fdatasync ordering ← current substep
 - 8-9: LS rotation — triggers: max_file_size, metadata schema change, rule change
 - 8-10: LS Index Builder — *.idx + *.index (sorted arrays by account_id, async at rotation)
 - 8-11: LS Sign Index — *.ls_sign_idx (sorted array by transfer_id, if signing enabled)

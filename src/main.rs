@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::thread;
+use common::consts::CPU_CACHE_LINE_SIZE;
 use common::generate_random_u64::generate_random_u64;
 use config::{Config, PartitionAccountAssignmentConfig};
 use ledger::ledger_pipeline_handler::LedgerPipelineHandler;
@@ -19,6 +20,7 @@ use storage::flush_done_slot::FlushDoneSlot;
 use storage::io_uring_flush_backend::IoUringFlushBackend;
 use storage::ls_writer_slot::LsWriterSlot;
 use storage::portable_flush_backend::PortableFlushBackend;
+use storage::ls_writer::LsWriter;
 
 fn main() {
     let config = Config::load("config.yaml").expect("Failed to load config");
@@ -181,7 +183,7 @@ fn main() {
                 )
             ).collect();
 
-    let committed_gsn_arena = ringbuf::arena::Arena::new(64)
+    let committed_gsn_arena = ringbuf::arena::Arena::new(decision_maker_shards * CPU_CACHE_LINE_SIZE)
         .expect("Failed to create committed gsn arena");
     let global_committed_gsn: *mut u64 = committed_gsn_arena.as_ptr() as *mut u64;
     
@@ -255,6 +257,51 @@ fn main() {
                     decision_maker.run();
                 }
             ).expect("Failed to spawn decision-maker thread");
+
+        std::fs::create_dir_all(&config.storage.current_files_directory)
+            .expect("Failed to create LS storage files directory");
+
+        let ls_writer_rb = Arc::clone(&ls_writer_rbs_source[i]);
+        let ls_writer_flush_done_rb = Arc::clone(&flush_done_rbs[i]);
+
+        let ls_file_path = format!(
+            "{}/ls_{}_{}.ls",
+            config.storage.current_files_directory, i, 0
+        );
+        let max_ls_file_size = config.storage.max_ls_file_size_mb * 1024 * 1024;
+        let flush_timeout_ms = config.storage.flush_timeout_ms;
+        let flush_max_buffer = config.storage.flush_max_buffer_posting_records;
+        let partition_count = config.partitions.count as u16;
+
+        let ls_writer_committed_gsn = unsafe {
+            committed_gsn_arena.as_ptr().add(i * CPU_CACHE_LINE_SIZE) as usize
+        };
+
+        thread::Builder::new()
+            .name(format!("ls-writer-{}", i))
+            .spawn(
+                move || {
+                    let backend = PortableFlushBackend::new();
+                    let mut writer = LsWriter::new(
+                        i,
+                        ls_writer_rb,
+                        ls_writer_flush_done_rb,
+                        ls_writer_committed_gsn as *mut u64,
+                        backend,
+                        ls_file_path,
+                        max_ls_file_size,
+                        1024,
+                        generate_random_u64(),
+                        generate_random_u64(),
+                        CPU_CACHE_LINE_SIZE,
+                        flush_timeout_ms,
+                        flush_max_buffer,
+                        None,
+                        partition_count,
+                    );
+                    writer.run();
+                }
+            ).expect("[main] Failed to spawn ls writer thread");
     }
     println!("[main] {} decision maker threads started", decision_maker_shards);
     

@@ -1,0 +1,1 @@
+pub const CPU_CACHE_LINE_SIZE: usize = 64;
