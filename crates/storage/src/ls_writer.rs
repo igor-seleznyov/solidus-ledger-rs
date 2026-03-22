@@ -7,6 +7,8 @@ use crate::ls_writer_slot::*;
 use crate::flush_done_slot::FlushDoneSlot;
 use crate::flush_backend::FlushBackend;
 use common::mem_barrier::release_store_u64;
+use crate::sig_record::SigRecord;
+use crate::signing_state::SigningState;
 
 const CLOCK_CHECK_REPEATS_COUNT_INTERVAL: u32 = 100_000;
 
@@ -44,6 +46,10 @@ pub struct LsWriter<T: FlushBackend> {
     flush_in_flight: bool,
     flush_pending_records: Vec<PendingFlush>,
     flush_buffer_snapshot_len: usize,
+    signing_state: Option<SigningState>,
+    sign_fd: i32,
+    sign_buffer: Vec<u8>,
+    sign_write_offset: u64,
 }
 
 impl<T: FlushBackend> LsWriter<T> {
@@ -61,6 +67,7 @@ impl<T: FlushBackend> LsWriter<T> {
         batch_size: usize,
         flush_timeout_ms: u64,
         flush_max_buffer_posting_records: usize,
+        signing_state: Option<SigningState>,
     ) -> Self {
         let flush_max_buffer_bytes = flush_max_buffer_posting_records * PostingRecord::SIZE;
         let buffer_capacity = (flush_max_buffer_bytes * 2 + 4095) & !4095;
@@ -86,7 +93,7 @@ impl<T: FlushBackend> LsWriter<T> {
             buffer_ptr,
             buffer_len: 0,
             buffer_capacity,
-            write_offset: 0, //TODO: read file size on recovery
+            write_offset: 0,
             flush_timeout_ms,
             flush_max_buffer_size: flush_max_buffer_bytes,
             pending_flush: Vec::with_capacity(256),
@@ -95,6 +102,10 @@ impl<T: FlushBackend> LsWriter<T> {
             flush_in_flight: false,
             flush_pending_records: Vec::with_capacity(256),
             flush_buffer_snapshot_len: 0,
+            signing_state,
+            sign_fd: -1,
+            sign_buffer: Vec::with_capacity(256 * SigRecord::SIZE),
+            sign_write_offset: 0,
         }
     }
 
@@ -144,6 +155,18 @@ impl<T: FlushBackend> LsWriter<T> {
             return;
         }
 
+        if let Some(ref mut signing) = self.signing_state {
+            Self::sign_batch_inner(
+                signing,
+                self.buffer_ptr,
+                self.buffer_len,
+                self.write_offset,
+                &mut self.sign_buffer,
+            );
+        }
+
+        self.flush_sign_buffer();
+
         let padded_len = (self.buffer_len + 4095) & !4095;
 
         let data = unsafe {
@@ -161,6 +184,82 @@ impl<T: FlushBackend> LsWriter<T> {
 
         self.last_flush = Instant::now();
         self.idle_count = 0;
+    }
+
+    fn sign_batch_inner(
+        signing: &mut SigningState,
+        buffer_ptr: *mut u8,
+        buffer_len: usize,
+        write_offset: u64,
+        sign_buffer: &mut Vec<u8>,
+    ) {
+        let record_count = buffer_len / PostingRecord::SIZE;
+        if record_count == 0 {
+            return;
+        }
+
+        let records = unsafe {
+            std::slice::from_raw_parts(
+                buffer_ptr as *const PostingRecord,
+                record_count,
+            )
+        };
+
+        for i in 0..record_count {
+            let record = &records[i];
+            let ls_offset = write_offset + (i * PostingRecord::SIZE) as u64;
+
+            let sig_record = signing.sign_posting(
+                record.transfer_id_hi,
+                record.transfer_id_lo,
+                record.gsn,
+                ls_offset,
+                record,
+            );
+
+            let sig_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &sig_record as *const SigRecord as *const u8,
+                    SigRecord::SIZE,
+                )
+            };
+            sign_buffer.extend_from_slice(sig_bytes);
+        }
+    }
+
+    fn sign_batch(&mut self, signing: &mut SigningState) {
+        let record_count = self.buffer_len / PostingRecord::SIZE;
+        if record_count == 0 {
+            return;
+        }
+
+        let records = unsafe {
+            std::slice::from_raw_parts(
+                self.buffer_ptr as *const PostingRecord,
+                record_count,
+            )
+        };
+
+        for i in 0..record_count {
+            let record = &records[i];
+            let ls_offset = self.write_offset + (i * PostingRecord::SIZE) as u64;
+
+            let sig_record = signing.sign_posting(
+                record.transfer_id_hi,
+                record.transfer_id_lo,
+                record.gsn,
+                ls_offset,
+                record,
+            );
+
+            let sig_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &sig_record as *const SigRecord as *const u8,
+                    SigRecord::SIZE,
+                )
+            };
+            self.sign_buffer.extend_from_slice(sig_bytes);
+        }
     }
 
     pub fn poll_and_handle_completions(&mut self) {
@@ -264,10 +363,47 @@ impl<T: FlushBackend> LsWriter<T> {
             .fallocate(self.max_ls_file_size)
             .expect("Failed to fallocate LS file");
 
+        if self.signing_state.is_none() {
+            let sign_path = format!("{}.sign", self.ls_file_path);
+            let c_path = std::ffi::CString::new(sign_path.as_str()).unwrap();
+            let fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY,
+                    0o644,
+                )
+            };
+            assert!(fd >= 0, "Failed to open ls_sign file");
+            self.sign_fd = fd;
+        }
+
         println!(
             "[ls-writer {}] initialized: file={}, max_size={}MB",
             self.id, self.ls_file_path, self.max_ls_file_size / (1024 * 1024),
         );
+    }
+
+    fn flush_sign_buffer(&mut self) {
+        if self.sign_buffer.is_empty() || self.sign_fd < 0 {
+            return;
+        }
+
+        let written = unsafe {
+            libc::pwrite(
+                self.sign_fd,
+                self.sign_buffer.as_ptr() as *const libc::c_void,
+                self.sign_buffer.len(),
+                self.sign_write_offset as libc::off_t,
+            )
+        };
+
+        assert!(written > 0, "ls_sign pwrite failed");
+
+        let sync_result = unsafe { libc::fdatasync(self.sign_fd) };
+        assert_eq!(sync_result, 0, "ls_sign fdatasync failed");
+
+        self.sign_write_offset += written as u64;
+        self.sign_buffer.clear();
     }
 
     fn maybe_advance_committed_gsn(&self) {
@@ -285,6 +421,7 @@ impl<T: FlushBackend> LsWriter<T> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use ed25519_dalek::SigningKey;
     use super::*;
     use crate::flush_backend::{FlushBackend, FlushCompletion};
     use pipeline::posting_record::PostingRecord;
@@ -296,7 +433,6 @@ mod tests {
     const K0: u64 = 0x0123456789ABCDEF;
     const K1: u64 = 0xFEDCBA9876543210;
 
-    // --- Mock FlushBackend ---
 
     struct MockFlushBackend {
         written: Vec<(Vec<u8>, u64)>,
@@ -368,6 +504,7 @@ mod tests {
             64,
             2,
             512,
+            None,
         );
         writer.initialize();
         writer
@@ -400,6 +537,7 @@ mod tests {
             K0,
             K1,
             64, 2, 512,
+            None,
         );
         writer.initialize();
 
@@ -427,7 +565,7 @@ mod tests {
         slot.posting.gsn = gsn;
         slot.posting.amount = amount;
         slot.posting.transfer_id_hi = 0;
-        slot.posting.transfer_id_lo = gsn; // для простоты transfer_id_lo = gsn
+        slot.posting.transfer_id_lo = gsn;
         slot
     }
 
@@ -441,6 +579,63 @@ mod tests {
         slot
     }
 
+    fn make_writer_with_signing(signing: SigningState) -> LsWriter<MockFlushBackend> {
+        let ls_writer_rb = Arc::new(
+            MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
+        );
+        let flush_done_rb = Arc::new(
+            MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()
+        );
+
+        unsafe { TEST_COMMITTED_GSN = 0; }
+        let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
+
+        let key = SigningKey::from_bytes(&[0x42u8; 32]);
+        let genesis = [0u8; 32];
+
+        let mut writer = LsWriter::new(
+            0,
+            ls_writer_rb,
+            flush_done_rb,
+            committed_gsn_ptr,
+            MockFlushBackend::new(),
+            "test.ls".to_string(),
+            0,
+            64, K0, K1,
+            64, 2, 512,
+            Some(signing),
+        );
+        writer.initialize();
+        writer
+    }
+
+
+    #[test]
+    fn sign_batch_creates_sig_records() {
+        let key = SigningKey::from_bytes(&[0x42u8; 32]);
+        let genesis = [0u8; 32];
+        let signing = SigningState::new(key, genesis);
+
+        let mut writer = make_writer_with_signing(signing);
+        writer.initialize();
+
+        let mut slot1 = make_posting_slot(100, 500);
+        slot1.posting.transfer_id_hi = 0;
+        slot1.posting.transfer_id_lo = 1;
+
+        let mut slot2 = make_posting_slot(100, -500);
+        slot2.posting.transfer_id_hi = 0;
+        slot2.posting.transfer_id_lo = 1;
+
+        writer.process_message(&slot1);
+        writer.process_message(&slot2);
+
+        assert!(writer.sign_buffer.is_empty());
+
+        writer.submit_flush();
+
+        assert_ne!(writer.signing_state.as_ref().unwrap().last_tx_hash(), &genesis);
+    }
 
     #[test]
     fn initialize_opens_file() {
@@ -499,7 +694,7 @@ mod tests {
         writer.process_message(&make_posting_slot(200, 300));
         writer.process_message(&make_posting_slot(300, 100));
 
-        assert_eq!(writer.buffer_len, PostingRecord::SIZE * 3); // 384 байт
+        assert_eq!(writer.buffer_len, PostingRecord::SIZE * 3);
     }
 
     #[test]
@@ -567,6 +762,7 @@ mod tests {
 
         writer.process_message(&make_posting_slot(100, 500));
         writer.submit_flush();
+
         writer.process_message(&make_posting_slot(200, 300));
         writer.submit_flush();
 

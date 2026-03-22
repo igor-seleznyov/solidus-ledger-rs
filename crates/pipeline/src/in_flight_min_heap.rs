@@ -304,7 +304,6 @@ mod tests {
         ifmh.add(200);
         ifmh.add(300);
 
-        // Удаляем средний — min не меняется
         ifmh.remove(200);
         assert_eq!(ifmh.min(), Some(100));
         assert_eq!(ifmh.len(), 2);
@@ -327,7 +326,6 @@ mod tests {
     #[test]
     fn remove_out_of_order() {
         let mut ifmh = InFlightMinHeap::new(64, K0, K1);
-
         for gsn in 1..=10u64 {
             ifmh.add(gsn * 100);
         }
