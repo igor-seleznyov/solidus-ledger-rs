@@ -3,7 +3,6 @@ use ringbuf::hash_table_slot_status::SLOT_FREE;
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct AccountSlot {
-    // ═══ Cache line 0: hot data (each PREPARE) ═══
     pub account_id_hi: u64,
     pub account_id_lo: u64,
     pub psl: u8,
@@ -15,7 +14,6 @@ pub struct AccountSlot {
     pub last_gsn: u64,
     pub initial_balance: i64,
 
-    // ═══ Cache line 1: lifecycle (more rarely) ═══
     pub ordinal: u64,
     pub total_operations: u64,
     pub first_operation_time_ns: u64,
@@ -26,7 +24,6 @@ pub struct AccountSlot {
     pub last_snapshot_ts_ms: u64,
     pub _reserved1: [u8; 8],
 
-    // ═══ Cache line 2: persistence + reserve ═══
     pub ls_filename_hash: u64,
     pub ls_offset: u64,
     pub _reserved2: [u8; 48],
