@@ -52,6 +52,22 @@ Framing, handshake, batch validation, codec.
 - prepare_success_bitmap in TransferSlot
 - DM sends ROLLBACK only for entries with PREPARE_SUCCESS
 
+### Miri + Loom Testing
+- **Miri** (unsafe correctness, single-thread):
+  - PAHT: Robin Hood swap, ptr::write, lookup through raw pointers (4 tests)
+  - PVT: Robin Hood swap, inline/overflow write, read_balance (4 tests)
+  - THT: Hopscotch insert/lookup/remove, bitmap, copy_nonoverlapping (6 tests)
+  - SPSC Ring Buffer: claim/publish/read/release, batch, wrap-around (8 tests)
+  - MPSC Ring Buffer: claim/publish/read, batch, fetch_add correctness (9 tests)
+  - IFMH: existing tests (Vec-based, Miri-compatible)
+- **Loom** (concurrency correctness, C11 abstract memory model, all interleavings exhaustively verified):
+  - THT ready barrier: Pipeline release_store(ready=1) → DM acquire_load(ready) (2 tests)
+  - global_committed_gsn: LS Writer release → DM acquire, sequential flushes (2 tests)
+  - MPSC sequence barrier: Release store → Acquire load (not Relaxed+fence — correct per C11) (2 tests)
+  - Three-thread Pipeline→Actor→DM: transitive happens-before chain across two independent release/acquire pairs verified under all interleavings (3 tests)
+  - Three-thread LS Writer→DM→IO: transitive durability guarantee — if client sees COMMITTED, fdatasync is proven complete under all interleavings (2 tests)
+  - MPSC two writers: fetch_add atomicity — no double claim under any interleaving (1 test)
+
 ## In Progress
 
 ### Step 8: LS Writer + Persistence + Signing + CRC32C ← current

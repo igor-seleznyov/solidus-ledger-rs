@@ -5,3 +5,11 @@ edition = "2024"
 
 [dependencies]
 libc.workspace = true
+loom = { version = "0.7.2", optional = true }
+
+[dev-dependencies]
+loom = "0.7"
+
+[loom]
+[features]
+loom = ["dep:loom"]
