@@ -303,3 +303,182 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod miri_tests {
+    use crate::account_slot::AccountSlot;
+    use common::siphash::siphash13;
+    use ringbuf::hash_table_slot_status::{SLOT_FREE, SLOT_OCCUPIED};
+
+    struct MiriPaht {
+        #[allow(dead_code)]
+        storage: Vec<AccountSlot>,
+        slots: *mut AccountSlot,
+        capacity: usize,
+        mask: usize,
+        count: usize,
+        seed_k0: u64,
+        seed_k1: u64,
+    }
+
+    impl MiriPaht {
+        fn new(capacity: usize, seed_k0: u64, seed_k1: u64) -> Self {
+            let mut storage = vec![AccountSlot::zeroed(); capacity];
+            let slots = storage.as_mut_ptr();
+            Self {
+                storage,
+                slots,
+                capacity,
+                mask: capacity - 1,
+                count: 0,
+                seed_k0,
+                seed_k1,
+            }
+        }
+
+        unsafe fn get_or_create(&mut self, id_hi: u64, id_lo: u64) -> *mut AccountSlot {
+            let hash = siphash13(self.seed_k0, self.seed_k1, id_hi, id_lo);
+            let mut pos = (hash as usize) & self.mask;
+            let mut psl: u8 = 1;
+
+            let mut inserting = AccountSlot::zeroed();
+            inserting.account_id_hi = id_hi;
+            inserting.account_id_lo = id_lo;
+            inserting.psl = 1;
+            inserting.status = SLOT_OCCUPIED;
+
+            let mut result: *mut AccountSlot = std::ptr::null_mut();
+
+            loop {
+                let slot = self.slots.add(pos);
+
+                let slot_psl = (*slot).psl;
+                let slot_status = (*slot).status;
+
+                if slot_status == SLOT_FREE {
+                    std::ptr::write(slot, inserting);
+                    self.count += 1;
+                    return if result.is_null() { slot } else { result };
+                }
+
+                let slot_id_hi = (*slot).account_id_hi;
+                let slot_id_lo = (*slot).account_id_lo;
+
+                if slot_id_hi == id_hi && slot_id_lo == id_lo {
+                    return slot;
+                }
+
+                if slot_psl < psl {
+                    std::mem::swap(&mut *slot, &mut inserting);
+                    psl = inserting.psl;
+                    if result.is_null() {
+                        result = slot;
+                    }
+                }
+
+                pos = (pos + 1) & self.mask;
+                psl += 1;
+                inserting.psl = psl;
+            }
+        }
+
+        unsafe fn lookup(&self, id_hi: u64, id_lo: u64) -> Option<*mut AccountSlot> {
+            let hash = siphash13(self.seed_k0, self.seed_k1, id_hi, id_lo);
+            let mut pos = (hash as usize) & self.mask;
+            let mut psl: u8 = 1;
+
+            loop {
+                let slot = self.slots.add(pos);
+
+                let slot_psl = (*slot).psl;
+                let slot_status = (*slot).status;
+
+                if slot_status == SLOT_FREE {
+                    return None;
+                }
+
+                if slot_psl < psl {
+                    return None;
+                }
+
+                let account_id_hi = (*slot).account_id_hi;
+                let slot_id_lo = (*slot).account_id_lo;
+
+                if account_id_hi == id_hi && slot_id_lo == id_lo {
+                    return Some(slot);
+                }
+
+                pos = (pos + 1) & self.mask;
+                psl += 1;
+            }
+        }
+    }
+
+    const K0: u64 = 0x0123456789ABCDEF;
+    const K1: u64 = 0xFEDCBA9876543210;
+
+    #[test]
+    fn miri_paht_insert_and_lookup() {
+        let mut table = MiriPaht::new(64, K0, K1);
+
+        unsafe {
+            let slot = table.get_or_create(100, 200);
+            (*slot).balance = 1000;
+
+            let found = table.lookup(100, 200);
+            assert!(found.is_some());
+            assert_eq!((*found.unwrap()).balance, 1000);
+        }
+    }
+
+    #[test]
+    fn miri_paht_swap_on_collision() {
+        let mut table = MiriPaht::new(16, K0, K1);
+
+        unsafe {
+            for i in 0..10u64 {
+                let slot = table.get_or_create(i, i * 100);
+                (*slot).balance = i as i64 * 1000;
+            }
+
+            for i in 0..10u64 {
+                let found = table.lookup(i, i * 100);
+                assert!(found.is_some(), "not found: {}", i);
+                assert_eq!((*found.unwrap()).balance, i as i64 * 1000);
+            }
+        }
+    }
+
+    #[test]
+    fn miri_paht_duplicate_returns_same_slot() {
+        let mut table = MiriPaht::new(64, K0, K1);
+
+        unsafe {
+            let slot1 = table.get_or_create(100, 200);
+            (*slot1).balance = 500;
+
+            let slot2 = table.get_or_create(100, 200);
+            assert_eq!(slot1, slot2);
+            assert_eq!((*slot2).balance, 500);
+            assert_eq!(table.count, 1);
+        }
+    }
+
+    #[test]
+    fn miri_paht_high_load_factor() {
+        let mut table = MiriPaht::new(32, K0, K1);
+
+        unsafe {
+            for i in 0..24u64 {
+                let slot = table.get_or_create(i, i);
+                (*slot).balance = i as i64;
+            }
+
+            for i in 0..24u64 {
+                let found = table.lookup(i, i);
+                assert!(found.is_some(), "not found at load 75%: {}", i);
+                assert_eq!((*found.unwrap()).balance, i as i64);
+            }
+        }
+    }
+}

@@ -707,3 +707,285 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod miri_tests {
+    use std::cell::UnsafeCell;
+    use common::siphash::siphash13;
+    use pipeline::transfer_slot::TransferSlot;
+    use pipeline::transfer_hash_table_entry::TransferHashTableEntry;
+    use ringbuf::hash_table_slot_status::{SLOT_DELETED, SLOT_FREE, SLOT_OCCUPIED};
+
+    const NEIGHBOURHOOD_SIZE: usize = 32;
+
+    struct MiriTht {
+        #[allow(dead_code)]
+        storage: Vec<TransferSlot>,
+        slots: *mut TransferSlot,
+        hop_bitmaps: Vec<u32>,
+        #[allow(dead_code)]
+        overflow_storage: Vec<TransferHashTableEntry>,
+        overflow_base: *mut TransferHashTableEntry,
+        overflow_per_slot: usize,
+        capacity: usize,
+        mask: usize,
+        count: UnsafeCell<usize>,
+        seed_k0: u64,
+        seed_k1: u64,
+    }
+
+    impl MiriTht {
+        fn new(capacity: usize, seed_k0: u64, seed_k1: u64) -> Self {
+            let mut storage = vec![TransferSlot::zeroed(); capacity];
+            let slots = storage.as_mut_ptr();
+            let hop_bitmaps = vec![0u32; capacity];
+            let overflow_per_slot = 2;
+            let mut overflow_storage = vec![
+                TransferHashTableEntry::zeroed();
+                capacity * overflow_per_slot
+            ];
+            let overflow_base = overflow_storage.as_mut_ptr();
+
+            Self {
+                storage,
+                slots,
+                hop_bitmaps,
+                overflow_storage,
+                overflow_base,
+                overflow_per_slot,
+                capacity,
+                mask: capacity - 1,
+                count: UnsafeCell::new(0),
+                seed_k0,
+                seed_k1,
+            }
+        }
+
+        fn count(&self) -> usize {
+            unsafe { *self.count.get() }
+        }
+
+        unsafe fn insert(&self, id_hi: u64, id_lo: u64) -> u32 {
+            let hash = siphash13(self.seed_k0, self.seed_k1, id_hi, id_lo);
+            let fp = (hash >> 56) as u8;
+            let home = (hash as usize) & self.mask;
+
+            let bitmap = self.hop_bitmaps[home];
+            let mut check_bits = bitmap;
+            while check_bits != 0 {
+                let bit_pos = check_bits.trailing_zeros() as usize;
+                let pos = (home + bit_pos) & self.mask;
+                let slot = self.slots.add(pos);
+                if (*slot).fingerprint == fp
+                    && (*slot).transfer_id_hi == id_hi
+                    && (*slot).transfer_id_lo == id_lo
+                    && (*slot).status == SLOT_OCCUPIED
+                {
+                    return pos as u32;
+                }
+                check_bits &= check_bits - 1;
+            }
+
+            for offset in 0..NEIGHBOURHOOD_SIZE {
+                let pos = (home + offset) & self.mask;
+                let slot = self.slots.add(pos);
+                if (*slot).status == SLOT_FREE || (*slot).status == SLOT_DELETED {
+                    self.write_new_slot(slot, id_hi, id_lo, fp);
+
+                    let bitmaps_ptr = self.hop_bitmaps.as_ptr() as *mut u32;
+                    *bitmaps_ptr.add(home) |= 1u32 << offset;
+                    *self.count.get() += 1;
+                    return pos as u32;
+                }
+            }
+
+            panic!("THT full in Miri test");
+        }
+
+        unsafe fn write_new_slot(
+            &self,
+            slot: *mut TransferSlot,
+            id_hi: u64,
+            id_lo: u64,
+            fp: u8,
+        ) {
+            let new_slot = TransferSlot {
+                transfer_id_hi: id_hi,
+                transfer_id_lo: id_lo,
+                fingerprint: fp,
+                status: SLOT_OCCUPIED,
+                entries_count: 2,
+                ..TransferSlot::zeroed()
+            };
+            std::ptr::copy_nonoverlapping(&new_slot, slot, 1);
+        }
+
+        unsafe fn lookup(&self, id_hi: u64, id_lo: u64) -> Option<u32> {
+            let hash = siphash13(self.seed_k0, self.seed_k1, id_hi, id_lo);
+            let fp = (hash >> 56) as u8;
+            let home = (hash as usize) & self.mask;
+
+            let bitmap = self.hop_bitmaps[home];
+            let mut check_bits = bitmap;
+
+            while check_bits != 0 {
+                let bit_pos = check_bits.trailing_zeros() as usize;
+                let pos = (home + bit_pos) & self.mask;
+                let slot = self.slots.add(pos);
+
+                if (*slot).status == SLOT_OCCUPIED
+                    && (*slot).fingerprint == fp
+                    && (*slot).transfer_id_hi == id_hi
+                    && (*slot).transfer_id_lo == id_lo
+                {
+                    return Some(pos as u32);
+                }
+                check_bits &= check_bits - 1;
+            }
+            None
+        }
+
+        unsafe fn remove(&self, offset: u32) {
+            let pos = offset as usize;
+            let slot = self.slots.add(pos);
+
+            let hash = siphash13(
+                self.seed_k0, self.seed_k1,
+                (*slot).transfer_id_hi, (*slot).transfer_id_lo,
+            );
+            let home = (hash as usize) & self.mask;
+
+            let bit_offset = if pos >= home {
+                pos - home
+            } else {
+                pos + self.capacity - home
+            };
+
+            let bitmaps_ptr = self.hop_bitmaps.as_ptr() as *mut u32;
+            *bitmaps_ptr.add(home) &= !(1u32 << bit_offset);
+            (*slot).status = SLOT_DELETED;
+            *self.count.get() -= 1;
+        }
+
+        unsafe fn fill_entry(&self, offset: u32, index: usize, entry: &TransferHashTableEntry) {
+            let slot = self.slots.add(offset as usize);
+            std::ptr::copy_nonoverlapping(entry, &mut (*slot).entries[index], 1);
+        }
+
+        unsafe fn get_entry(&self, offset: u32, index: usize) -> &TransferHashTableEntry {
+            if index < 8 {
+                let slot = self.slots.add(offset as usize);
+                &(*slot).entries[index]
+            } else {
+                &*self.overflow_base.add(
+                    offset as usize * self.overflow_per_slot + (index - 8),
+                )
+            }
+        }
+    }
+
+    const K0: u64 = 0x0123456789ABCDEF;
+    const K1: u64 = 0xFEDCBA9876543210;
+
+    #[test]
+    fn miri_tht_insert_and_lookup() {
+        let table = MiriTht::new(64, K0, K1);
+
+        unsafe {
+            let offset = table.insert(100, 200);
+            let found = table.lookup(100, 200);
+            assert_eq!(found, Some(offset));
+            assert_eq!(table.count(), 1);
+        }
+    }
+
+    #[test]
+    fn miri_tht_insert_duplicate() {
+        let table = MiriTht::new(64, K0, K1);
+
+        unsafe {
+            let offset1 = table.insert(100, 200);
+            let offset2 = table.insert(100, 200);
+            assert_eq!(offset1, offset2);
+            assert_eq!(table.count(), 1);
+        }
+    }
+
+    #[test]
+    fn miri_tht_remove() {
+        let table = MiriTht::new(64, K0, K1);
+
+        unsafe {
+            let offset = table.insert(100, 200);
+            assert_eq!(table.count(), 1);
+
+            table.remove(offset);
+            assert_eq!(table.count(), 0);
+            assert_eq!(table.lookup(100, 200), None);
+        }
+    }
+
+    #[test]
+    fn miri_tht_fill_and_get_entry() {
+        let table = MiriTht::new(64, K0, K1);
+
+        unsafe {
+            let offset = table.insert(100, 200);
+
+            let mut entry = TransferHashTableEntry::zeroed();
+            entry.account_id_hi = 0xAAAA;
+            entry.account_id_lo = 0xBBBB;
+            entry.amount = 5000;
+            entry.entry_type = 1;
+
+            table.fill_entry(offset, 0, &entry);
+
+            let read_entry = table.get_entry(offset, 0);
+            assert_eq!(read_entry.account_id_hi, 0xAAAA);
+            assert_eq!(read_entry.account_id_lo, 0xBBBB);
+            assert_eq!(read_entry.amount, 5000);
+        }
+    }
+
+    #[test]
+    fn miri_tht_multiple_inserts_and_removes() {
+        let table = MiriTht::new(64, K0, K1);
+
+        unsafe {
+            let mut offsets = Vec::new();
+            for i in 0..20u64 {
+                offsets.push(table.insert(i, i * 100));
+            }
+            assert_eq!(table.count(), 20);
+
+            for i in 0..20u64 {
+                assert!(table.lookup(i, i * 100).is_some());
+            }
+
+            for i in 0..10 {
+                table.remove(offsets[i]);
+            }
+            assert_eq!(table.count(), 10);
+
+            for i in 0..10u64 {
+                assert_eq!(table.lookup(i, i * 100), None);
+            }
+            for i in 10..20u64 {
+                assert!(table.lookup(i, i * 100).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn miri_tht_copy_nonoverlapping_in_write_new_slot() {
+        let table = MiriTht::new(64, K0, K1);
+
+        unsafe {
+            let offset = table.insert(0xDEAD, 0xBEEF);
+            let slot = table.slots.add(offset as usize);
+            assert_eq!((*slot).transfer_id_hi, 0xDEAD);
+            assert_eq!((*slot).transfer_id_lo, 0xBEEF);
+            assert_eq!((*slot).status, SLOT_OCCUPIED);
+        }
+    }
+}

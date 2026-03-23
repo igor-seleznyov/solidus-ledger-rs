@@ -361,3 +361,294 @@ mod tests {
         drain.release();
     }
 }
+
+#[cfg(test)]
+mod miri_tests {
+    use std::cell::UnsafeCell;
+    use crate::slot::Slot;
+    use crate::slot::ClaimedSlot;
+    use crate::slot::ReadSlot;
+    use crate::batch::ClaimedBatch;
+    use crate::batch::DrainBatch;
+    use crate::sequence_mem_barrier::read_sequence_acquire;
+
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct TestSlot {
+        sequence: u64,
+        value: u64,
+        _padding: [u8; 48],
+    }
+
+    unsafe impl Slot for TestSlot {
+        fn sequence(&self) -> u64 { self.sequence }
+        fn set_sequence(&mut self, seq: u64) { self.sequence = seq; }
+    }
+
+    struct MiriSpsc {
+        writer_seq: Box<UnsafeCell<u64>>,
+        consumer_seq: Box<UnsafeCell<u64>>,
+        slots: Vec<TestSlot>,
+        capacity: usize,
+        mask: usize,
+    }
+
+    impl MiriSpsc {
+        fn new(capacity: usize) -> Self {
+            assert!(capacity.is_power_of_two());
+
+            let writer_seq = Box::new(UnsafeCell::new(0u64));
+            let consumer_seq = Box::new(UnsafeCell::new(0u64));
+
+            let mut slots = vec![TestSlot { sequence: 0, value: 0, _padding: [0; 48] }; capacity];
+            for i in 0..capacity {
+                slots[i].set_sequence(i as u64);
+            }
+
+            Self {
+                writer_seq, consumer_seq, slots,
+                capacity, mask: capacity - 1,
+            }
+        }
+
+        fn writer_seq_ptr(&self) -> *mut u64 {
+            self.writer_seq.get()
+        }
+
+        fn consumer_seq_ptr(&self) -> *mut u64 {
+            self.consumer_seq.get()
+        }
+
+        fn claim(&self) -> ClaimedSlot<'_, TestSlot> {
+            let seq = unsafe { *self.writer_seq_ptr() };
+            let index = (seq as usize) & self.mask;
+            let base = self.slots.as_ptr() as *mut TestSlot;
+            let slot_ptr = unsafe { &mut *base.add(index) };
+
+            let expected_seq = seq;
+            loop {
+                let current = read_sequence_acquire(slot_ptr);
+                if current == expected_seq {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+
+            unsafe { *self.writer_seq_ptr() = seq + 1; }
+
+            ClaimedSlot {
+                slot: slot_ptr,
+                sequence: seq + self.capacity as u64,
+            }
+        }
+
+        fn try_read(&self) -> Option<ReadSlot<TestSlot>> {
+            let consumer = unsafe { *self.consumer_seq_ptr() };
+            let index = (consumer as usize) & self.mask;
+            let base = self.slots.as_ptr() as *mut TestSlot;
+            let slot_ptr = unsafe { base.add(index) };
+
+            let expected_seq = consumer + self.capacity as u64;
+            let current = read_sequence_acquire(unsafe { &*slot_ptr });
+
+            if current != expected_seq {
+                return None;
+            }
+
+            Some(ReadSlot {
+                slot_ptr: slot_ptr as *const TestSlot,
+                consumer_seq: self.consumer_seq_ptr(),
+                next_seq: consumer + 1,
+                release_seq: consumer + self.capacity as u64,
+            })
+        }
+
+        fn claim_batch(&self, count: usize) -> ClaimedBatch<TestSlot> {
+            let start = unsafe { *self.writer_seq_ptr() };
+            let base = self.slots.as_ptr() as *mut TestSlot;
+
+            let last_index = ((start + count as u64 - 1) as usize) & self.mask;
+            let last_slot = unsafe { &*base.add(last_index) };
+            let expected_seq = start + count as u64 - 1;
+
+            loop {
+                let current = read_sequence_acquire(last_slot);
+                if current == expected_seq {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+
+            unsafe { *self.writer_seq_ptr() = start + count as u64; }
+
+            ClaimedBatch {
+                base,
+                mask: self.mask,
+                start,
+                count,
+                capacity: self.capacity as u64,
+            }
+        }
+
+        fn drain_batch(&self, max_count: usize) -> DrainBatch<TestSlot> {
+            let consumer = unsafe { *self.consumer_seq_ptr() };
+            let base = self.slots.as_ptr() as *mut TestSlot;
+
+            let mut ready_count = 0;
+            for i in 0..max_count {
+                let seq = consumer + i as u64;
+                let index = (seq as usize) & self.mask;
+                let slot = unsafe { &*base.add(index) };
+                let expected = seq + self.capacity as u64;
+
+                if read_sequence_acquire(slot) != expected {
+                    break;
+                }
+                ready_count += 1;
+            }
+
+            DrainBatch {
+                base,
+                mask: self.mask,
+                consumer_seq: self.consumer_seq_ptr(),
+                start: consumer,
+                count: ready_count,
+                capacity: self.capacity as u64,
+            }
+        }
+    }
+
+    #[test]
+    fn miri_spsc_single_claim_publish_read() {
+        let rb = MiriSpsc::new(16);
+
+        let mut claimed = rb.claim();
+        claimed.as_mut().value = 42;
+        claimed.publish();
+
+        let read = rb.try_read().expect("should have data");
+        assert_eq!(read.as_ref().value, 42);
+        read.release();
+    }
+
+    #[test]
+    fn miri_spsc_empty_read() {
+        let rb = MiriSpsc::new(16);
+        assert!(rb.try_read().is_none());
+    }
+
+    #[test]
+    fn miri_spsc_multiple_sequential() {
+        let rb = MiriSpsc::new(16);
+
+        for i in 0..10u64 {
+            let mut claimed = rb.claim();
+            claimed.as_mut().value = i * 100;
+            claimed.publish();
+
+            let read = rb.try_read().expect("should have data");
+            assert_eq!(read.as_ref().value, i * 100);
+            read.release();
+        }
+    }
+
+    #[test]
+    fn miri_spsc_fill_and_drain() {
+        let rb = MiriSpsc::new(16);
+
+        for i in 0..16u64 {
+            let mut claimed = rb.claim();
+            claimed.as_mut().value = i;
+            claimed.publish();
+        }
+
+        for i in 0..16u64 {
+            let read = rb.try_read().expect("should have data");
+            assert_eq!(read.as_ref().value, i);
+            read.release();
+        }
+
+        assert!(rb.try_read().is_none());
+    }
+
+    #[test]
+    fn miri_spsc_wrap_around() {
+        let rb = MiriSpsc::new(4);
+
+        for i in 0..20u64 {
+            let mut claimed = rb.claim();
+            claimed.as_mut().value = i;
+            claimed.publish();
+
+            let read = rb.try_read().expect("should have data");
+            assert_eq!(read.as_ref().value, i);
+            read.release();
+        }
+    }
+
+    #[test]
+    fn miri_spsc_batch_claim_and_drain() {
+        let rb = MiriSpsc::new(16);
+
+        let mut batch = rb.claim_batch(4);
+        for i in 0..batch.len() {
+            batch.slot_mut(i).value = (i * 10) as u64;
+        }
+        batch.publish();
+
+        let drain = rb.drain_batch(16);
+        assert_eq!(drain.len(), 4);
+        for i in 0..drain.len() {
+            assert_eq!(drain.slot(i).value, (i * 10) as u64);
+        }
+        drain.release();
+    }
+
+    #[test]
+    fn miri_spsc_batch_wrap_around() {
+        let rb = MiriSpsc::new(4);
+
+        for i in 0..3u64 {
+            let mut claimed = rb.claim();
+            claimed.as_mut().value = i;
+            claimed.publish();
+        }
+        let drain = rb.drain_batch(4);
+        assert_eq!(drain.len(), 3);
+        drain.release();
+
+        let mut batch = rb.claim_batch(4);
+        for i in 0..4 {
+            batch.slot_mut(i).value = (i + 100) as u64;
+        }
+        batch.publish();
+
+        let drain = rb.drain_batch(4);
+        assert_eq!(drain.len(), 4);
+        for i in 0..4 {
+            assert_eq!(drain.slot(i).value, (i + 100) as u64);
+        }
+        drain.release();
+    }
+
+    #[test]
+    fn miri_spsc_release_resets_sequence() {
+        let rb = MiriSpsc::new(4);
+
+        let mut claimed = rb.claim();
+        claimed.as_mut().value = 999;
+        claimed.publish();
+
+        let read = rb.try_read().expect("data");
+        assert_eq!(read.as_ref().value, 999);
+        read.release();
+
+        let mut claimed2 = rb.claim();
+        claimed2.as_mut().value = 888;
+        claimed2.publish();
+
+        let read2 = rb.try_read().expect("data");
+        assert_eq!(read2.as_ref().value, 888);
+        read2.release();
+    }
+}
