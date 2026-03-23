@@ -167,7 +167,7 @@ data/ikey/
 
 ## Project Status
 
-Actively developed. See [Implementation Steps](steps.md) for the full plan.
+Actively developed. See [Implementation Steps](STEPS.md) for the full plan.
 
 **Completed:**
 - Network layer (mio, binary protocol, batch validation)
@@ -179,13 +179,15 @@ Actively developed. See [Implementation Steps](steps.md) for the full plan.
 - CRC32C hardware-accelerated (SSE4.2)
 - Ed25519 signing with SHA-256 hash chain
 - LS/LS-SIGN file headers with CRC32C checksums
+- Miri testing: all hash tables (PAHT, PVT, THT) and ring buffers (SPSC, MPSC) verified for unsafe correctness
+- Loom testing: happens-before correctness verified in C11 abstract memory model with exhaustive interleaving exploration — three-thread transitive chains (Pipeline→Actor→DM, LS Writer→DM→IO), release/acquire barriers, MPSC fetch_add atomicity
 
 **In progress (Step 8):**
 - LS metadata infrastructure (LS-META files, MetaRecord, dual buffer)
-
-**Planned:**
 - LS file rotation and indexes
 - Snapshots and crash recovery
+
+**Planned:**
 - Rule Engine (configurable chart-of-accounts)
 - TLS (rustls over mio)
 - Deduplication (IdempotencyCheck)

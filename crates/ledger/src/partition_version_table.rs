@@ -642,3 +642,261 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod miri_tests {
+    use crate::partition_version_table_slot::PartitionVersionTableSlot;
+    use crate::version_record::VersionRecord;
+    use common::siphash::siphash13;
+    use ringbuf::hash_table_slot_status::{SLOT_FREE, SLOT_OCCUPIED};
+
+    struct MiriPvt {
+        #[allow(dead_code)]
+        storage: Vec<PartitionVersionTableSlot>,
+        slots: *mut PartitionVersionTableSlot,
+        #[allow(dead_code)]
+        overflow_storage: Vec<VersionRecord>,
+        overflow_base: *mut VersionRecord,
+        overflow_free_stack: Vec<u32>,
+        next_block: Vec<u32>,
+        capacity: usize,
+        mask: usize,
+        count: usize,
+        seed_k0: u64,
+        seed_k1: u64,
+    }
+
+    impl MiriPvt {
+        fn new(capacity: usize, seed_k0: u64, seed_k1: u64) -> Self {
+            let mut storage = vec![PartitionVersionTableSlot::zeroed(); capacity];
+            let slots = storage.as_mut_ptr();
+
+            let overflow_total = capacity * 8;
+            let mut overflow_storage = vec![VersionRecord::zeroed(); overflow_total];
+            let overflow_base = overflow_storage.as_mut_ptr();
+
+            let overflow_free_stack: Vec<u32> = (0..capacity as u32).rev().collect();
+            let next_block = vec![0u32; capacity];
+
+            Self {
+                storage,
+                slots,
+                overflow_storage,
+                overflow_base,
+                overflow_free_stack,
+                next_block,
+                capacity,
+                mask: capacity - 1,
+                count: 0,
+                seed_k0,
+                seed_k1,
+            }
+        }
+
+        unsafe fn get_or_create(&mut self, id_hi: u64, id_lo: u64) -> *mut PartitionVersionTableSlot {
+            let hash = siphash13(self.seed_k0, self.seed_k1, id_hi, id_lo);
+            let mut pos = (hash as usize) & self.mask;
+            let mut psl: u8 = 1;
+
+            let mut inserting = PartitionVersionTableSlot::zeroed();
+            inserting.account_id_hi = id_hi;
+            inserting.account_id_lo = id_lo;
+            inserting.psl = 1;
+            inserting.status = SLOT_OCCUPIED;
+
+            let mut result: *mut PartitionVersionTableSlot = std::ptr::null_mut();
+
+            loop {
+                let slot = self.slots.add(pos);
+                let slot_psl = (*slot).psl;
+                let slot_status = (*slot).status;
+
+                if slot_status == SLOT_FREE {
+                    inserting.psl = psl;
+                    std::ptr::write(slot, inserting);
+                    self.count += 1;
+                    return if result.is_null() { slot } else { result };
+                }
+
+                if (*slot).account_id_hi == id_hi && (*slot).account_id_lo == id_lo {
+                    return slot;
+                }
+
+                if slot_psl < psl {
+                    std::mem::swap(&mut *slot, &mut inserting);
+                    psl = inserting.psl;
+                    if result.is_null() {
+                        result = slot;
+                    }
+                }
+
+                pos = (pos + 1) & self.mask;
+                psl += 1;
+                inserting.psl = psl;
+            }
+        }
+
+        unsafe fn record_version(&mut self, id_hi: u64, id_lo: u64, gsn: u64, balance: i64) {
+            let slot = self.get_or_create(id_hi, id_lo);
+            let count = (*slot).count as usize;
+
+            if count < 8 {
+                (*slot).inline[count].gsn = gsn;
+                (*slot).inline[count].balance = balance;
+            } else {
+                let overflow_index = count - 8;
+                let block_number = overflow_index >> 3;
+                let entry_index = overflow_index & 7;
+
+                let block_id = self.get_or_alloc_overflow_chain(slot, block_number);
+                let ptr = self.overflow_base.add(block_id as usize * 8 + entry_index);
+                (*ptr).gsn = gsn;
+                (*ptr).balance = balance;
+            }
+
+            (*slot).count = (count + 1) as u32;
+        }
+
+        unsafe fn get_or_alloc_overflow_chain(
+            &mut self,
+            slot: *mut PartitionVersionTableSlot,
+            block_number: usize,
+        ) -> u32 {
+            if (*slot).overflow == 0 {
+                let block_id = self.overflow_free_stack.pop().expect("overflow exhausted");
+                (*slot).overflow = block_id + 1;
+            }
+
+            let mut current = (*slot).overflow - 1;
+            for _ in 0..block_number {
+                let next = self.next_block[current as usize];
+                if next == 0 {
+                    let new_block = self.overflow_free_stack.pop().expect("overflow exhausted");
+                    self.next_block[current as usize] = new_block + 1;
+                    current = new_block;
+                } else {
+                    current = next - 1;
+                }
+            }
+            current
+        }
+
+        unsafe fn read_balance(&self, id_hi: u64, id_lo: u64, committed_gsn: u64) -> Option<i64> {
+            let hash = siphash13(self.seed_k0, self.seed_k1, id_hi, id_lo);
+            let mut pos = (hash as usize) & self.mask;
+            let mut psl: u8 = 1;
+
+            let slot = loop {
+                let s = self.slots.add(pos);
+                if (*s).status == SLOT_FREE { return None; }
+                if (*s).psl < psl { return None; }
+                if (*s).account_id_hi == id_hi && (*s).account_id_lo == id_lo {
+                    break s;
+                }
+                pos = (pos + 1) & self.mask;
+                psl += 1;
+            };
+
+            let count = (*slot).count as usize;
+            let inline_count = if count <= 8 { count } else { 8 };
+            let mut latest_gsn = 0u64;
+            let mut latest_balance = None;
+
+            for i in 0..inline_count {
+                let r = &(*slot).inline[i];
+                if r.gsn <= committed_gsn && r.gsn > latest_gsn {
+                    latest_gsn = r.gsn;
+                    latest_balance = Some(r.balance);
+                }
+            }
+
+            if count > 8 && (*slot).overflow != 0 {
+                let mut remaining = count - 8;
+                let mut current_block = (*slot).overflow - 1;
+                while remaining > 0 {
+                    let entries = if remaining > 8 { 8 } else { remaining };
+                    for i in 0..entries {
+                        let r = &*self.overflow_base.add(current_block as usize * 8 + i);
+                        if r.gsn <= committed_gsn && r.gsn > latest_gsn {
+                            latest_gsn = r.gsn;
+                            latest_balance = Some(r.balance);
+                        }
+                    }
+                    remaining -= entries;
+                    if remaining > 0 {
+                        let next = self.next_block[current_block as usize];
+                        if next == 0 { break; }
+                        current_block = next - 1;
+                    }
+                }
+            }
+
+            latest_balance
+        }
+    }
+
+    const K0: u64 = 0x0123456789ABCDEF;
+    const K1: u64 = 0xFEDCBA9876543210;
+
+    #[test]
+    fn miri_pvt_inline_record_and_read() {
+        let mut table = MiriPvt::new(64, K0, K1);
+
+        unsafe {
+            table.record_version(100, 200, 1, 1000);
+            table.record_version(100, 200, 2, 2000);
+            table.record_version(100, 200, 3, 3000);
+
+            assert_eq!(table.read_balance(100, 200, 2), Some(2000));
+            assert_eq!(table.read_balance(100, 200, 3), Some(3000));
+            assert_eq!(table.read_balance(100, 200, 0), None);
+        }
+    }
+
+    #[test]
+    fn miri_pvt_overflow_record_and_read() {
+        let mut table = MiriPvt::new(64, K0, K1);
+
+        unsafe {
+            for i in 1..=12u64 {
+                table.record_version(100, 200, i, i as i64 * 100);
+            }
+
+            assert_eq!(table.read_balance(100, 200, 12), Some(1200));
+            assert_eq!(table.read_balance(100, 200, 8), Some(800));
+            assert_eq!(table.read_balance(100, 200, 5), Some(500));
+        }
+    }
+
+    #[test]
+    fn miri_pvt_swap_on_collision() {
+        let mut table = MiriPvt::new(16, K0, K1);
+
+        unsafe {
+            for i in 0..10u64 {
+                table.record_version(i, i * 100, i + 1, i as i64 * 1000);
+            }
+
+            for i in 0..10u64 {
+                let balance = table.read_balance(i, i * 100, i + 1);
+                assert_eq!(balance, Some(i as i64 * 1000), "wrong balance for account {}", i);
+            }
+        }
+    }
+
+    #[test]
+    fn miri_pvt_multiple_accounts() {
+        let mut table = MiriPvt::new(64, K0, K1);
+
+        unsafe {
+            table.record_version(1, 1, 10, 100);
+            table.record_version(2, 2, 10, 200);
+            table.record_version(3, 3, 10, 300);
+
+            assert_eq!(table.read_balance(1, 1, 10), Some(100));
+            assert_eq!(table.read_balance(2, 2, 10), Some(200));
+            assert_eq!(table.read_balance(3, 3, 10), Some(300));
+            assert_eq!(table.read_balance(4, 4, 10), None);
+        }
+    }
+}
