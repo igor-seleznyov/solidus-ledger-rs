@@ -82,6 +82,14 @@ pub struct StorageConfig {
     pub previous_files_directory: String,
     pub max_ls_file_size_mb: usize,
     pub signing_enabled: bool,
+    pub posting_metadata: PostingMetadata,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PostingMetadata {
+    pub enabled: bool,
+    pub record_size: usize,
 }
 
 impl Config {
@@ -171,6 +179,12 @@ impl Config {
         if self.storage.max_ls_file_size_mb == 0 {
             return Err("storage.max-ls-file-size-mb must be > 0".into());
         }
+        if self.storage.posting_metadata.enabled && self.storage.posting_metadata.record_size <= 0 {
+            return Err("posting-metadata.record_size must be > 0 if it is enabled".into());
+        }
+        if self.storage.posting_metadata.enabled && !self.storage.posting_metadata.record_size.is_power_of_two() {
+            return Err("posting-metadata.record_size must be a power of two".into());
+        }
         if let Some(ref path) = self.partitions.accounts_assignment_overrides_path {
             if path.is_empty() {
                 return Err("partitions.accounts-assignment-overrides-path must not be empty if specified".into());
@@ -256,6 +270,9 @@ storage:
   previous-files-directory: \"data/ls\"
   max-ls-file-size-mb: 256
   signing-enabled: true
+  posting-metadata:
+    enabled: true
+    record-size: 256
  ";
 
     #[test]
@@ -285,6 +302,8 @@ storage:
         assert_eq!(config.storage.max_ls_file_size_mb, 256);
         assert!(config.batch_accept.all_or_nothing);
         assert!(!config.batch_accept.partial_reject_by_transfer_sequence_id);
+        assert!(config.storage.posting_metadata.enabled);
+        assert_eq!(config.storage.posting_metadata.record_size, 256);
     }
 
     #[test]

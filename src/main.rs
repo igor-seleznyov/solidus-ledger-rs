@@ -298,6 +298,8 @@ fn main() {
                         flush_max_buffer,
                         None,
                         partition_count,
+                        config.storage.posting_metadata.enabled,
+                        config.storage.posting_metadata.record_size,
                     );
                     writer.run();
                 }
