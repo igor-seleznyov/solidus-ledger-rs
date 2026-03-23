@@ -11,6 +11,8 @@ use crate::sig_record::SigRecord;
 use crate::signing_state::SigningState;
 use crate::ls_file_header::{LsFileHeader};
 use crate::ls_sign_file_header::LsSignFileHeader;
+use crate::meta_record::MetaRecordWriter;
+use crate::ls_meta_file_header::LsMetaFileHeader;
 use crate::consts::LS_FILE_PAGE_SIZE;
 
 const CLOCK_CHECK_REPEATS_COUNT_INTERVAL: u32 = 100_000;
@@ -55,6 +57,16 @@ pub struct LsWriter<T: FlushBackend> {
     sign_write_offset: u64,
     partition_count: u16,
     file_seq: u64,
+
+    metadata_enabled: bool,
+    metadata_record_size: usize,
+    meta_record_writer: Option<MetaRecordWriter>,
+    meta_fd: i32,
+    meta_buffer_arena: Option<ringbuf::arena::Arena>,
+    meta_buffer_ptr: *mut u8,
+    meta_buffer_len: usize,
+    meta_buffer_capacity: usize,
+    meta_write_offset: u64,
 }
 
 impl<T: FlushBackend> LsWriter<T> {
@@ -74,12 +86,30 @@ impl<T: FlushBackend> LsWriter<T> {
         flush_max_buffer_posting_records: usize,
         signing_state: Option<SigningState>,
         partition_count: u16,
+        metadata_enabled: bool,
+        metadata_record_size: usize,
     ) -> Self {
         let flush_max_buffer_bytes = flush_max_buffer_posting_records * PostingRecord::SIZE;
         let buffer_capacity = (flush_max_buffer_bytes * 2 + 4095) & !4095;
         let buffer_arena = ringbuf::arena::Arena::new(buffer_capacity)
             .expect("Failed to create LS Writer buffer Arena");
         let buffer_ptr = buffer_arena.as_ptr();
+
+        let (
+            meta_record_writer,
+            meta_buffer_arena,
+            meta_buffer_ptr,
+            meta_buffer_capacity
+        ) = if metadata_enabled {
+            let writer = MetaRecordWriter::new(metadata_record_size);
+            let meta_capacity = flush_max_buffer_posting_records * metadata_record_size;
+            let meta_arena = ringbuf::arena::Arena::new(meta_capacity)
+                .expect("Failed to create postings metadata buffer Arena");
+            let meta_ptr = meta_arena.as_ptr();
+            (Some(writer), Some(meta_arena), meta_ptr, meta_capacity)
+        } else {
+            (None, None, std::ptr::null_mut(), 0)
+        };
 
         Self {
             id,
@@ -114,6 +144,16 @@ impl<T: FlushBackend> LsWriter<T> {
             sign_write_offset: 0,
             partition_count,
             file_seq: 0,
+
+            metadata_enabled,
+            metadata_record_size,
+            meta_record_writer,
+            meta_fd: -1,
+            meta_buffer_arena,
+            meta_buffer_ptr,
+            meta_buffer_len: 0,
+            meta_buffer_capacity,
+            meta_write_offset: 0,
         }
     }
 
@@ -174,6 +214,7 @@ impl<T: FlushBackend> LsWriter<T> {
         }
 
         self.flush_sign_buffer();
+        self.flush_meta_buffer();
 
         let padded_len = (self.buffer_len + 4095) & !4095;
 
@@ -192,6 +233,31 @@ impl<T: FlushBackend> LsWriter<T> {
 
         self.last_flush = Instant::now();
         self.idle_count = 0;
+    }
+
+    fn flush_meta_buffer(&mut self) {
+        if !self.metadata_enabled || self.meta_buffer_len == 0 || self.meta_fd < 0 {
+            return;
+        }
+
+        let written = unsafe {
+            libc::pwrite(
+                self.meta_fd,
+                self.meta_buffer_ptr as *const libc::c_void,
+                self.meta_buffer_len,
+                self.meta_write_offset as libc::off_t,
+            )
+        };
+
+        assert!(written > 0, "ls_meta pwrite failed");
+
+        let sync_result = unsafe {
+            libc::fdatasync(self.meta_fd)
+        };
+        assert_eq!(sync_result, 0, "ls_meta fdatasync failed");
+
+        self.meta_write_offset += written as u64;
+        self.meta_buffer_len = 0;
     }
 
     fn sign_batch_inner(
@@ -387,6 +453,7 @@ impl<T: FlushBackend> LsWriter<T> {
             self.max_ls_file_size as u64,
             self.file_seq,
             public_key_hash,
+            self.metadata_enabled,
         );
 
         let header_page = header.to_page();
@@ -440,12 +507,51 @@ impl<T: FlushBackend> LsWriter<T> {
             assert_eq!(sync_result, 0, "ls_sign header fdatasync failed");
         }
 
+        if self.metadata_enabled {
+            let meta_path = format!("{}.meta", self.ls_file_path);
+            let c_path = std::ffi::CString::new(meta_path.as_str()).unwrap();
+            let fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY,
+                    0o644,
+                )
+            };
+            assert!(fd >= 0, "Failed to open ls_meta file: {}", meta_path);
+            self.meta_fd = fd;
+
+            let meta_header = LsMetaFileHeader::new(
+                self.metadata_record_size as u32,
+                self.max_ls_file_size as u64,
+                self.file_seq,
+            );
+
+            let meta_header_page = meta_header.to_page();
+            let written = unsafe {
+                libc::pwrite(
+                    self.meta_fd,
+                    meta_header_page.as_ptr() as *const libc::c_void,
+                    meta_header_page.len(),
+                    0,
+                )
+            };
+            assert_eq!(written as usize, LS_FILE_PAGE_SIZE, "ls_meta header pwrite failed");
+
+            let sync_result = unsafe {
+                libc::fdatasync(self.meta_fd)
+            };
+            assert_eq!(sync_result, 0, "ls_meta header fdatasync failed");
+
+            self.meta_write_offset = LsMetaFileHeader::DATA_OFFSET as u64;
+        }
+
         println!(
-            "[ls-writer {}] initialized: file={}, max_size={}MB, signing={}, data_offset={}",
+            "[ls-writer {}] initialized: file={}, max_size={}MB, signing={}, metadata={}, data_offset={}",
             self.id,
             self.ls_file_path,
             self.max_ls_file_size / (1024 * 1024),
             if self.signing_state.is_some() { "enabled" } else { "disabled" },
+            if self.metadata_enabled { "enabled" } else { "disabled" },
             self.write_offset,
         );
     }
@@ -576,6 +682,38 @@ mod tests {
             512,
             None,
             16,
+            false,
+            0,
+        );
+        writer.initialize();
+        writer
+    }
+
+    fn make_writer_with_metadata(record_size: usize) -> LsWriter<MockFlushBackend> {
+        let ls_writer_rb = Arc::new(
+            MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
+        );
+        let flush_done_rb = Arc::new(
+            MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()
+        );
+
+        unsafe { TEST_COMMITTED_GSN = 0; }
+        let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
+
+        let mut writer = LsWriter::new(
+            0,
+            ls_writer_rb,
+            flush_done_rb,
+            committed_gsn_ptr,
+            MockFlushBackend::new(),
+            "test.ls".to_string(),
+            0,
+            64, K0, K1,
+            64, 2, 512,
+            None,
+            16,
+            true,
+            record_size,
         );
         writer.initialize();
         writer
@@ -610,6 +748,8 @@ mod tests {
             64, 2, 512,
             None,
             16,
+            false,
+            0,
         );
         writer.initialize();
 
@@ -678,6 +818,8 @@ mod tests {
             64, 2, 512,
             Some(signing),
             16,
+            false,
+            0,
         );
         writer.initialize();
         writer
@@ -1073,8 +1215,42 @@ mod tests {
     }
 
     #[test]
+    fn ls_meta_file_header_layout() {
+        assert_eq!(LsMetaFileHeader::SIZE, 128);
+        assert_eq!(std::mem::size_of::<LsMetaFileHeader>(), 128);
+
+        assert_eq!(std::mem::offset_of!(LsMetaFileHeader, magic), 0);
+        assert_eq!(std::mem::offset_of!(LsMetaFileHeader, format_version), 8);
+        assert_eq!(std::mem::offset_of!(LsMetaFileHeader, file_type), 10);
+        assert_eq!(std::mem::offset_of!(LsMetaFileHeader, created_at_ns), 16);
+        assert_eq!(std::mem::offset_of!(LsMetaFileHeader, record_size), 24);
+        assert_eq!(std::mem::offset_of!(LsMetaFileHeader, data_offset), 28);
+        assert_eq!(std::mem::offset_of!(LsMetaFileHeader, max_file_size), 32);
+        assert_eq!(std::mem::offset_of!(LsMetaFileHeader, linked_ls_file_seq), 40);
+        assert_eq!(std::mem::offset_of!(LsMetaFileHeader, checksum), 120);
+    }
+
+    #[test]
+    fn metadata_enabled_initializes_meta_buffer() {
+        let writer = make_writer_with_metadata(256);
+        assert!(writer.metadata_enabled);
+        assert!(writer.meta_record_writer.is_some());
+        assert_eq!(writer.meta_buffer_len, 0);
+        assert_eq!(writer.metadata_record_size, 256);
+    }
+
+    #[test]
+    fn metadata_disabled_no_meta_buffer() {
+        let writer = make_writer();
+        assert!(!writer.metadata_enabled);
+        assert!(writer.meta_record_writer.is_none());
+        assert_eq!(writer.meta_buffer_len, 0);
+        assert_eq!(writer.meta_fd, -1);
+    }
+
+    #[test]
     fn ls_file_header_checksum() {
-        let header = LsFileHeader::new(false, 16, 256 * 1024 * 1024, 0, 0);
+        let header = LsFileHeader::new(false, 16, 256 * 1024 * 1024, 0, 0, false);
 
         assert_ne!(header.checksum, 0);
         assert!(unsafe { header.verify_checksum() });
@@ -1082,7 +1258,7 @@ mod tests {
 
     #[test]
     fn ls_file_header_to_page() {
-        let header = LsFileHeader::new(true, 16, 256 * 1024 * 1024, 1, 0x12345678);
+        let header = LsFileHeader::new(true, 16, 256 * 1024 * 1024, 1, 0x12345678, false);
         let page = header.to_page();
 
         assert_eq!(page.len(), 4096);

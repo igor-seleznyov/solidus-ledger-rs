@@ -39,3 +39,6 @@ storage:
   previous-files-directory: "data/ls"
   max-ls-file-size-mb: 256
   signing-enabled: false
+  posting-metadata:
+    enabled: false
+    record-size: 256

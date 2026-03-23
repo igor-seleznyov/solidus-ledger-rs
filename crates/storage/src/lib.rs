@@ -9,3 +9,5 @@ pub mod signing_state;
 pub mod ls_file_header;
 pub mod ls_sign_file_header;
 pub mod consts;
+pub mod meta_record;
+pub mod ls_meta_file_header;
