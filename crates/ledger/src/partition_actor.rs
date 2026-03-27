@@ -220,6 +220,8 @@ impl PartitionActor {
 
         ls_slot.msg_type = LS_MSG_POSTING;
         ls_slot.gsn = partition_slot.gsn;
+        
+        ls_slot.posting.set_magic();
 
         let (posting_transfer_id_hi, posting_transfer_id_lo) = raw_u128_to_u64(&partition_slot.transfer_id);
         (ls_slot.posting.transfer_id_hi, ls_slot.posting.transfer_id_lo) = (posting_transfer_id_hi, posting_transfer_id_lo);

@@ -17,10 +17,19 @@ use pipeline::partition_slot::PartitionSlot;
 use pipeline::coordinator_slot::CoordinatorSlot;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
 use storage::flush_done_slot::FlushDoneSlot;
+#[cfg(target_os = "linux")]
 use storage::io_uring_flush_backend::IoUringFlushBackend;
 use storage::ls_writer_slot::LsWriterSlot;
 use storage::portable_flush_backend::PortableFlushBackend;
 use storage::ls_writer::LsWriter;
+use storage::no_signing_strategy::NoSigningStrategy;
+use storage::no_metadata_strategy::NoMetadataStrategy;
+use storage::ed25519_signing_strategy::Ed25519SigningStrategy;
+use storage::posting_metadata_strategy::PostingMetadataStrategy;
+use storage::signing_state::SigningState;
+use storage::flush_backend::FlushBackend;
+use storage::signing_strategy::SigningStrategy;
+use storage::metadata_strategy::MetadataStrategy;
 
 fn main() {
     let config = Config::load("config.yaml").expect("Failed to load config");
@@ -277,34 +286,52 @@ fn main() {
             committed_gsn_arena.as_ptr().add(i * CPU_CACHE_LINE_SIZE) as usize
         };
 
-        thread::Builder::new()
-            .name(format!("ls-writer-{}", i))
-            .spawn(
-                move || {
-                    let backend = PortableFlushBackend::new();
-                    let mut writer = LsWriter::new(
-                        i,
-                        ls_writer_rb,
-                        ls_writer_flush_done_rb,
-                        ls_writer_committed_gsn as *mut u64,
-                        backend,
-                        ls_file_path,
-                        max_ls_file_size,
-                        1024,
-                        generate_random_u64(),
-                        generate_random_u64(),
-                        CPU_CACHE_LINE_SIZE,
-                        flush_timeout_ms,
-                        flush_max_buffer,
-                        None,
-                        partition_count,
-                        config.storage.posting_metadata.enabled,
-                        config.storage.posting_metadata.record_size,
-                    );
-                    writer.run();
+        let signing_enabled = config.storage.signing_enabled;
+        let metadata_enabled = config.storage.posting_metadata.enabled;
+        let metadata_record_size = config.storage.posting_metadata.record_size;
+
+        #[cfg(target_os = "linux")]
+        match IoUringFlushBackend::new() {
+            Ok(backend) => {
+                if i == 0 {
+                    println!("[main] Using io_uring flush backend");
                 }
-            ).expect("[main] Failed to spawn ls writer thread");
+                spawn_with_strategies(
+                    i, ls_writer_rb, ls_writer_flush_done_rb, ls_writer_committed_gsn,
+                    backend, ls_file_path, max_ls_file_size,
+                    flush_timeout_ms, flush_max_buffer, partition_count,
+                    signing_enabled, metadata_enabled, metadata_record_size,
+                );
+            }
+            Err(e) => {
+                if i == 0 {
+                    println!("[main] io_uring not available ({}), using portable flush backend", e);
+                }
+                let backend = PortableFlushBackend::new();
+                spawn_with_strategies(
+                    i, ls_writer_rb, ls_writer_flush_done_rb, ls_writer_committed_gsn,
+                    backend, ls_file_path, max_ls_file_size,
+                    flush_timeout_ms, flush_max_buffer, partition_count,
+                    signing_enabled, metadata_enabled, metadata_record_size,
+                );
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            if i == 0 {
+                println!("[main] Using portable flush backend");
+            }
+            let backend = PortableFlushBackend::new();
+            spawn_with_strategies(
+                i, ls_writer_rb, ls_writer_flush_done_rb, ls_writer_committed_gsn,
+                backend, ls_file_path, max_ls_file_size,
+                flush_timeout_ms, flush_max_buffer, partition_count,
+                signing_enabled, metadata_enabled, metadata_record_size,
+            );
+        }
     }
+
     println!("[main] {} decision maker threads started", decision_maker_shards);
     
     
@@ -332,4 +359,107 @@ fn main() {
     println!("Listening on {}", bind_address);
     let mut acceptor = net::acceptor::Acceptor::new(&bind_address, queues).unwrap();
     acceptor.run().unwrap();
+}
+
+fn spawn_ls_writer_thread<T, S, M>(
+    id: usize,
+    ls_writer_rb: Arc<MpscRingBuffer<LsWriterSlot>>,
+    flush_done_rb: Arc<MpscRingBuffer<FlushDoneSlot>>,
+    commit_gsn_addr: usize,
+    backend: T,
+    signing: S,
+    metadata: M,
+    ls_file_path: String,
+    max_ls_file_size: usize,
+    flush_timeout_ms: u64,
+    flush_max_buffer_posting_records: usize,
+    partition_count: u16,
+) where
+    T: FlushBackend + Send + 'static,
+    S: SigningStrategy + Send + 'static,
+    M: MetadataStrategy + Send + 'static, {
+    thread::Builder::new()
+        .name(format!("ls-writer-{}", id))
+        .spawn(
+            move || {
+                let mut writer = LsWriter::new(
+                    id,
+                    ls_writer_rb,
+                    flush_done_rb,
+                    commit_gsn_addr as *mut u64,
+                    backend,
+                    signing,
+                    metadata,
+                    ls_file_path,
+                    max_ls_file_size,
+                    1024,
+                    generate_random_u64(),
+                    generate_random_u64(),
+                    CPU_CACHE_LINE_SIZE,
+                    flush_timeout_ms,
+                    flush_max_buffer_posting_records,
+                    partition_count,
+                );
+                writer.run();
+            }
+        ).expect("[main] Failed to spawn ls-writer thread");
+}
+
+fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
+    id: usize,
+    ls_writer_rb: Arc<MpscRingBuffer<LsWriterSlot>>,
+    flush_done_rb: Arc<MpscRingBuffer<FlushDoneSlot>>,
+    committed_gsn_addr: usize,
+    backend: T,
+    ls_file_path: String,
+    max_ls_file_size: usize,
+    flush_timeout_ms: u64,
+    flush_max_buffer: usize,
+    partition_count: u16,
+    signing_enabled: bool,
+    metadata_enabled: bool,
+    metadata_record_size: usize,
+) {
+    if signing_enabled {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let genesis = [0u8; 32];
+        let signing = Ed25519SigningStrategy::new(
+            SigningState::new(key, genesis),
+            flush_max_buffer,
+        );
+
+        if metadata_enabled {
+            let metadata = PostingMetadataStrategy::new(metadata_record_size, flush_max_buffer);
+            spawn_ls_writer_thread(
+                id, ls_writer_rb, flush_done_rb, committed_gsn_addr,
+                backend, signing, metadata,
+                ls_file_path, max_ls_file_size,
+                flush_timeout_ms, flush_max_buffer, partition_count,
+            );
+        } else {
+            spawn_ls_writer_thread(
+                id, ls_writer_rb, flush_done_rb, committed_gsn_addr,
+                backend, signing, NoMetadataStrategy,
+                ls_file_path, max_ls_file_size,
+                flush_timeout_ms, flush_max_buffer, partition_count,
+            );
+        }
+    } else {
+        if metadata_enabled {
+            let metadata = PostingMetadataStrategy::new(metadata_record_size, flush_max_buffer);
+            spawn_ls_writer_thread(
+                id, ls_writer_rb, flush_done_rb, committed_gsn_addr,
+                backend, NoSigningStrategy, metadata,
+                ls_file_path, max_ls_file_size,
+                flush_timeout_ms, flush_max_buffer, partition_count,
+            );
+        } else {
+            spawn_ls_writer_thread(
+                id, ls_writer_rb, flush_done_rb, committed_gsn_addr,
+                backend, NoSigningStrategy, NoMetadataStrategy,
+                ls_file_path, max_ls_file_size,
+                flush_timeout_ms, flush_max_buffer, partition_count,
+            );
+        }
+    }
 }

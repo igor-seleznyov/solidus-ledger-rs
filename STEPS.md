@@ -84,11 +84,14 @@ Framing, handshake, batch validation, codec.
 - 8-6-1: CRC32C hw-accelerated (SSE4.2) + Ed25519 (ed25519-dalek) + SHA256 chain + SigningState + SigRecord (192 bytes) ✅
 - 8-6-2: Signing integration with LS Writer — ls_sign file, sign_batch, fdatasync ordering ✅
 - 8-7: LSFileHeader (128 bytes) + LSSignFileHeader + file creation/open ✅
-- 8-8: LS metadata — ls_meta file, MetaRecord, dual buffer, fdatasync ordering ← current substep
+- 8-8: LS metadata — ls_meta file, MetaRecord, PostingMetadataStrategy, fdatasync ordering ✅
+- 8-8-strategy-rf: Strategy pattern for Signing and Metadata — generic `LsWriter<T, S, M>`, SigningStrategy/MetadataStrategy traits, Ed25519SigningStrategy, PostingMetadataStrategy, NoSigningStrategy, NoMetadataStrategy, zero-cost static dispatch ✅
+- 8-8-storage-rf: Uniform FlushBackend API — `open_file → handle_index`, `submit_write/submit_sync/flush_submissions/wait_completions/poll_completion`, O_DIRECT + io_uring for sign and meta files, parallel sign+meta flush ✅
+- 8-8-main-rf: Runtime backend selection (io_uring / portable fallback), strategy wiring in main.rs, `spawn_with_strategies<T>` + `spawn_ls_writer_thread<T, S, M>`, `#[cfg(target_os)]` for platform support ✅
+- 8-12: main.rs wiring — LS Writer RB, Flush Done RB, LS Writer threads, global_committed_gsn ✅ (done in 8-8-main-rf)
 - 8-9: LS rotation — triggers: max_file_size, metadata schema change, rule change
 - 8-10: LS Index Builder — *.idx + *.index (sorted arrays by account_id, async at rotation)
 - 8-11: LS Sign Index — *.ls_sign_idx (sorted array by transfer_id, if signing enabled)
-- 8-12: main.rs wiring — LS Writer RB, Flush Done RB, LS Writer threads, global_committed_gsn
 - 8-t: Integration tests (DM → LS Writer → fdatasync → Flush Done → DM → THT cleanup)
 - 8-13: Snapshots + Recovery
   - 8-13-1: SLS file format — SnapshotRecord (per account: balance, ordinal, ls_offset)

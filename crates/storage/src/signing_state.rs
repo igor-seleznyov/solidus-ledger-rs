@@ -56,7 +56,7 @@ impl SigningState {
         let posting_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 posting as *const PostingRecord as *const u8,
-                124,
+                PostingRecord::SIZE,
             )
         };
 
@@ -97,6 +97,8 @@ impl SigningState {
         record.prev_tx_hash = prev_hash;
         record.postings_hash = postings_hash;
         record.signature = signature_bytes;
+
+        record.set_magic();
 
         unsafe { record.compute_checksum(); }
 
@@ -160,7 +162,7 @@ impl SigningState {
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     posting as *const PostingRecord as *const u8,
-                    PostingRecord::SIZE_WITHOUT_CHECKSUM
+                    PostingRecord::SIZE
                 )
             };
             Digest::update(&mut hasher, bytes);
