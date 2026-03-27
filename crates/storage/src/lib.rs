@@ -3,6 +3,7 @@ pub mod flush_done_slot;
 pub mod flush_backend;
 pub mod portable_flush_backend;
 pub mod ls_writer;
+#[cfg(target_os = "linux")]
 pub mod io_uring_flush_backend;
 pub mod sig_record;
 pub mod signing_state;
@@ -11,3 +12,10 @@ pub mod ls_sign_file_header;
 pub mod consts;
 pub mod meta_record;
 pub mod ls_meta_file_header;
+pub mod signing_strategy;
+pub mod ed25519_signing_strategy;
+pub mod no_signing_strategy;
+pub mod metadata_strategy;
+pub mod no_metadata_strategy;
+pub mod posting_metadata_strategy;
+pub mod pending_flush;

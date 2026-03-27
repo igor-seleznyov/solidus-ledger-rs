@@ -4,13 +4,27 @@ pub struct FlushCompletion {
 }
 
 pub trait FlushBackend {
-    fn open_ls_file(&mut self, path: &str) -> std::io::Result<()>;
-    
-    fn fallocate(&mut self, size: usize) -> std::io::Result<()>;
+    fn open_file(
+        &mut self,
+        path: &str,
+        prealloc_size: usize,
+    ) -> std::io::Result<u8>;
 
-    fn submit_write_and_sync(&mut self, data: &[u8], offset: u64) -> std::io::Result<()>;
+    fn submit_write(
+        &mut self,
+        handle_index: u8,
+        data: *const u8,
+        len: usize,
+        offset: u64,
+    ) -> std::io::Result<()>;
+
+    fn submit_sync(&mut self, handle_index: u8) -> std::io::Result<()>;
+
+    fn flush_submissions(&mut self) -> std::io::Result<()>;
+
+    fn wait_completions(&mut self, count: usize);
 
     fn poll_completion(&mut self) -> Option<FlushCompletion>;
-    
-    fn close(&mut self);
+
+    fn close_file(&mut self, handle_index: u8);
 }

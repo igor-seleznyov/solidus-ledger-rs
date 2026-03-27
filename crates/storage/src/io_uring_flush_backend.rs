@@ -7,12 +7,13 @@ const FSYNC_USER_DATA: u64 = 0xF1_05_D0_0E;
 const PWRITE_USER_DATA: u64 = 0x70_57_17_0E;
 const RING_ENTRIES: u32 = 32;
 const PAGE_SIZE: usize = 4096;
+const MAX_FILES: usize = 8;
 
 pub struct IoUringFlushBackend {
     ring: IoUring,
-    fd: RawFd,
+    fds: [i32; MAX_FILES],
+    fds_count: usize,
     pending_bytes: usize,
-    fsync_submitted: bool,
 }
 
 impl IoUringFlushBackend {
@@ -30,26 +31,18 @@ impl IoUringFlushBackend {
         Ok(
             Self {
                 ring,
-                fd: -1,
+                fds: [-1; MAX_FILES],
+                fds_count: 0,
                 pending_bytes: 0,
-                fsync_submitted: false,
             }
         )
-    }
-
-    fn fallocate(&self, size: usize) -> std::io::Result<()> {
-        let result = unsafe {
-            libc::fallocate(self.fd, 0, 0, size as libc::off_t)
-        };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
     }
 }
 
 impl FlushBackend for IoUringFlushBackend {
-    fn open_ls_file(&mut self, path: &str) -> std::io::Result<()> {
+    fn open_file(&mut self, path: &str, prealloc_size: usize) -> std::io::Result<u8> {
+        assert!(self.fds_count < MAX_FILES, "Too many open files");
+
         let c_path = CString::new(path).map_err(
             |_| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path")
@@ -68,78 +61,108 @@ impl FlushBackend for IoUringFlushBackend {
             return Err(std::io::Error::last_os_error());
         }
 
-        self.fd = fd;
-        Ok(())
-    }
-    
-    fn fallocate(&mut self, size: usize) -> std::io::Result<()> {
-        assert!(self.fd >= 0, "LS file is not opened");
-        if size == 0 {
-            return Ok(());
+        if prealloc_size > 0 {
+            let result = unsafe {
+                libc::fallocate(fd, 0, 0, prealloc_size as libc::off_t)
+            };
+            if result != 0 {
+                unsafe { libc::close(fd); }
+                return Err(std::io::Error::last_os_error());
+            }
         }
-        let result = unsafe {
-            libc::fallocate(self.fd, 0, 0, size as libc::off_t)
-        };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+
+        let handle = self.fds_count as u8;
+        self.fds[self.fds_count] = fd;
+        self.fds_count += 1;
+        Ok(handle)
     }
 
-    fn submit_write_and_sync(&mut self, data: &[u8], offset: u64) -> std::io::Result<()> {
-        assert!(self.fd >= 0, "LS file not opened");
-        assert!(!self.fsync_submitted, "Previous flush not completed");
-        assert_eq!(data.as_ptr() as usize % PAGE_SIZE, 0, "Buffer must be page-aligned for O_DIRECT");
-        assert_eq!(data.len() % PAGE_SIZE, 0, "Write size must be multiple of PAGE_SIZE for O_DIRECT");
+    fn submit_write(
+        &mut self,
+        handle_index: u8,
+        data: *const u8,
+        len: usize,
+        offset: u64,
+    ) -> std::io::Result<()> {
+        let fd = self.fds[handle_index as usize];
+        assert!(fd >= 0, "File not opened: handle={:?}", handle_index);
+        assert_eq!(data as usize % PAGE_SIZE, 0, "Buffer must be page-aligned for O_DIRECT");
+        assert_eq!(len % PAGE_SIZE, 0, "Write size must be multiple of PAGE_SIZE for O_DIRECT");
         assert_eq!(offset % PAGE_SIZE as u64, 0, "Offset must be multiple of PAGE_SIZE for O_DIRECT");
 
-        self.pending_bytes = data.len();
+        self.pending_bytes = len;
 
-        let pwrite_entry = opcode::Write::new(
-            types::Fd(self.fd),
-            data.as_ptr(),
-            data.len() as u32,
-        )
-            .offset(offset)
+        let pwrite_sqe = opcode::Write::new(
+            types::Fd(fd),
+            data,
+            len as u32,
+        ).offset(offset)
             .build()
             .user_data(PWRITE_USER_DATA)
             .flags(squeue::Flags::IO_LINK);
 
-        let fsync_entry = opcode::Fsync::new(
-            types::Fd(self.fd),
-        ).build().user_data(FSYNC_USER_DATA);
+        unsafe {
+            self.ring.submission().push(&pwrite_sqe)
+                .map_err(
+                    |_| std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "SQ full: pwrite"
+                    )
+                )?;
+        }
+        Ok(())
+    }
+
+    fn submit_sync(&mut self, handle_index: u8) -> std::io::Result<()> {
+        let fd = self.fds[handle_index as usize];
+        assert!(fd >= 0, "File not opened: handle={:?}", handle_index);
+
+        let fsync_sqe = opcode::Fsync::new(types::Fd(fd))
+            .build()
+            .user_data(FSYNC_USER_DATA);
 
         unsafe {
-            self.ring
-                .submission()
-                .push(&pwrite_entry)
+            self.ring.submission().push(&fsync_sqe)
                 .map_err(
                     |_| std::io::Error::new(
-                        std::io::ErrorKind::Other, "SQ full: pwrite",
+                        std::io::ErrorKind::Other,
+                        "SQ full: fsync",
                     )
                 )?;
+        }
+        Ok(())
+    }
 
-            self.ring
-                .submission()
-                .push(&fsync_entry)
-                .map_err(
-                    |_| std::io::Error::new(
-                        std::io::ErrorKind::Other, "SQ full: fsync",
-                    )
-                )?;
+    fn flush_submissions(&mut self) -> std::io::Result<()> {
+        self.ring.submit()?;
+        Ok(())
+    }
 
-            self.ring.submit()?;
-            self.fsync_submitted = true;
+    fn wait_completions(&mut self, count: usize) {
+        let mut completed = 0;
 
-            Ok(())
+        while completed < count {
+            for cqe in self.ring.completion() {
+                match cqe.user_data() {
+                    PWRITE_USER_DATA => {
+                        assert!(cqe.result() >= 0, "pwrite failed: {}", cqe.result());
+                    }
+                    FSYNC_USER_DATA => {
+                        assert!(cqe.result() >= 0, "fsync failed: {}", cqe.result());
+                        completed += 1;
+                    }
+                    _ => {
+                        panic!("Unexpected CQE user_data={:#x}", cqe.user_data());
+                    }
+                }
+            }
+            if completed < count {
+                std::hint::spin_loop();
+            }
         }
     }
 
     fn poll_completion(&mut self) -> Option<FlushCompletion> {
-        if !self.fsync_submitted {
-            return None;
-        }
-
         let mut pwrite_done = false;
         let mut fsync_done = false;
         let mut success = true;
@@ -166,7 +189,6 @@ impl FlushBackend for IoUringFlushBackend {
         }
 
         if fsync_done {
-            self.fsync_submitted = false;
             Some(
                 FlushCompletion {
                     bytes_written: if bytes_written > 0 {
@@ -182,19 +204,22 @@ impl FlushBackend for IoUringFlushBackend {
         }
     }
 
-    fn close(&mut self) {
-        if self.fd >= 0 {
+    fn close_file(&mut self, handle_index: u8) {
+        let idx = handle_index as usize;
+        if idx < MAX_FILES && self.fds[idx] >= 0 {
             unsafe {
-                libc::close(self.fd);
+                libc::close(self.fds[idx]);
             }
-            self.fd = -1;
+            self.fds[idx] = -1;
         }
     }
 }
 
 impl Drop for IoUringFlushBackend {
     fn drop(&mut self) {
-        self.close();
+        for i in 0..MAX_FILES {
+            self.close_file(i as u8);
+        }
     }
 }
 
@@ -213,8 +238,7 @@ mod tests {
     fn write_aligned_data() {
         let path = temp_path("aligned");
         let mut backend = IoUringFlushBackend::new().unwrap();
-        backend.open_ls_file(&path).unwrap();
-        backend.fallocate(1024 * 1024).unwrap();
+        let handle = backend.open_file(&path, 1024 * 1024).unwrap();
 
         let arena = ringbuf::arena::Arena::new(4096).unwrap();
         let ptr = arena.as_ptr();
@@ -222,8 +246,9 @@ mod tests {
             std::ptr::write_bytes(ptr, 0xAB, 128);
         }
 
-        let data = unsafe { std::slice::from_raw_parts(ptr, 4096) };
-        backend.submit_write_and_sync(data, 0).unwrap();
+        backend.submit_write(handle, ptr, 4096, 0).unwrap();
+        backend.submit_sync(handle).unwrap();
+        backend.flush_submissions().unwrap();
 
         loop {
             if let Some(c) = backend.poll_completion() {
@@ -234,7 +259,7 @@ mod tests {
             std::hint::spin_loop();
         }
 
-        backend.close();
+        backend.close_file(handle);
 
         let contents = fs::read(&path).unwrap();
         assert!(contents.len() >= 4096);
@@ -249,11 +274,10 @@ mod tests {
     fn fallocate_preallocates_space() {
         let path = temp_path("fallocate");
         let mut backend = IoUringFlushBackend::new().unwrap();
-        backend.open_ls_file(&path).unwrap();
-        backend.fallocate(256 * 1024 * 1024).unwrap();
+        let handle = backend.open_file(&path, 256 * 1024 * 1024).unwrap();
 
         let metadata = fs::metadata(&path).unwrap();
-        backend.close();
+        backend.close_file(handle);
 
         fs::remove_file(&path).ok();
     }
@@ -262,15 +286,17 @@ mod tests {
     fn sequential_aligned_writes() {
         let path = temp_path("seq-aligned");
         let mut backend = IoUringFlushBackend::new().unwrap();
-        backend.open_ls_file(&path).unwrap();
-        backend.fallocate(1024 * 1024).unwrap();
+        let handle = backend.open_file(&path, 1024 * 1024).unwrap();
 
         let arena = ringbuf::arena::Arena::new(8192).unwrap();
         let ptr = arena.as_ptr();
 
         unsafe { std::ptr::write_bytes(ptr, 0x01, 4096); }
-        let data1 = unsafe { std::slice::from_raw_parts(ptr, 4096) };
-        backend.submit_write_and_sync(data1, 0).unwrap();
+
+        backend.submit_write(handle, ptr, 4096, 0).unwrap();
+        backend.submit_sync(handle).unwrap();
+        backend.flush_submissions().unwrap();
+
         loop {
             if let Some(c) = backend.poll_completion() {
                 assert!(c.success);
@@ -279,9 +305,14 @@ mod tests {
             std::hint::spin_loop();
         }
 
-        unsafe { std::ptr::write_bytes(ptr.add(4096), 0x02, 4096); }
-        let data2 = unsafe { std::slice::from_raw_parts(ptr.add(4096), 4096) };
-        backend.submit_write_and_sync(data2, 4096).unwrap();
+        unsafe {
+            std::ptr::write_bytes(ptr.add(4096), 0x02, 4096);
+
+            backend.submit_write(handle, ptr.add(4096) as *const u8, 4096, 4096).unwrap();
+        }
+
+        backend.submit_sync(handle).unwrap();
+        backend.flush_submissions().unwrap();
         loop {
             if let Some(c) = backend.poll_completion() {
                 assert!(c.success);
@@ -290,7 +321,7 @@ mod tests {
             std::hint::spin_loop();
         }
 
-        backend.close();
+        backend.close_file(handle);
 
         let contents = fs::read(&path).unwrap();
         assert!(contents.len() >= 8192);

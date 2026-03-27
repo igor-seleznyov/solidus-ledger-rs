@@ -7,29 +7,21 @@ use crate::ls_writer_slot::*;
 use crate::flush_done_slot::FlushDoneSlot;
 use crate::flush_backend::FlushBackend;
 use common::mem_barrier::release_store_u64;
-use crate::sig_record::SigRecord;
-use crate::signing_state::SigningState;
 use crate::ls_file_header::{LsFileHeader};
-use crate::ls_sign_file_header::LsSignFileHeader;
-use crate::meta_record::MetaRecordWriter;
-use crate::ls_meta_file_header::LsMetaFileHeader;
-use crate::consts::LS_FILE_PAGE_SIZE;
+use crate::metadata_strategy::MetadataStrategy;
+use crate::pending_flush::PendingFlush;
+use crate::signing_strategy::SigningStrategy;
 
 const CLOCK_CHECK_REPEATS_COUNT_INTERVAL: u32 = 100_000;
 
-struct PendingFlush {
-    transfer_id_hi: u64,
-    transfer_id_lo: u64,
-    transfer_hash_table_offset: u32,
-    gsn: u64,
-}
-
-pub struct LsWriter<T: FlushBackend> {
+pub struct LsWriter<T: FlushBackend, S: SigningStrategy, M: MetadataStrategy> {
     id: usize,
     ls_writer_rb: Arc<MpscRingBuffer<LsWriterSlot>>,
     flush_done_rb: Arc<MpscRingBuffer<FlushDoneSlot>>,
     global_committed_gsn: *mut u64,
     backend: T,
+    signing_strategy: S,
+    metadata_strategy: M,
     ls_file_path: String,
     max_ls_file_size: usize,
     in_flight_min_heap: InFlightMinHeap,
@@ -43,39 +35,40 @@ pub struct LsWriter<T: FlushBackend> {
 
     flush_timeout_ms: u64,
     flush_max_buffer_size: usize,
-    pending_flush: Vec<PendingFlush>,
+    collecting_arena: ringbuf::arena::Arena,
+    collecting_ptr: *mut PendingFlush,
+    collecting_len: usize,
+    collecting_capacity: usize,
 
     idle_count: u32,
     last_flush: Instant,
 
     flush_in_flight: bool,
-    flush_pending_records: Vec<PendingFlush>,
+    in_flushing_arena: ringbuf::arena::Arena,
+    in_flushing_ptr: *mut PendingFlush,
+    in_flushing_len: usize,
+    in_flushing_capacity: usize,
     flush_buffer_snapshot_len: usize,
-    signing_state: Option<SigningState>,
-    sign_fd: i32,
-    sign_buffer: Vec<u8>,
-    sign_write_offset: u64,
+
     partition_count: u16,
     file_seq: u64,
 
-    metadata_enabled: bool,
-    metadata_record_size: usize,
-    meta_record_writer: Option<MetaRecordWriter>,
-    meta_fd: i32,
-    meta_buffer_arena: Option<ringbuf::arena::Arena>,
-    meta_buffer_ptr: *mut u8,
-    meta_buffer_len: usize,
-    meta_buffer_capacity: usize,
-    meta_write_offset: u64,
+    ls_handle_index: u8,
+    sign_handle_index: u8,
+    meta_handle_index: u8,
 }
 
-impl<T: FlushBackend> LsWriter<T> {
+unsafe impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> Send for LsWriter<T, S, M> {}
+
+impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsWriter<T, S, M> {
     pub fn new(
         id: usize,
         ls_writer_rb: Arc<MpscRingBuffer<LsWriterSlot>>,
         flush_done_rb: Arc<MpscRingBuffer<FlushDoneSlot>>,
         global_committed_gsn: *mut u64,
         backend: T,
+        signing_strategy: S,
+        metadata_strategy: M,
         ls_file_path: String,
         max_ls_file_size: usize,
         in_flight_min_heap_capacity: usize,
@@ -84,10 +77,7 @@ impl<T: FlushBackend> LsWriter<T> {
         batch_size: usize,
         flush_timeout_ms: u64,
         flush_max_buffer_posting_records: usize,
-        signing_state: Option<SigningState>,
         partition_count: u16,
-        metadata_enabled: bool,
-        metadata_record_size: usize,
     ) -> Self {
         let flush_max_buffer_bytes = flush_max_buffer_posting_records * PostingRecord::SIZE;
         let buffer_capacity = (flush_max_buffer_bytes * 2 + 4095) & !4095;
@@ -95,21 +85,16 @@ impl<T: FlushBackend> LsWriter<T> {
             .expect("Failed to create LS Writer buffer Arena");
         let buffer_ptr = buffer_arena.as_ptr();
 
-        let (
-            meta_record_writer,
-            meta_buffer_arena,
-            meta_buffer_ptr,
-            meta_buffer_capacity
-        ) = if metadata_enabled {
-            let writer = MetaRecordWriter::new(metadata_record_size);
-            let meta_capacity = flush_max_buffer_posting_records * metadata_record_size;
-            let meta_arena = ringbuf::arena::Arena::new(meta_capacity)
-                .expect("Failed to create postings metadata buffer Arena");
-            let meta_ptr = meta_arena.as_ptr();
-            (Some(writer), Some(meta_arena), meta_ptr, meta_capacity)
-        } else {
-            (None, None, std::ptr::null_mut(), 0)
-        };
+        let pending_capacity = flush_max_buffer_posting_records;
+        let pending_arena_size = (pending_capacity * PendingFlush::SIZE + 4096) & !4095;
+
+        let pending_flush_arena = ringbuf::arena::Arena::new(pending_arena_size)
+            .expect("Failed to create pending_flush buffer Arena");
+        let pending_flush_ptr = pending_flush_arena.as_ptr() as *mut PendingFlush;
+
+        let flush_pending_arena = ringbuf::arena::Arena::new(pending_arena_size)
+            .expect("Failed to create flush_pending buffer Arena");
+        let flush_pending_ptr = flush_pending_arena.as_ptr() as *mut PendingFlush;
 
         Self {
             id,
@@ -117,6 +102,8 @@ impl<T: FlushBackend> LsWriter<T> {
             flush_done_rb,
             global_committed_gsn,
             backend,
+            signing_strategy,
+            metadata_strategy,
             ls_file_path,
             max_ls_file_size,
             in_flight_min_heap: InFlightMinHeap::new(
@@ -132,28 +119,27 @@ impl<T: FlushBackend> LsWriter<T> {
             write_offset: 0,
             flush_timeout_ms,
             flush_max_buffer_size: flush_max_buffer_bytes,
-            pending_flush: Vec::with_capacity(256),
+            collecting_arena: pending_flush_arena,
+            collecting_ptr: pending_flush_ptr,
+            collecting_len: 0,
+            collecting_capacity: pending_capacity,
+
             idle_count: 0,
             last_flush: Instant::now(),
             flush_in_flight: false,
-            flush_pending_records: Vec::with_capacity(256),
+
+            in_flushing_arena: flush_pending_arena,
+            in_flushing_ptr: flush_pending_ptr,
+            in_flushing_len: 0,
+            in_flushing_capacity: pending_capacity,
+
             flush_buffer_snapshot_len: 0,
-            signing_state,
-            sign_fd: -1,
-            sign_buffer: Vec::with_capacity(256 * SigRecord::SIZE),
-            sign_write_offset: 0,
+
             partition_count,
             file_seq: 0,
-
-            metadata_enabled,
-            metadata_record_size,
-            meta_record_writer,
-            meta_fd: -1,
-            meta_buffer_arena,
-            meta_buffer_ptr,
-            meta_buffer_len: 0,
-            meta_buffer_capacity,
-            meta_write_offset: 0,
+            ls_handle_index: 0,
+            sign_handle_index: 0,
+            meta_handle_index: 0,
         }
     }
 
@@ -203,137 +189,62 @@ impl<T: FlushBackend> LsWriter<T> {
             return;
         }
 
-        if let Some(ref mut signing) = self.signing_state {
-            Self::sign_batch_inner(
-                signing,
-                self.buffer_ptr,
-                self.buffer_len,
-                self.write_offset,
-                &mut self.sign_buffer,
-            );
+        let signature_flush = self.signing_strategy.prepare_flush(
+            self.buffer_ptr,
+            self.buffer_len,
+            self.write_offset,
+        );
+
+        let metadata_flush = self.metadata_strategy.prepare_flush();
+
+        let mut sync_count = 0;
+
+        if let Some((data, len, offset)) = signature_flush {
+            self.backend.submit_write(self.sign_handle_index, data, len, offset)
+                .expect("Failed to submit signature flush write");
+            self.backend.submit_sync(self.sign_handle_index)
+                .expect("Failed to submit signature flush sync");
+            sync_count += 1;
         }
 
-        self.flush_sign_buffer();
-        self.flush_meta_buffer();
+        if let Some((data, len, offset)) = metadata_flush {
+            self.backend.submit_write(self.meta_handle_index, data, len, offset)
+                .expect("Failed to submit posting metadata flush write");
+            self.backend.submit_sync(self.meta_handle_index)
+                .expect("Failed to submit posting metadata flush sync");
+            sync_count += 1;
+        }
+
+        if sync_count > 0 {
+            self.backend.flush_submissions()
+                .expect("Failed to flush signature and(or) postings metadata submissions");
+            self.backend.wait_completions(sync_count);
+
+            self.signing_strategy.on_flush_complete();
+            self.metadata_strategy.on_flush_complete();
+        }
 
         let padded_len = (self.buffer_len + 4095) & !4095;
-
-        let data = unsafe {
-            std::slice::from_raw_parts(self.buffer_ptr, padded_len)
-        };
-
         self.backend
-            .submit_write_and_sync(data, self.write_offset)
-            .expect("Failed to LS submit flush");
+            .submit_write(
+                self.ls_handle_index,
+                self.buffer_ptr as *const u8,
+                padded_len,
+                self.write_offset,
+            ).expect("Failed to submit ledger storage write");
+        self.backend.submit_sync(self.ls_handle_index)
+            .expect("Failed to submit ledger storage sync");
 
         self.flush_in_flight = true;
         self.flush_buffer_snapshot_len = self.buffer_len;
 
-        self.flush_pending_records = std::mem::take(&mut self.pending_flush);
+        std::mem::swap(&mut self.collecting_ptr, &mut self.in_flushing_ptr);
+        std::mem::swap(&mut self.collecting_arena, &mut self.in_flushing_arena);
+        self.in_flushing_len = self.collecting_len;
+        self.collecting_len = 0;
 
         self.last_flush = Instant::now();
         self.idle_count = 0;
-    }
-
-    fn flush_meta_buffer(&mut self) {
-        if !self.metadata_enabled || self.meta_buffer_len == 0 || self.meta_fd < 0 {
-            return;
-        }
-
-        let written = unsafe {
-            libc::pwrite(
-                self.meta_fd,
-                self.meta_buffer_ptr as *const libc::c_void,
-                self.meta_buffer_len,
-                self.meta_write_offset as libc::off_t,
-            )
-        };
-
-        assert!(written > 0, "ls_meta pwrite failed");
-
-        let sync_result = unsafe {
-            libc::fdatasync(self.meta_fd)
-        };
-        assert_eq!(sync_result, 0, "ls_meta fdatasync failed");
-
-        self.meta_write_offset += written as u64;
-        self.meta_buffer_len = 0;
-    }
-
-    fn sign_batch_inner(
-        signing: &mut SigningState,
-        buffer_ptr: *mut u8,
-        buffer_len: usize,
-        write_offset: u64,
-        sign_buffer: &mut Vec<u8>,
-    ) {
-        let record_count = buffer_len / PostingRecord::SIZE;
-        if record_count == 0 {
-            return;
-        }
-
-        let records = unsafe {
-            std::slice::from_raw_parts(
-                buffer_ptr as *const PostingRecord,
-                record_count,
-            )
-        };
-
-        for i in 0..record_count {
-            let record = &records[i];
-            let ls_offset = write_offset + (i * PostingRecord::SIZE) as u64;
-
-            let sig_record = signing.sign_posting(
-                record.transfer_id_hi,
-                record.transfer_id_lo,
-                record.gsn,
-                ls_offset,
-                record,
-            );
-
-            let sig_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &sig_record as *const SigRecord as *const u8,
-                    SigRecord::SIZE,
-                )
-            };
-            sign_buffer.extend_from_slice(sig_bytes);
-        }
-    }
-
-    fn sign_batch(&mut self, signing: &mut SigningState) {
-        let record_count = self.buffer_len / PostingRecord::SIZE;
-        if record_count == 0 {
-            return;
-        }
-
-        let records = unsafe {
-            std::slice::from_raw_parts(
-                self.buffer_ptr as *const PostingRecord,
-                record_count,
-            )
-        };
-
-        for i in 0..record_count {
-            let record = &records[i];
-            let ls_offset = self.write_offset + (i * PostingRecord::SIZE) as u64;
-
-            let sig_record = signing.sign_posting(
-                record.transfer_id_hi,
-                record.transfer_id_lo,
-                record.gsn,
-                ls_offset,
-                record,
-            );
-
-            let sig_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &sig_record as *const SigRecord as *const u8,
-                    SigRecord::SIZE,
-                )
-            };
-            self.sign_buffer.extend_from_slice(sig_bytes);
-        }
     }
 
     pub fn poll_and_handle_completions(&mut self) {
@@ -373,7 +284,9 @@ impl<T: FlushBackend> LsWriter<T> {
             }
         }
 
-        for pending in self.flush_pending_records.drain(..) {
+        for i in 0..self.in_flushing_len {
+            let pending = unsafe { &*self.in_flushing_ptr.add(i) };
+
             self.in_flight_min_heap.remove(pending.gsn);
 
             let mut claimed = self.flush_done_rb.claim();
@@ -383,6 +296,7 @@ impl<T: FlushBackend> LsWriter<T> {
             slot.transfer_hash_table_offset = pending.transfer_hash_table_offset;
             claimed.publish();
         }
+        self.in_flushing_len = 0;
 
         self.maybe_advance_committed_gsn();
 
@@ -415,168 +329,99 @@ impl<T: FlushBackend> LsWriter<T> {
                 }
             }
             LS_MSG_FLUSH_MARKER => {
-                self.pending_flush.push(
-                    PendingFlush {
-                        transfer_id_hi: slot.transfer_id_hi,
-                        transfer_id_lo: slot.transfer_id_lo,
-                        transfer_hash_table_offset: slot.transfer_hash_table_offset,
-                        gsn: slot.gsn,
-                    }
-                );
+                unsafe {
+                    let pending_flush = self.collecting_ptr.add(self.collecting_len);
+                    (*pending_flush).transfer_id_hi = slot.transfer_id_hi;
+                    (*pending_flush).transfer_id_lo = slot.transfer_id_lo;
+                    (*pending_flush).transfer_hash_table_offset = slot.transfer_hash_table_offset;
+                    (*pending_flush)._pad = 0;
+                    (*pending_flush).gsn = slot.gsn;
+                }
+                self.collecting_len += 1;
             }
             _ => {}
         }
     }
 
     fn initialize(&mut self) {
-        self.backend
-            .open_ls_file(&self.ls_file_path)
+        self.ls_handle_index = self.backend
+            .open_file(&self.ls_file_path, self.max_ls_file_size)
             .expect("Failed to open LS file");
 
-        self.backend
-            .fallocate(self.max_ls_file_size)
-            .expect("Failed to fallocate LS file");
+        if let Some((sign_path, prealloc)) = self.signing_strategy.file_info(&self.ls_file_path) {
+            self.sign_handle_index = self.backend.open_file(&sign_path, prealloc)
+                    .expect("Failed to open signature file");
+        }
 
-        let public_key_hash = match &self.signing_state {
-            Some(signing) => {
-                let pub_key_bytes = signing.public_key_bytes();
-                unsafe {
-                    common::crc32c::crc32c(pub_key_bytes.as_ptr(), pub_key_bytes.len())
-                }
-            }
-            None => 0
-        };
+        if let Some((meta_path, prealloc)) = self.metadata_strategy.file_info(&self.ls_file_path) {
+            self.meta_handle_index = self.backend.open_file(&meta_path, prealloc)
+                    .expect("Failed to open metadata file");
+        }
+
+        let signature_header = self.signing_strategy.prepare_header(self.file_seq);
+        let metadata_header = self.metadata_strategy.prepare_header(self.file_seq, self.max_ls_file_size as u64);
+
+        let mut sync_count = 0;
+
+        if let Some((data, len, offset)) = signature_header {
+            self.backend.submit_write(self.sign_handle_index, data, len, offset)
+                .expect("Failed to submit signature header write");
+            self.backend.submit_sync(self.sign_handle_index)
+                .expect("Failed to submit signature header sync");
+            sync_count += 1;
+        }
+
+        if let Some((data, len, offset)) = metadata_header {
+            self.backend.submit_write(self.meta_handle_index, data, len, offset)
+                .expect("Failed to submit posting metadata header write");
+            self.backend.submit_sync(self.meta_handle_index)
+                .expect("Failed to submit posting metadata header sync");
+            sync_count += 1;
+        }
+
+        if sync_count > 0 {
+            self.backend.flush_submissions()
+                .expect("Failed to flush header submissions");
+            self.backend.wait_completions(sync_count);
+
+            self.signing_strategy.on_header_written();
+            self.metadata_strategy.on_header_written();
+        }
 
         let header = LsFileHeader::new(
-            self.signing_state.is_some(),
+            self.signing_strategy.is_enabled(),
             self.partition_count,
             self.max_ls_file_size as u64,
             self.file_seq,
-            public_key_hash,
-            self.metadata_enabled,
+            self.signing_strategy.public_key_hash(),
+            self.metadata_strategy.is_enabled(),
         );
 
         let header_page = header.to_page();
-        self.backend
-            .submit_write_and_sync(&header_page, 0)
-            .expect("Failed to submit LS file header");
+        self.backend.submit_write(
+            self.ls_handle_index,
+            header_page.as_ptr(),
+            header_page.len(),
+            0,
+        ).expect("Failed to submit ledger storage header write");
 
-        loop {
-            if let Some(completion) = self.backend.poll_completion() {
-                assert!(completion.success, "LS file header write failed");
-                break;
-            }
-        }
+        self.backend.submit_sync(self.ls_handle_index)
+            .expect("Failed to submit ledger storage header sync");
+
+        self.backend.flush_submissions()
+            .expect("Failed to flush ledger storage header");
+
+        self.backend.wait_completions(1);
 
         self.write_offset = LsFileHeader::DATA_OFFSET as u64;
 
-        if self.signing_state.is_some() {
-            let sign_path = format!("{}.sign", self.ls_file_path);
-            let c_path = std::ffi::CString::new(sign_path.as_str()).unwrap();
-            let fd = unsafe {
-                libc::open(
-                    c_path.as_ptr(),
-                    libc::O_CREAT | libc::O_WRONLY,
-                    0o644,
-                )
-            };
-            assert!(fd >= 0, "Failed to open ls_sign file: {}", sign_path);
-            self.sign_fd = fd;
-
-            let signing = self.signing_state.as_ref().unwrap();
-            let sign_header = LsSignFileHeader::new(
-                SigningState::ALGORITHM_ED25519,
-                0,
-                self.file_seq,
-                signing.public_key_bytes(),
-                *signing.last_tx_hash(),
-            );
-
-            let sign_header_page = sign_header.to_page();
-            let written = unsafe {
-                libc::pwrite(
-                    self.sign_fd,
-                    sign_header_page.as_ptr() as *const libc::c_void,
-                    sign_header_page.len(),
-                    0,
-                )
-            };
-            assert_eq!(written as usize, LS_FILE_PAGE_SIZE, "ls_sign header pwrite failed");
-
-            let sync_result = unsafe { libc::fdatasync(self.sign_fd) };
-            assert_eq!(sync_result, 0, "ls_sign header fdatasync failed");
-        }
-
-        if self.metadata_enabled {
-            let meta_path = format!("{}.meta", self.ls_file_path);
-            let c_path = std::ffi::CString::new(meta_path.as_str()).unwrap();
-            let fd = unsafe {
-                libc::open(
-                    c_path.as_ptr(),
-                    libc::O_CREAT | libc::O_WRONLY,
-                    0o644,
-                )
-            };
-            assert!(fd >= 0, "Failed to open ls_meta file: {}", meta_path);
-            self.meta_fd = fd;
-
-            let meta_header = LsMetaFileHeader::new(
-                self.metadata_record_size as u32,
-                self.max_ls_file_size as u64,
-                self.file_seq,
-            );
-
-            let meta_header_page = meta_header.to_page();
-            let written = unsafe {
-                libc::pwrite(
-                    self.meta_fd,
-                    meta_header_page.as_ptr() as *const libc::c_void,
-                    meta_header_page.len(),
-                    0,
-                )
-            };
-            assert_eq!(written as usize, LS_FILE_PAGE_SIZE, "ls_meta header pwrite failed");
-
-            let sync_result = unsafe {
-                libc::fdatasync(self.meta_fd)
-            };
-            assert_eq!(sync_result, 0, "ls_meta header fdatasync failed");
-
-            self.meta_write_offset = LsMetaFileHeader::DATA_OFFSET as u64;
-        }
-
         println!(
-            "[ls-writer {}] initialized: file={}, max_size={}MB, signing={}, metadata={}, data_offset={}",
-            self.id,
-            self.ls_file_path,
-            self.max_ls_file_size / (1024 * 1024),
-            if self.signing_state.is_some() { "enabled" } else { "disabled" },
-            if self.metadata_enabled { "enabled" } else { "disabled" },
+            "[ls-writer {}] initialized: file={}, signing={}, metadata={}, data_offset={}",
+            self.id, self.ls_file_path,
+            self.signing_strategy.is_enabled(),
+            self.metadata_strategy.is_enabled(),
             self.write_offset,
         );
-    }
-
-    fn flush_sign_buffer(&mut self) {
-        if self.sign_buffer.is_empty() || self.sign_fd < 0 {
-            return;
-        }
-
-        let written = unsafe {
-            libc::pwrite(
-                self.sign_fd,
-                self.sign_buffer.as_ptr() as *const libc::c_void,
-                self.sign_buffer.len(),
-                self.sign_write_offset as libc::off_t,
-            )
-        };
-
-        assert!(written > 0, "ls_sign pwrite failed");
-
-        let sync_result = unsafe { libc::fdatasync(self.sign_fd) };
-        assert_eq!(sync_result, 0, "ls_sign fdatasync failed");
-
-        self.sign_write_offset += written as u64;
-        self.sign_buffer.clear();
     }
 
     fn maybe_advance_committed_gsn(&self) {
@@ -599,63 +444,91 @@ mod tests {
     use crate::flush_backend::{FlushBackend, FlushCompletion};
     use pipeline::posting_record::PostingRecord;
     use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
+    use crate::consts::LS_FILE_PAGE_SIZE;
+    use crate::ed25519_signing_strategy::Ed25519SigningStrategy;
     use crate::flush_done_slot::FlushDoneSlot;
     use crate::ls_writer::LsWriter;
     use crate::ls_writer_slot::{LsWriterSlot, LS_MSG_ADD_TO_HEAP, LS_MSG_FLUSH_MARKER, LS_MSG_POSTING, LS_MSG_REMOVE_FROM_HEAP};
     use crate::ls_file_header::LsFileHeader;
+    use crate::ls_meta_file_header::LsMetaFileHeader;
     use crate::ls_sign_file_header::LsSignFileHeader;
+    use crate::no_metadata_strategy::NoMetadataStrategy;
+    use crate::no_signing_strategy::NoSigningStrategy;
+    use crate::posting_metadata_strategy::PostingMetadataStrategy;
+    use crate::signing_state::SigningState;
 
     const K0: u64 = 0x0123456789ABCDEF;
     const K1: u64 = 0xFEDCBA9876543210;
 
 
+    const MAX_FILES: usize = 8;
+
     struct MockFlushBackend {
-        written: Vec<(Vec<u8>, u64)>,
-        pending: Option<FlushCompletion>,
-        open_called: bool,
+        fds_opened: [bool; MAX_FILES],
+        fds_count: usize,
+        written: Vec<(u8, Vec<u8>, u64)>,
+        pending_completion: Option<FlushCompletion>,
     }
 
     impl MockFlushBackend {
         fn new() -> Self {
             Self {
+                fds_opened: [false; MAX_FILES],
+                fds_count: 0,
                 written: Vec::new(),
-                pending: None,
-                open_called: false,
+                pending_completion: None,
             }
         }
     }
 
     impl FlushBackend for MockFlushBackend {
-        fn open_ls_file(&mut self, _path: &str) -> std::io::Result<()> {
-            self.open_called = true;
-            Ok(())
+        fn open_file(&mut self, _path: &str, _prealloc: usize) -> std::io::Result<u8> {
+            let handle = self.fds_count as u8;
+            self.fds_opened[self.fds_count] = true;
+            self.fds_count += 1;
+            Ok(handle)
         }
 
-        fn fallocate(&mut self, size: usize) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn submit_write_and_sync(&mut self, data: &[u8], offset: u64) -> std::io::Result<()> {
-            let len = data.len();
-            self.written.push((data.to_vec(), offset));
-            self.pending = Some(FlushCompletion {
+        fn submit_write(
+            &mut self,
+            handle_index: u8,
+            data: *const u8,
+            len: usize,
+            offset: u64,
+        ) -> std::io::Result<()> {
+            let slice = unsafe { std::slice::from_raw_parts(data, len) };
+            self.written.push((handle_index, slice.to_vec(), offset));
+            self.pending_completion = Some(FlushCompletion {
                 bytes_written: len,
                 success: true,
             });
             Ok(())
         }
 
-        fn poll_completion(&mut self) -> Option<FlushCompletion> {
-            self.pending.take()
+        fn submit_sync(&mut self, _handle_index: u8) -> std::io::Result<()> {
+            Ok(())
         }
 
-        fn close(&mut self) {}
+        fn flush_submissions(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn wait_completions(&mut self, _count: usize) {
+        }
+
+        fn poll_completion(&mut self) -> Option<FlushCompletion> {
+            self.pending_completion.take()
+        }
+
+        fn close_file(&mut self, handle_index: u8) {
+            self.fds_opened[handle_index as usize] = false;
+        }
     }
 
 
     static mut TEST_COMMITTED_GSN: u64 = 0;
 
-    fn make_writer() -> LsWriter<MockFlushBackend> {
+    fn make_writer() -> LsWriter<MockFlushBackend, NoSigningStrategy, NoMetadataStrategy> {
         let ls_writer_rb = Arc::new(
             MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
         );
@@ -672,6 +545,8 @@ mod tests {
             flush_done_rb,
             committed_gsn_ptr,
             MockFlushBackend::new(),
+            NoSigningStrategy,
+            NoMetadataStrategy,
             "test.ls".to_string(),
             0,
             64,
@@ -680,16 +555,13 @@ mod tests {
             64,
             2,
             512,
-            None,
             16,
-            false,
-            0,
         );
         writer.initialize();
         writer
     }
 
-    fn make_writer_with_metadata(record_size: usize) -> LsWriter<MockFlushBackend> {
+    fn make_writer_with_metadata(record_size: usize) -> LsWriter<MockFlushBackend, NoSigningStrategy, PostingMetadataStrategy> {
         let ls_writer_rb = Arc::new(
             MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
         );
@@ -700,27 +572,28 @@ mod tests {
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
 
+        let metadata = PostingMetadataStrategy::new(record_size, 512);
+
         let mut writer = LsWriter::new(
             0,
             ls_writer_rb,
             flush_done_rb,
             committed_gsn_ptr,
             MockFlushBackend::new(),
+            NoSigningStrategy,
+            metadata,
             "test.ls".to_string(),
             0,
             64, K0, K1,
             64, 2, 512,
-            None,
             16,
-            true,
-            record_size,
         );
         writer.initialize();
         writer
     }
 
     fn make_writer_with_flush_done_rb() -> (
-        LsWriter<MockFlushBackend>,
+        LsWriter<MockFlushBackend, NoSigningStrategy, NoMetadataStrategy>,
         Arc<MpscRingBuffer<FlushDoneSlot>>,
     ) {
         let ls_writer_rb = Arc::new(
@@ -740,16 +613,15 @@ mod tests {
             flush_done_rb,
             committed_gsn_ptr,
             MockFlushBackend::new(),
+            NoSigningStrategy,
+            NoMetadataStrategy,
             "test.ls".to_string(),
             0,
             64,
             K0,
             K1,
             64, 2, 512,
-            None,
             16,
-            false,
-            0,
         );
         writer.initialize();
 
@@ -775,6 +647,7 @@ mod tests {
         let mut slot = LsWriterSlot::zeroed();
         slot.msg_type = LS_MSG_POSTING;
         slot.gsn = gsn;
+        slot.posting.set_magic();
         slot.posting.gsn = gsn;
         slot.posting.amount = amount;
         slot.posting.transfer_id_hi = 0;
@@ -792,7 +665,7 @@ mod tests {
         slot
     }
 
-    fn make_writer_with_signing(signing: SigningState) -> LsWriter<MockFlushBackend> {
+    fn make_writer_with_signing() -> LsWriter<MockFlushBackend, Ed25519SigningStrategy, NoMetadataStrategy> {
         let ls_writer_rb = Arc::new(
             MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
         );
@@ -805,6 +678,8 @@ mod tests {
 
         let key = SigningKey::from_bytes(&[0x42u8; 32]);
         let genesis = [0u8; 32];
+        let signing_state = SigningState::new(key, genesis);
+        let signing = Ed25519SigningStrategy::new(signing_state, 512);
 
         let mut writer = LsWriter::new(
             0,
@@ -812,14 +687,13 @@ mod tests {
             flush_done_rb,
             committed_gsn_ptr,
             MockFlushBackend::new(),
+            signing,
+            NoMetadataStrategy,
             "test.ls".to_string(),
             0,
             64, K0, K1,
             64, 2, 512,
-            Some(signing),
             16,
-            false,
-            0,
         );
         writer.initialize();
         writer
@@ -830,9 +704,21 @@ mod tests {
     fn sign_batch_creates_sig_records() {
         let key = SigningKey::from_bytes(&[0x42u8; 32]);
         let genesis = [0u8; 32];
-        let signing = SigningState::new(key, genesis);
+        let signing_state = SigningState::new(key, genesis);
+        let signing = Ed25519SigningStrategy::new(signing_state, 512);
 
-        let mut writer = make_writer_with_signing(signing);
+        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
+        let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+
+        unsafe { TEST_COMMITTED_GSN = 0; }
+        let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
+
+        let mut writer = LsWriter::new(
+            0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
+            MockFlushBackend::new(), signing, NoMetadataStrategy,
+            "test.ls".to_string(), 0,
+            64, K0, K1, 64, 2, 512, 16,
+        );
         writer.initialize();
 
         let mut slot1 = make_posting_slot(100, 500);
@@ -846,20 +732,18 @@ mod tests {
         writer.process_message(&slot1);
         writer.process_message(&slot2);
 
-        assert!(writer.sign_buffer.is_empty());
-
         writer.submit_flush();
 
-        assert_ne!(writer.signing_state.as_ref().unwrap().last_tx_hash(), &genesis);
+        assert_eq!(writer.backend.written.len(), 4);
     }
 
     #[test]
     fn initialize_opens_file() {
         let writer = make_writer();
-        assert!(writer.backend.open_called);
+        assert!(writer.backend.fds_opened[0]);
         assert_eq!(writer.backend.written.len(), 1);
-        assert_eq!(writer.backend.written[0].1, 0);
-        assert_eq!(writer.backend.written[0].0.len(), 4096);
+        assert_eq!(writer.backend.written[0].2, 0);
+        assert_eq!(writer.backend.written[0].1.len(), 4096);
     }
 
     #[test]
@@ -869,8 +753,8 @@ mod tests {
         assert_eq!(writer.write_offset, LS_FILE_PAGE_SIZE as u64);
         assert!(!writer.flush_in_flight);
         assert_eq!(writer.flush_buffer_snapshot_len, 0);
-        assert_eq!(writer.pending_flush.len(), 0);
-        assert_eq!(writer.flush_pending_records.len(), 0)
+        assert_eq!(writer.collecting_len, 0);
+        assert_eq!(writer.in_flushing_len, 0)
     }
 
     #[test]
@@ -922,7 +806,7 @@ mod tests {
 
         writer.process_message(&make_flush_marker_slot(100, 1, 42));
 
-        assert_eq!(writer.pending_flush.len(), 1);
+        assert_eq!(writer.collecting_len, 1);
     }
 
     #[test]
@@ -935,9 +819,9 @@ mod tests {
         writer.submit_flush();
 
         assert_eq!(writer.backend.written.len(), 2);
-        assert_eq!(writer.backend.written[1].0.len() % LS_FILE_PAGE_SIZE, 0);
-        assert!(writer.backend.written[1].0.len() >= PostingRecord::SIZE);
-        assert_eq!(writer.backend.written[1].1, LsFileHeader::DATA_OFFSET as u64);
+        assert_eq!(writer.backend.written[1].1.len() % LS_FILE_PAGE_SIZE, 0);
+        assert!(writer.backend.written[1].1.len() >= PostingRecord::SIZE);
+        assert_eq!(writer.backend.written[1].2, LsFileHeader::DATA_OFFSET as u64);
     }
 
     #[test]
@@ -961,8 +845,8 @@ mod tests {
 
         writer.submit_flush();
 
-        assert_eq!(writer.pending_flush.len(), 0);
-        assert_eq!(writer.flush_pending_records.len(), 2);
+        assert_eq!(writer.collecting_len, 0);
+        assert_eq!(writer.in_flushing_len, 2);
     }
 
     #[test]
@@ -1094,8 +978,8 @@ mod tests {
         writer.submit_flush();
 
         assert_eq!(writer.backend.written.len(), 2);
-        assert_eq!(writer.backend.written[1].0.len() % LS_FILE_PAGE_SIZE, 0);
-        assert!(writer.backend.written[1].0.len() >= PostingRecord::SIZE * 3);
+        assert_eq!(writer.backend.written[1].1.len() % LS_FILE_PAGE_SIZE, 0);
+        assert!(writer.backend.written[1].1.len() >= PostingRecord::SIZE * 3);
 
         writer.poll_and_handle_completions();
 
@@ -1124,7 +1008,7 @@ mod tests {
         writer.submit_flush();
 
         assert_eq!(writer.backend.written.len(), 3);
-        assert_eq!(writer.backend.written[2].1, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64);
+        assert_eq!(writer.backend.written[2].2, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64);
 
         writer.poll_and_handle_completions();
 
@@ -1233,19 +1117,14 @@ mod tests {
     #[test]
     fn metadata_enabled_initializes_meta_buffer() {
         let writer = make_writer_with_metadata(256);
-        assert!(writer.metadata_enabled);
-        assert!(writer.meta_record_writer.is_some());
-        assert_eq!(writer.meta_buffer_len, 0);
-        assert_eq!(writer.metadata_record_size, 256);
+        assert!(writer.metadata_strategy.is_enabled());
+        assert_eq!(writer.metadata_strategy.record_size(), 256);
     }
 
     #[test]
     fn metadata_disabled_no_meta_buffer() {
         let writer = make_writer();
-        assert!(!writer.metadata_enabled);
-        assert!(writer.meta_record_writer.is_none());
-        assert_eq!(writer.meta_buffer_len, 0);
-        assert_eq!(writer.meta_fd, -1);
+        assert!(!writer.metadata_strategy.is_enabled());
     }
 
     #[test]
@@ -1272,7 +1151,7 @@ mod tests {
         let writer = make_writer();
 
         assert!(!writer.backend.written.is_empty());
-        let (data, offset) = &writer.backend.written[0];
+        let (_, data, offset) = &writer.backend.written[0];
         assert_eq!(*offset, 0);
         assert_eq!(data.len(), 4096);
 

@@ -1,17 +1,19 @@
+pub const SIG_RECORD_MAGIC: u64 = 0x524E_4753_5453_444C;
+
 #[repr(C, align(64))]
 #[derive(Copy, Clone)]
 pub struct SigRecord {
-    pub checksum: u32,
-    pub postings_count: u8,
-    pub algorithm: u8,
-    pub key_version: u16,
+    pub magic: u64,
     pub transfer_id_hi: u64,
     pub transfer_id_lo: u64,
     pub gsn: u64,
     pub ls_offset: u64,
     pub timestamp_ns: u64,
+    pub postings_count: u8,
+    pub algorithm: u8,
+    pub key_version: u16,
+    pub checksum: u32,
     pub batch_seq: u64,
-    pub _pad: [u8; 8],
 
     pub prev_tx_hash: [u8; 32],
     pub postings_hash: [u8; 32],
@@ -45,6 +47,14 @@ impl SigRecord {
         }
         computed == saved
     }
+
+    pub fn set_magic(&mut self) {
+        self.magic = SIG_RECORD_MAGIC;
+    }
+
+    pub fn verify_magic(&self) -> bool {
+        self.magic == SIG_RECORD_MAGIC
+    }
 }
 
 #[cfg(test)]
@@ -63,21 +73,22 @@ mod tests {
 
     #[test]
     fn field_offsets() {
-        assert_eq!(std::mem::offset_of!(SigRecord, checksum), 0);
-        assert_eq!(std::mem::offset_of!(SigRecord, postings_count), 4);
-        assert_eq!(std::mem::offset_of!(SigRecord, algorithm), 5);
-        assert_eq!(std::mem::offset_of!(SigRecord, key_version), 6);
+        assert_eq!(std::mem::offset_of!(SigRecord, magic), 0);
         assert_eq!(std::mem::offset_of!(SigRecord, transfer_id_hi), 8);
         assert_eq!(std::mem::offset_of!(SigRecord, transfer_id_lo), 16);
         assert_eq!(std::mem::offset_of!(SigRecord, gsn), 24);
         assert_eq!(std::mem::offset_of!(SigRecord, ls_offset), 32);
         assert_eq!(std::mem::offset_of!(SigRecord, timestamp_ns), 40);
-        assert_eq!(std::mem::offset_of!(SigRecord, batch_seq), 48);
+        assert_eq!(std::mem::offset_of!(SigRecord, postings_count), 48);
+        assert_eq!(std::mem::offset_of!(SigRecord, algorithm), 49);
+        assert_eq!(std::mem::offset_of!(SigRecord, key_version), 50);
+        assert_eq!(std::mem::offset_of!(SigRecord, checksum), 52);
+        assert_eq!(std::mem::offset_of!(SigRecord, batch_seq), 56);
         assert_eq!(std::mem::offset_of!(SigRecord, prev_tx_hash), 64);
         assert_eq!(std::mem::offset_of!(SigRecord, postings_hash), 96);
         assert_eq!(std::mem::offset_of!(SigRecord, signature), 128);
     }
-
+    
     #[test]
     fn checksum_compute_and_verify() {
         let mut record = SigRecord::zeroed();
