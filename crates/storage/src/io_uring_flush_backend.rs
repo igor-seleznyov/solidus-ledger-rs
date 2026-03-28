@@ -14,6 +14,7 @@ pub struct IoUringFlushBackend {
     fds: [i32; MAX_FILES],
     fds_count: usize,
     pending_bytes: usize,
+    direct_io: [bool; MAX_FILES],
 }
 
 impl IoUringFlushBackend {
@@ -34,6 +35,7 @@ impl IoUringFlushBackend {
                 fds: [-1; MAX_FILES],
                 fds_count: 0,
                 pending_bytes: 0,
+                direct_io: [false; MAX_FILES],
             }
         )
     }
@@ -73,6 +75,51 @@ impl FlushBackend for IoUringFlushBackend {
 
         let handle = self.fds_count as u8;
         self.fds[self.fds_count] = fd;
+        self.direct_io[self.fds_count] = true;
+        self.fds_count += 1;
+        Ok(handle)
+    }
+    
+    fn open_file_buffered(
+        &mut self,
+        path: &str,
+        prealloc_size: usize,
+    ) -> std::io::Result<u8> {
+        assert!(self.fds_count < MAX_FILES, "Too many open files");
+        
+        let c_path = CString::new(path).map_err(
+            |_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path")
+            }
+        )?;
+        
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_CREAT | libc::O_WRONLY,
+                0o644,
+            )
+        };
+        
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        
+        if prealloc_size > 0 {
+            let result = unsafe {
+                libc::fallocate(fd, 0, 0, prealloc_size as libc::off_t)
+            };
+            if result != 0 {
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        
+        let handle = self.fds_count as u8;
+        self.fds[self.fds_count] = fd;
+        self.direct_io[self.fds_count] = false;
         self.fds_count += 1;
         Ok(handle)
     }
@@ -86,9 +133,12 @@ impl FlushBackend for IoUringFlushBackend {
     ) -> std::io::Result<()> {
         let fd = self.fds[handle_index as usize];
         assert!(fd >= 0, "File not opened: handle={:?}", handle_index);
-        assert_eq!(data as usize % PAGE_SIZE, 0, "Buffer must be page-aligned for O_DIRECT");
-        assert_eq!(len % PAGE_SIZE, 0, "Write size must be multiple of PAGE_SIZE for O_DIRECT");
-        assert_eq!(offset % PAGE_SIZE as u64, 0, "Offset must be multiple of PAGE_SIZE for O_DIRECT");
+        
+        if self.direct_io[handle_index as usize] {
+            assert_eq!(data as usize % PAGE_SIZE, 0, "Buffer must be page-aligned for O_DIRECT");
+            assert_eq!(len % PAGE_SIZE, 0, "Write size must be multiple of PAGE_SIZE for O_DIRECT");
+            assert_eq!(offset % PAGE_SIZE as u64, 0, "Offset must be multiple of PAGE_SIZE for O_DIRECT");
+        }
 
         self.pending_bytes = len;
 
@@ -329,5 +379,75 @@ mod tests {
         assert_eq!(contents[4096], 0x02);
 
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn open_file_buffered_no_direct_io() {
+        let path = temp_path("buffered");
+        let mut backend = IoUringFlushBackend::new().unwrap();
+        let handle = backend.open_file_buffered(&path, 4096).unwrap();
+
+        assert_eq!(handle, 0);
+        assert!(!backend.direct_io[handle as usize]);
+        assert!(backend.fds[handle as usize] >= 0);
+
+        backend.close_file(handle);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn buffered_write_unaligned_size() {
+        let path = temp_path("buffered-unaligned");
+        let mut backend = IoUringFlushBackend::new().unwrap();
+        let handle = backend.open_file_buffered(&path, 4096).unwrap();
+
+        let data = [0xABu8; 32];
+
+        let arena = ringbuf::arena::Arena::new(4096).unwrap();
+        let ptr = arena.as_ptr();
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, 32);
+        }
+
+        backend.submit_write(handle, ptr as *const u8, 32, 0).unwrap();
+        backend.submit_sync(handle).unwrap();
+        backend.flush_submissions().unwrap();
+
+        loop {
+            if let Some(c) = backend.poll_completion() {
+                assert!(c.success);
+                break;
+            }
+            std::hint::spin_loop();
+        }
+
+        backend.close_file(handle);
+
+        let contents = fs::read(&path).unwrap();
+        assert!(contents.len() >= 32);
+        assert_eq!(contents[0], 0xAB);
+        assert_eq!(contents[31], 0xAB);
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mixed_direct_and_buffered_handles() {
+        let path_direct = temp_path("mixed-direct");
+        let path_buffered = temp_path("mixed-buffered");
+        let mut backend = IoUringFlushBackend::new().unwrap();
+
+        let h_direct = backend.open_file(&path_direct, 1024 * 1024).unwrap();
+        let h_buffered = backend.open_file_buffered(&path_buffered, 4096).unwrap();
+
+        assert!(backend.direct_io[h_direct as usize]);
+        assert!(!backend.direct_io[h_buffered as usize]);
+        assert_eq!(h_direct, 0);
+        assert_eq!(h_buffered, 1);
+
+        backend.close_file(h_direct);
+        backend.close_file(h_buffered);
+        fs::remove_file(&path_direct).ok();
+        fs::remove_file(&path_buffered).ok();
     }
 }

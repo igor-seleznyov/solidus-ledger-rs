@@ -19,3 +19,5 @@ pub mod metadata_strategy;
 pub mod no_metadata_strategy;
 pub mod posting_metadata_strategy;
 pub mod pending_flush;
+pub mod checkpoint_record;
+pub mod checkpoint_file_header;

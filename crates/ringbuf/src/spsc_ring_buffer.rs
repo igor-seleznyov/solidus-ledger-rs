@@ -22,15 +22,12 @@ impl<T: Slot> SpscRingBuffer<T> {
     pub fn new(capacity: usize) -> std::io::Result<Self> {
         assert!(capacity.is_power_of_two(), "capacity must be a power of two");
         assert!(
-            std::mem::size_of::<T>() >= 64,
+            size_of::<T>() >= 64,
             "slot size must be at least 64 bytes (cache line)"
         );
-        assert!(
-            std::mem::align_of::<T>() == 64,
-            "slot alignment must be 64 bytes (cache line)"
-        );
+        assert_eq!(align_of::<T>(), 64, "slot alignment must be 64 bytes (cache line)");
 
-        let slot_size = std::mem::size_of::<T>();
+        let slot_size = size_of::<T>();
         let total_size = HEADER_SIZE + capacity * slot_size;
         let arena = Arena::new(total_size)?;
         let ptr = arena.as_ptr();

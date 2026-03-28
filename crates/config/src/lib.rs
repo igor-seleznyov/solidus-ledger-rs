@@ -83,7 +83,11 @@ pub struct StorageConfig {
     pub max_ls_file_size_mb: usize,
     pub signing_enabled: bool,
     pub posting_metadata: PostingMetadata,
+    #[serde(default = "default_checkpoint_prealloc_multiplier")]
+    pub checkpoint_prealloc_multiplier: usize,
 }
+
+fn default_checkpoint_prealloc_multiplier() -> usize { 4 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -185,6 +189,9 @@ impl Config {
         if self.storage.posting_metadata.enabled && !self.storage.posting_metadata.record_size.is_power_of_two() {
             return Err("posting-metadata.record_size must be a power of two".into());
         }
+        if self.storage.checkpoint_prealloc_multiplier < 1 {
+            return Err("storage.checkpoint_prealloc_multiplier must be equals or greater than 1".into());
+        }
         if let Some(ref path) = self.partitions.accounts_assignment_overrides_path {
             if path.is_empty() {
                 return Err("partitions.accounts-assignment-overrides-path must not be empty if specified".into());
@@ -273,6 +280,7 @@ storage:
   posting-metadata:
     enabled: true
     record-size: 256
+  checkpoint-prealloc-multiplier: 4
  ";
 
     #[test]
@@ -304,6 +312,7 @@ storage:
         assert!(!config.batch_accept.partial_reject_by_transfer_sequence_id);
         assert!(config.storage.posting_metadata.enabled);
         assert_eq!(config.storage.posting_metadata.record_size, 256);
+        assert_eq!(config.storage.checkpoint_prealloc_multiplier, 4);
     }
 
     #[test]

@@ -10,6 +10,14 @@ pub trait FlushBackend {
         prealloc_size: usize,
     ) -> std::io::Result<u8>;
 
+    fn open_file_buffered(
+        &mut self,
+        path: &str,
+        prealloc_size: usize,
+    ) -> std::io::Result<u8> {
+        self.open_file(path, prealloc_size)
+    }
+
     fn submit_write(
         &mut self,
         handle_index: u8,
