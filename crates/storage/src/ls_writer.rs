@@ -11,6 +11,8 @@ use crate::ls_file_header::{LsFileHeader};
 use crate::metadata_strategy::MetadataStrategy;
 use crate::pending_flush::PendingFlush;
 use crate::signing_strategy::SigningStrategy;
+use crate::checkpoint_record::CheckpointRecord;
+use crate::checkpoint_file_header::CheckpointFileHeader;
 
 const CLOCK_CHECK_REPEATS_COUNT_INTERVAL: u32 = 100_000;
 
@@ -56,6 +58,13 @@ pub struct LsWriter<T: FlushBackend, S: SigningStrategy, M: MetadataStrategy> {
     ls_handle_index: u8,
     sign_handle_index: u8,
     meta_handle_index: u8,
+
+    checkpoint_handle_index: u8,
+    checkpoint_write_offset: u64,
+    batch_seq: u32,
+    in_flushing_first_offset: u64,
+    in_flushing_posting_count: u64,
+    checkpoint_prealloc_size: usize,
 }
 
 unsafe impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> Send for LsWriter<T, S, M> {}
@@ -78,6 +87,7 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         flush_timeout_ms: u64,
         flush_max_buffer_posting_records: usize,
         partition_count: u16,
+        checkpoint_prealloc_multiplier: usize,
     ) -> Self {
         let flush_max_buffer_bytes = flush_max_buffer_posting_records * PostingRecord::SIZE;
         let buffer_capacity = (flush_max_buffer_bytes * 2 + 4095) & !4095;
@@ -140,6 +150,17 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
             ls_handle_index: 0,
             sign_handle_index: 0,
             meta_handle_index: 0,
+
+            checkpoint_handle_index: 0,
+            checkpoint_write_offset: 0,
+            batch_seq: 0,
+            in_flushing_first_offset: 0,
+            in_flushing_posting_count: 0,
+            checkpoint_prealloc_size: Self::compute_checkpoint_prealloc(
+                max_ls_file_size,
+                flush_max_buffer_posting_records,
+                checkpoint_prealloc_multiplier,
+            ),
         }
     }
 
@@ -238,6 +259,9 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         self.flush_in_flight = true;
         self.flush_buffer_snapshot_len = self.buffer_len;
 
+        self.in_flushing_first_offset = self.write_offset;
+        self.in_flushing_posting_count = (self.flush_buffer_snapshot_len / PostingRecord::SIZE) as u64;
+
         std::mem::swap(&mut self.collecting_ptr, &mut self.in_flushing_ptr);
         std::mem::swap(&mut self.collecting_arena, &mut self.in_flushing_arena);
         self.in_flushing_len = self.collecting_len;
@@ -301,6 +325,8 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         self.maybe_advance_committed_gsn();
 
         self.flush_in_flight = false;
+
+        self.write_checkpoint_record();
     }
 
     pub fn process_message(&mut self, slot: &LsWriterSlot) {
@@ -357,6 +383,11 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
             self.meta_handle_index = self.backend.open_file(&meta_path, prealloc)
                     .expect("Failed to open metadata file");
         }
+
+        let checkpoint_path = format!("{}.checkpoint", self.ls_file_path);
+        self.checkpoint_handle_index = self.backend
+            .open_file_buffered(&checkpoint_path, self.checkpoint_prealloc_size)
+            .expect("Failed to open checkpoint file");
 
         let signature_header = self.signing_strategy.prepare_header(self.file_seq);
         let metadata_header = self.metadata_strategy.prepare_header(self.file_seq, self.max_ls_file_size as u64);
@@ -415,12 +446,32 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
 
         self.write_offset = LsFileHeader::DATA_OFFSET as u64;
 
+        let checkpoint_header = CheckpointFileHeader::new(self.file_seq);
+        let checkpoint_header_bytes = unsafe { checkpoint_header.as_bytes() };
+
+        self.backend.submit_write(
+            self.checkpoint_handle_index,
+            checkpoint_header_bytes.as_ptr(),
+            CheckpointFileHeader::SIZE,
+            0,
+        ).expect("Failed to submit checkpoint header write");
+
+        self.backend.submit_sync(self.checkpoint_handle_index)
+            .expect("Failed to submit checkpoint header sync");
+
+        self.backend.flush_submissions()
+            .expect("Failed to flush checkpoint header");
+
+        self.checkpoint_write_offset = CheckpointFileHeader::DATA_OFFSET as u64;
+        self.batch_seq = 0;
+
         println!(
-            "[ls-writer {}] initialized: file={}, signing={}, metadata={}, data_offset={}",
+            "[ls-writer {}] initialized: file={}, signing={}, metadata={}, data_offset={}, checkpoint_prealloc={}",
             self.id, self.ls_file_path,
             self.signing_strategy.is_enabled(),
             self.metadata_strategy.is_enabled(),
             self.write_offset,
+            self.checkpoint_prealloc_size,
         );
     }
 
@@ -433,6 +484,49 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         unsafe {
             release_store_u64(self.global_committed_gsn, new_committed);
         }
+    }
+
+    fn compute_checkpoint_prealloc(
+        max_ls_file_size: usize,
+        flush_max_buffer_posting_records: usize,
+        checkpoint_prealloc_multiplier: usize,
+    ) -> usize {
+        let max_batch_bytes = flush_max_buffer_posting_records * PostingRecord::SIZE;
+        let max_batches = if max_batch_bytes > 0 {
+            max_ls_file_size / max_batch_bytes
+        } else {
+            1024
+        };
+        let base_size = CheckpointFileHeader::SIZE + max_batches * CheckpointRecord::SIZE;
+        base_size * checkpoint_prealloc_multiplier
+    }
+
+    fn write_checkpoint_record(&mut self) {
+        let record = CheckpointRecord::new(
+            self.in_flushing_first_offset,
+            self.in_flushing_posting_count,
+            self.batch_seq,
+        );
+
+        let record_bytes = unsafe { record.as_bytes() };
+
+        self.backend.submit_write(
+            self.checkpoint_handle_index,
+            record_bytes.as_ptr(),
+            CheckpointRecord::SIZE,
+            self.checkpoint_write_offset,
+        ).expect("Failed to submit checkpoint record write");
+
+        self.backend.submit_sync(self.checkpoint_handle_index)
+            .expect("Failed to submit checkpoint record sync");
+
+        self.backend.flush_submissions()
+            .expect("Failed to flush checkpoint submissions");
+
+        self.backend.wait_for_the_one_completion();
+
+        self.checkpoint_write_offset += CheckpointRecord::SIZE as u64;
+        self.batch_seq += 1;
     }
 }
 
@@ -456,6 +550,8 @@ mod tests {
     use crate::no_signing_strategy::NoSigningStrategy;
     use crate::posting_metadata_strategy::PostingMetadataStrategy;
     use crate::signing_state::SigningState;
+    use crate::checkpoint_record::CheckpointRecord;
+    use crate::checkpoint_file_header::CheckpointFileHeader;
 
     const K0: u64 = 0x0123456789ABCDEF;
     const K1: u64 = 0xFEDCBA9876543210;
@@ -556,6 +652,7 @@ mod tests {
             2,
             512,
             16,
+            4,
         );
         writer.initialize();
         writer
@@ -587,6 +684,7 @@ mod tests {
             64, K0, K1,
             64, 2, 512,
             16,
+            4,
         );
         writer.initialize();
         writer
@@ -622,6 +720,7 @@ mod tests {
             K1,
             64, 2, 512,
             16,
+            4,
         );
         writer.initialize();
 
@@ -694,6 +793,7 @@ mod tests {
             64, K0, K1,
             64, 2, 512,
             16,
+            4,
         );
         writer.initialize();
         writer
@@ -717,7 +817,7 @@ mod tests {
             0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), signing, NoMetadataStrategy,
             "test.ls".to_string(), 0,
-            64, K0, K1, 64, 2, 512, 16,
+            64, K0, K1, 64, 2, 512, 16, 4,
         );
         writer.initialize();
 
@@ -734,16 +834,20 @@ mod tests {
 
         writer.submit_flush();
 
-        assert_eq!(writer.backend.written.len(), 4);
+        assert_eq!(writer.backend.written.len(), 5);
     }
 
     #[test]
     fn initialize_opens_file() {
         let writer = make_writer();
         assert!(writer.backend.fds_opened[0]);
-        assert_eq!(writer.backend.written.len(), 1);
+        assert!(writer.backend.fds_opened[1]);
+        assert_eq!(writer.backend.written.len(), 2);
         assert_eq!(writer.backend.written[0].2, 0);
         assert_eq!(writer.backend.written[0].1.len(), 4096);
+
+        assert_eq!(writer.backend.written[1].2, 0);
+        assert_eq!(writer.backend.written[1].1.len(), CheckpointFileHeader::SIZE);
     }
 
     #[test]
@@ -818,10 +922,10 @@ mod tests {
 
         writer.submit_flush();
 
-        assert_eq!(writer.backend.written.len(), 2);
-        assert_eq!(writer.backend.written[1].1.len() % LS_FILE_PAGE_SIZE, 0);
-        assert!(writer.backend.written[1].1.len() >= PostingRecord::SIZE);
-        assert_eq!(writer.backend.written[1].2, LsFileHeader::DATA_OFFSET as u64);
+        assert_eq!(writer.backend.written.len(), 3);
+        assert_eq!(writer.backend.written[2].1.len() % LS_FILE_PAGE_SIZE, 0);
+        assert!(writer.backend.written[2].1.len() >= PostingRecord::SIZE);
+        assert_eq!(writer.backend.written[2].2, LsFileHeader::DATA_OFFSET as u64);
     }
 
     #[test]
@@ -856,7 +960,7 @@ mod tests {
         writer.submit_flush();
 
         assert!(!writer.flush_in_flight);
-        assert_eq!(writer.backend.written.len(), 1);
+        assert_eq!(writer.backend.written.len(), 2);
     }
 
     #[test]
@@ -869,7 +973,7 @@ mod tests {
         writer.process_message(&make_posting_slot(200, 300));
         writer.submit_flush();
 
-        assert_eq!(writer.backend.written.len(), 2);
+        assert_eq!(writer.backend.written.len(), 3);
     }
 
     #[test]
@@ -977,11 +1081,13 @@ mod tests {
 
         writer.submit_flush();
 
-        assert_eq!(writer.backend.written.len(), 2);
-        assert_eq!(writer.backend.written[1].1.len() % LS_FILE_PAGE_SIZE, 0);
-        assert!(writer.backend.written[1].1.len() >= PostingRecord::SIZE * 3);
+        assert_eq!(writer.backend.written.len(), 3);
+        assert_eq!(writer.backend.written[2].1.len() % LS_FILE_PAGE_SIZE, 0);
+        assert!(writer.backend.written[2].1.len() >= PostingRecord::SIZE * 3);
 
         writer.poll_and_handle_completions();
+
+        assert_eq!(writer.backend.written.len(), 4);
 
         assert!(writer.in_flight_min_heap.is_empty());
         assert_eq!(writer.buffer_len, 0);
@@ -1007,8 +1113,8 @@ mod tests {
 
         writer.submit_flush();
 
-        assert_eq!(writer.backend.written.len(), 3);
-        assert_eq!(writer.backend.written[2].2, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64);
+        assert_eq!(writer.backend.written.len(), 5);
+        assert_eq!(writer.backend.written[4].2, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64);
 
         writer.poll_and_handle_completions();
 
@@ -1159,5 +1265,120 @@ mod tests {
         assert_eq!(magic, crate::ls_file_header::LS_FILE_MAGIC);
 
         assert_eq!(writer.write_offset, 4096);
+    }
+
+    #[test]
+    fn checkpoint_record_written_after_flush_completion() {
+        let mut writer = make_writer();
+
+        writer.process_message(&make_add_to_heap_slot(100));
+        writer.process_message(&make_posting_slot(100, 500));
+        writer.process_message(&make_flush_marker_slot(100, 1, 42));
+
+        writer.submit_flush();
+        assert_eq!(writer.backend.written.len(), 3);
+
+        writer.poll_and_handle_completions();
+        assert_eq!(writer.backend.written.len(), 4);
+
+        let (handle, data, offset) = &writer.backend.written[3];
+        assert_eq!(*handle, writer.checkpoint_handle_index);
+        assert_eq!(data.len(), CheckpointRecord::SIZE);
+        assert_eq!(*offset, CheckpointFileHeader::DATA_OFFSET as u64);
+    }
+
+    #[test]
+    fn checkpoint_batch_seq_increments() {
+        let mut writer = make_writer();
+
+        writer.process_message(&make_posting_slot(100, 500));
+        writer.submit_flush();
+        writer.poll_and_handle_completions();
+        assert_eq!(writer.batch_seq, 1);
+
+        writer.process_message(&make_posting_slot(200, 300));
+        writer.submit_flush();
+        writer.poll_and_handle_completions();
+        assert_eq!(writer.batch_seq, 2);
+    }
+
+    #[test]
+    fn checkpoint_write_offset_advances() {
+        let mut writer = make_writer();
+
+        assert_eq!(writer.checkpoint_write_offset, CheckpointFileHeader::DATA_OFFSET as u64);
+
+        writer.process_message(&make_posting_slot(100, 500));
+        writer.submit_flush();
+        writer.poll_and_handle_completions();
+
+        assert_eq!(
+            writer.checkpoint_write_offset,
+            CheckpointFileHeader::DATA_OFFSET as u64 + CheckpointRecord::SIZE as u64,
+        );
+
+        writer.process_message(&make_posting_slot(200, 300));
+        writer.submit_flush();
+        writer.poll_and_handle_completions();
+
+        assert_eq!(
+            writer.checkpoint_write_offset,
+            CheckpointFileHeader::DATA_OFFSET as u64 + 2 * CheckpointRecord::SIZE as u64,
+        );
+    }
+
+    #[test]
+    fn checkpoint_first_posting_offset_correct() {
+        let mut writer = make_writer();
+
+        writer.process_message(&make_posting_slot(100, 500));
+        writer.submit_flush();
+
+        assert_eq!(writer.in_flushing_first_offset, LsFileHeader::DATA_OFFSET as u64);
+    }
+
+    #[test]
+    fn checkpoint_posting_count_correct() {
+        let mut writer = make_writer();
+
+        writer.process_message(&make_posting_slot(100, 500));
+        writer.process_message(&make_posting_slot(200, 300));
+        writer.process_message(&make_posting_slot(300, 100));
+        writer.submit_flush();
+
+        assert_eq!(writer.in_flushing_posting_count, 3);
+    }
+
+    #[test]
+    fn checkpoint_record_content_correct() {
+        let mut writer = make_writer();
+
+        writer.process_message(&make_posting_slot(100, 500));
+        writer.process_message(&make_posting_slot(200, 300));
+        writer.submit_flush();
+        writer.poll_and_handle_completions();
+
+        let (_, data, _) = &writer.backend.written[3];
+        let record = unsafe { CheckpointRecord::from_bytes(data) };
+
+        assert_eq!(record.first_posting_offset, LsFileHeader::DATA_OFFSET as u64);
+        assert_eq!(record.posting_count, 2);
+        assert_eq!(record.batch_seq, 0);
+        assert!(unsafe { record.verify_checksum() });
+    }
+
+    #[test]
+    fn checkpoint_header_written_at_initialize() {
+        let writer = make_writer();
+
+        let (handle, data, offset) = &writer.backend.written[1];
+        assert_eq!(*handle, writer.checkpoint_handle_index);
+        assert_eq!(data.len(), CheckpointFileHeader::SIZE);
+        assert_eq!(*offset, 0u64);
+
+        let header = unsafe { CheckpointFileHeader::from_bytes(data) };
+        assert_eq!(header.magic, crate::checkpoint_file_header::CHECKPOINT_FILE_MAGIC);
+        assert_eq!(header.linked_ls_file_seq, 0);
+        assert!(unsafe { header.verify_checksum() });
     }
 }

@@ -289,6 +289,8 @@ fn main() {
         let signing_enabled = config.storage.signing_enabled;
         let metadata_enabled = config.storage.posting_metadata.enabled;
         let metadata_record_size = config.storage.posting_metadata.record_size;
+        
+        let checkpoint_prealloc_multiplier = config.storage.checkpoint_prealloc_multiplier;
 
         #[cfg(target_os = "linux")]
         match IoUringFlushBackend::new() {
@@ -301,6 +303,7 @@ fn main() {
                     backend, ls_file_path, max_ls_file_size,
                     flush_timeout_ms, flush_max_buffer, partition_count,
                     signing_enabled, metadata_enabled, metadata_record_size,
+                    checkpoint_prealloc_multiplier,
                 );
             }
             Err(e) => {
@@ -313,6 +316,7 @@ fn main() {
                     backend, ls_file_path, max_ls_file_size,
                     flush_timeout_ms, flush_max_buffer, partition_count,
                     signing_enabled, metadata_enabled, metadata_record_size,
+                    checkpoint_prealloc_multiplier,
                 );
             }
         }
@@ -374,6 +378,7 @@ fn spawn_ls_writer_thread<T, S, M>(
     flush_timeout_ms: u64,
     flush_max_buffer_posting_records: usize,
     partition_count: u16,
+    checkpoint_prealloc_multiplier: usize,
 ) where
     T: FlushBackend + Send + 'static,
     S: SigningStrategy + Send + 'static,
@@ -399,6 +404,7 @@ fn spawn_ls_writer_thread<T, S, M>(
                     flush_timeout_ms,
                     flush_max_buffer_posting_records,
                     partition_count,
+                    checkpoint_prealloc_multiplier,
                 );
                 writer.run();
             }
@@ -419,6 +425,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
     signing_enabled: bool,
     metadata_enabled: bool,
     metadata_record_size: usize,
+    checkpoint_prealloc_multiplier: usize,
 ) {
     if signing_enabled {
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
@@ -435,6 +442,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 backend, signing, metadata,
                 ls_file_path, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
+                checkpoint_prealloc_multiplier,
             );
         } else {
             spawn_ls_writer_thread(
@@ -442,6 +450,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 backend, signing, NoMetadataStrategy,
                 ls_file_path, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
+                checkpoint_prealloc_multiplier,
             );
         }
     } else {
@@ -452,6 +461,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 backend, NoSigningStrategy, metadata,
                 ls_file_path, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
+                checkpoint_prealloc_multiplier,
             );
         } else {
             spawn_ls_writer_thread(
@@ -459,6 +469,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 backend, NoSigningStrategy, NoMetadataStrategy,
                 ls_file_path, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
+                checkpoint_prealloc_multiplier,
             );
         }
     }
