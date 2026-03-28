@@ -90,6 +90,8 @@ Framing, handshake, batch validation, codec.
 - 8-8-main-rf: Runtime backend selection (io_uring / portable fallback), strategy wiring in main.rs, `spawn_with_strategies<T>` + `spawn_ls_writer_thread<T, S, M>`, `#[cfg(target_os)]` for platform support ✅
 - 8-12: main.rs wiring — LS Writer RB, Flush Done RB, LS Writer threads, global_committed_gsn ✅ (done in 8-8-main-rf)
 - 8-9: LS rotation — triggers: max_file_size, metadata schema change, rule change
+  - 8-9-1: CheckpointRecord (32 bytes) + CheckpointFileHeader (40 bytes) + open_file_buffered in FlushBackend ✅
+  - 8-9-2: Checkpoint integration in LsWriter — batch_seq tracking, write_checkpoint_record after flush completion, checkpoint_prealloc_multiplier config ✅
 - 8-10: LS Index Builder — *.idx + *.index (sorted arrays by account_id, async at rotation)
 - 8-11: LS Sign Index — *.ls_sign_idx (sorted array by transfer_id, if signing enabled)
 - 8-t: Integration tests (DM → LS Writer → fdatasync → Flush Done → DM → THT cleanup)
