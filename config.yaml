@@ -42,3 +42,4 @@ storage:
   posting-metadata:
     enabled: false
     record-size: 256
+  default-checkpoint-prealloc-multiplier: 4
