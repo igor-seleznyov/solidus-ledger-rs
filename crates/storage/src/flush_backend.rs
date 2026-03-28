@@ -31,6 +31,11 @@ pub trait FlushBackend {
     fn flush_submissions(&mut self) -> std::io::Result<()>;
 
     fn wait_completions(&mut self, count: usize);
+    
+    #[inline]
+    fn wait_for_the_one_completion(&mut self) {
+        self.wait_completions(1);
+    }
 
     fn poll_completion(&mut self) -> Option<FlushCompletion>;
 
