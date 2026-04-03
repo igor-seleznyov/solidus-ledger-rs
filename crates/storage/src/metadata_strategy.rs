@@ -8,6 +8,8 @@ pub trait MetadataStrategy {
     fn prepare_flush(&mut self) -> Option<(*const u8, usize, u64)>;
 
     fn on_flush_complete(&mut self);
+    
+    fn on_rotation(&mut self) {}
 
     fn is_enabled(&self) -> bool;
 }

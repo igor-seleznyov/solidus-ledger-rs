@@ -92,6 +92,12 @@ Framing, handshake, batch validation, codec.
 - 8-9: LS rotation — triggers: max_file_size, metadata schema change, rule change
   - 8-9-1: CheckpointRecord (32 bytes) + CheckpointFileHeader (40 bytes) + open_file_buffered in FlushBackend ✅
   - 8-9-2: Checkpoint integration in LsWriter — batch_seq tracking, write_checkpoint_record after flush completion, checkpoint_prealloc_multiplier config ✅
+  - 8-9-3: on_rotation() in SigningStrategy and MetadataStrategy — state reset on rotation, cross-file chain for signing ✅
+  - 8-9-4: Rotation logic in LsWriter — should_rotate(), rotate(), open_files() refactoring, datetime filenames, handle reuse in FlushBackend, ManifestEntry struct (128 bytes), Index Builder stub ✅
+  - 8-9-5: Manifest file + startup logic + recovery
+    - 8-9-5a: ManifestHeader (64 bytes) + Manifest read/write (create, open, append entry, finalize entry, fsync)
+    - 8-9-5b: Startup logic in LsWriter — read manifest → first launch / reopen existing file / rotate on config mismatch (rules_checksum, record_size, metadata_enabled)
+    - 8-9-5c: Recovery write_offset — read last checkpoint record + scan LS by PostingRecord magic for records after checkpoint
 - 8-10: LS Index Builder — *.idx + *.index (sorted arrays by account_id, async at rotation)
 - 8-11: LS Sign Index — *.ls_sign_idx (sorted array by transfer_id, if signing enabled)
 - 8-t: Integration tests (DM → LS Writer → fdatasync → Flush Done → DM → THT cleanup)

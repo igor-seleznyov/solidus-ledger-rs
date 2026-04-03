@@ -127,6 +127,12 @@ impl MetadataStrategy for PostingMetadataStrategy {
         self.pending_padded_len = 0;
     }
     
+    fn on_rotation(&mut self) {
+        self.meta_write_offset = 0;
+        self.meta_buffer_len = 0;
+        self.pending_padded_len = 0;
+    }
+    
     fn is_enabled(&self) -> bool {
         true
     }

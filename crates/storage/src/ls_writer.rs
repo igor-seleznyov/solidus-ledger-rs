@@ -1,12 +1,14 @@
-use std::sync::Arc;
-use std::time::Instant;
-use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
+use std::path::PathBuf;
+use chrono::Local;
+use common::mem_barrier::release_store_u64;
 use pipeline::posting_record::PostingRecord;
 use pipeline::in_flight_min_heap::InFlightMinHeap;
+use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
+use std::sync::Arc;
+use std::time::Instant;
 use crate::ls_writer_slot::*;
 use crate::flush_done_slot::FlushDoneSlot;
 use crate::flush_backend::FlushBackend;
-use common::mem_barrier::release_store_u64;
 use crate::ls_file_header::{LsFileHeader};
 use crate::metadata_strategy::MetadataStrategy;
 use crate::pending_flush::PendingFlush;
@@ -16,6 +18,11 @@ use crate::checkpoint_file_header::CheckpointFileHeader;
 
 const CLOCK_CHECK_REPEATS_COUNT_INTERVAL: u32 = 100_000;
 
+fn generate_ls_filename(shard_id: usize, file_seq: u64) -> String {
+    let now = Local::now();
+    format!("ls_{}-{}-{}.ls", now.format("%Y%m%d-%H%M%S-%3f"), shard_id, file_seq)
+}
+
 pub struct LsWriter<T: FlushBackend, S: SigningStrategy, M: MetadataStrategy> {
     id: usize,
     ls_writer_rb: Arc<MpscRingBuffer<LsWriterSlot>>,
@@ -24,7 +31,8 @@ pub struct LsWriter<T: FlushBackend, S: SigningStrategy, M: MetadataStrategy> {
     backend: T,
     signing_strategy: S,
     metadata_strategy: M,
-    ls_file_path: String,
+    ls_directory: String,
+    current_ls_file_path: String,
     max_ls_file_size: usize,
     in_flight_min_heap: InFlightMinHeap,
     batch_size: usize,
@@ -78,7 +86,7 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         backend: T,
         signing_strategy: S,
         metadata_strategy: M,
-        ls_file_path: String,
+        ls_directory: String,
         max_ls_file_size: usize,
         in_flight_min_heap_capacity: usize,
         in_flight_min_heap_seed_k0: u64,
@@ -114,7 +122,8 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
             backend,
             signing_strategy,
             metadata_strategy,
-            ls_file_path,
+            ls_directory,
+            current_ls_file_path: String::new(),
             max_ls_file_size,
             in_flight_min_heap: InFlightMinHeap::new(
                 in_flight_min_heap_capacity,
@@ -327,6 +336,10 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         self.flush_in_flight = false;
 
         self.write_checkpoint_record();
+
+        if self.should_rotate() {
+            self.rotate();
+        }
     }
 
     pub fn process_message(&mut self, slot: &LsWriterSlot) {
@@ -369,22 +382,38 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         }
     }
 
-    fn initialize(&mut self) {
+    pub fn initialize(&mut self) {
+        self.open_files();
+
+        println!(
+            "[ls-writer {}] initialized: file={}, signing={}, metadata={}, data_offset={}, checkpoint_prealloc={}",
+            self.id, self.current_ls_file_path,
+            self.signing_strategy.is_enabled(),
+            self.metadata_strategy.is_enabled(),
+            self.write_offset,
+            self.checkpoint_prealloc_size,
+        );
+    }
+
+    fn open_files(&mut self) {
+        let filename = generate_ls_filename(self.id, self.file_seq);
+        self.current_ls_file_path = format!("{}/{}", self.ls_directory, filename);
+
         self.ls_handle_index = self.backend
-            .open_file(&self.ls_file_path, self.max_ls_file_size)
+            .open_file(&self.current_ls_file_path, self.max_ls_file_size)
             .expect("Failed to open LS file");
 
-        if let Some((sign_path, prealloc)) = self.signing_strategy.file_info(&self.ls_file_path) {
+        if let Some((sign_path, prealloc)) = self.signing_strategy.file_info(&self.current_ls_file_path) {
             self.sign_handle_index = self.backend.open_file(&sign_path, prealloc)
-                    .expect("Failed to open signature file");
+                .expect("Failed to open signature file");
         }
 
-        if let Some((meta_path, prealloc)) = self.metadata_strategy.file_info(&self.ls_file_path) {
+        if let Some((meta_path, prealloc)) = self.metadata_strategy.file_info(&self.current_ls_file_path) {
             self.meta_handle_index = self.backend.open_file(&meta_path, prealloc)
-                    .expect("Failed to open metadata file");
+                .expect("Failed to open metadata file");
         }
 
-        let checkpoint_path = format!("{}.checkpoint", self.ls_file_path);
+        let checkpoint_path = format!("{}.checkpoint", self.current_ls_file_path);
         self.checkpoint_handle_index = self.backend
             .open_file_buffered(&checkpoint_path, self.checkpoint_prealloc_size)
             .expect("Failed to open checkpoint file");
@@ -464,15 +493,6 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
 
         self.checkpoint_write_offset = CheckpointFileHeader::DATA_OFFSET as u64;
         self.batch_seq = 0;
-
-        println!(
-            "[ls-writer {}] initialized: file={}, signing={}, metadata={}, data_offset={}, checkpoint_prealloc={}",
-            self.id, self.ls_file_path,
-            self.signing_strategy.is_enabled(),
-            self.metadata_strategy.is_enabled(),
-            self.write_offset,
-            self.checkpoint_prealloc_size,
-        );
     }
 
     fn maybe_advance_committed_gsn(&self) {
@@ -484,6 +504,43 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         unsafe {
             release_store_u64(self.global_committed_gsn, new_committed);
         }
+    }
+
+    fn should_rotate(&self) -> bool {
+        self.max_ls_file_size > 0 && self.write_offset >= self.max_ls_file_size as u64
+    }
+
+    pub fn rotate(&mut self) {
+        let old_path = self.current_ls_file_path.clone();
+
+        self.backend.close_file(self.checkpoint_handle_index);
+
+        if self.metadata_strategy.is_enabled() {
+            self.backend.close_file(self.meta_handle_index);
+        }
+
+        if self.signing_strategy.is_enabled() {
+            self.backend.close_file(self.sign_handle_index);
+        }
+
+        self.backend.close_file(self.ls_handle_index);
+
+        println!(
+            "[ls-writer {}] rotation: index builder stub for {}",
+            self.id, old_path
+        );
+
+        self.file_seq += 1;
+
+        self.signing_strategy.on_rotation();
+        self.metadata_strategy.on_rotation();
+
+        self.open_files();
+
+        println!(
+            "[ls-writer {}] rotated: {} -> {}",
+            self.id, old_path, self.current_ls_file_path
+        );
     }
 
     fn compute_checkpoint_prealloc(
@@ -528,6 +585,14 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         self.checkpoint_write_offset += CheckpointRecord::SIZE as u64;
         self.batch_seq += 1;
     }
+
+    pub fn current_ls_file_path(&self) -> &str {
+        &self.current_ls_file_path
+    }
+
+    pub fn signing_chain_hash(&self) -> Option<&[u8; 32]> {
+        self.signing_strategy.chain_hash()
+    }
 }
 
 #[cfg(test)]
@@ -561,7 +626,6 @@ mod tests {
 
     struct MockFlushBackend {
         fds_opened: [bool; MAX_FILES],
-        fds_count: usize,
         written: Vec<(u8, Vec<u8>, u64)>,
         pending_completion: Option<FlushCompletion>,
     }
@@ -570,19 +634,26 @@ mod tests {
         fn new() -> Self {
             Self {
                 fds_opened: [false; MAX_FILES],
-                fds_count: 0,
                 written: Vec::new(),
                 pending_completion: None,
             }
+        }
+
+        fn find_free_slot(&self) -> usize {
+            for i in 0..MAX_FILES {
+                if !self.fds_opened[i] {
+                    return i;
+                }
+            }
+            panic!("MockFlushBackend: no free file slots");
         }
     }
 
     impl FlushBackend for MockFlushBackend {
         fn open_file(&mut self, _path: &str, _prealloc: usize) -> std::io::Result<u8> {
-            let handle = self.fds_count as u8;
-            self.fds_opened[self.fds_count] = true;
-            self.fds_count += 1;
-            Ok(handle)
+            let handle = self.find_free_slot();
+            self.fds_opened[handle] = true;
+            Ok(handle as u8)
         }
 
         fn submit_write(
@@ -643,7 +714,7 @@ mod tests {
             MockFlushBackend::new(),
             NoSigningStrategy,
             NoMetadataStrategy,
-            "test.ls".to_string(),
+            "/tmp/solidus-test".to_string(),
             0,
             64,
             K0,
@@ -679,7 +750,7 @@ mod tests {
             MockFlushBackend::new(),
             NoSigningStrategy,
             metadata,
-            "test.ls".to_string(),
+            "/tmp/solidus-test".to_string(),
             0,
             64, K0, K1,
             64, 2, 512,
@@ -713,7 +784,7 @@ mod tests {
             MockFlushBackend::new(),
             NoSigningStrategy,
             NoMetadataStrategy,
-            "test.ls".to_string(),
+            "/tmp/solidus-test".to_string(),
             0,
             64,
             K0,
@@ -788,7 +859,7 @@ mod tests {
             MockFlushBackend::new(),
             signing,
             NoMetadataStrategy,
-            "test.ls".to_string(),
+            "/tmp/solidus-test".to_string(),
             0,
             64, K0, K1,
             64, 2, 512,
@@ -799,27 +870,44 @@ mod tests {
         writer
     }
 
-
-    #[test]
-    fn sign_batch_creates_sig_records() {
-        let key = SigningKey::from_bytes(&[0x42u8; 32]);
-        let genesis = [0u8; 32];
-        let signing_state = SigningState::new(key, genesis);
-        let signing = Ed25519SigningStrategy::new(signing_state, 512);
-
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+    fn make_writer_with_max_size(max_size: usize) -> LsWriter<MockFlushBackend, NoSigningStrategy, NoMetadataStrategy> {
+        let ls_writer_rb = Arc::new(
+            MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
+        );
+        let flush_done_rb = Arc::new(
+            MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()
+        );
 
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
 
         let mut writer = LsWriter::new(
-            0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
-            MockFlushBackend::new(), signing, NoMetadataStrategy,
-            "test.ls".to_string(), 0,
-            64, K0, K1, 64, 2, 512, 16, 4,
+            0,
+            ls_writer_rb,
+            flush_done_rb,
+            committed_gsn_ptr,
+            MockFlushBackend::new(),
+            NoSigningStrategy,
+            NoMetadataStrategy,
+            "/tmp/solidus-test".to_string(),
+            max_size,
+            64,
+            K0,
+            K1,
+            64,
+            2,
+            512,
+            16,
+            4,
         );
         writer.initialize();
+        writer
+    }
+
+
+    #[test]
+    fn sign_batch_creates_sig_records() {
+        let mut writer = make_writer_with_signing();
 
         let mut slot1 = make_posting_slot(100, 500);
         slot1.posting.transfer_id_hi = 0;
@@ -1380,5 +1468,231 @@ mod tests {
         assert_eq!(header.magic, crate::checkpoint_file_header::CHECKPOINT_FILE_MAGIC);
         assert_eq!(header.linked_ls_file_seq, 0);
         assert!(unsafe { header.verify_checksum() });
+    }
+
+    #[test]
+    fn signing_on_rotation_preserves_last_tx_hash() {
+        let key = SigningKey::from_bytes(&[0x42u8; 32]);
+        let genesis = [0u8; 32];
+        let signing_state = SigningState::new(key, genesis);
+        let mut signing = Ed25519SigningStrategy::new(signing_state, 512);
+
+        let hash_before = *signing.chain_hash().unwrap();
+
+        signing.on_rotation();
+
+        let hash_after = *signing.chain_hash().unwrap();
+        assert_eq!(hash_before, hash_after);
+    }
+
+    #[test]
+    fn signing_on_rotation_resets_write_offset() {
+        let key = SigningKey::from_bytes(&[0x42u8; 32]);
+        let genesis = [0u8; 32];
+        let signing_state = SigningState::new(key, genesis);
+        let mut signing = Ed25519SigningStrategy::new(signing_state, 512);
+
+        signing.prepare_header(0);
+        signing.on_header_written();
+
+        signing.on_rotation();
+
+    }
+
+    #[test]
+    fn metadata_on_rotation_resets_write_offset() {
+        let mut metadata = PostingMetadataStrategy::new(256, 512);
+
+        metadata.prepare_header(0, 256 * 1024 * 1024);
+        metadata.on_header_written();
+
+        metadata.on_rotation();
+
+    }
+
+    #[test]
+    fn no_signing_on_rotation_is_noop() {
+        let mut no_signing = NoSigningStrategy;
+        no_signing.on_rotation();
+    }
+
+    #[test]
+    fn no_metadata_on_rotation_is_noop() {
+        let mut no_metadata = NoMetadataStrategy;
+        no_metadata.on_rotation();
+    }
+
+    #[test]
+    fn should_rotate_false_when_max_size_zero() {
+        let writer = make_writer();
+        assert!(!writer.should_rotate());
+    }
+
+    #[test]
+    fn should_rotate_false_when_below_max_size() {
+        let mut writer = make_writer_with_max_size(1024 * 1024);
+        assert!(!writer.should_rotate());
+    }
+
+    #[test]
+    fn should_rotate_true_when_at_max_size() {
+        let mut writer = make_writer_with_max_size(4096);
+        assert!(writer.should_rotate());
+    }
+
+    #[test]
+    fn rotate_opens_new_files() {
+        let mut writer = make_writer_with_max_size(4096);
+
+        let old_path = writer.current_ls_file_path.clone();
+
+        writer.rotate();
+
+        assert!(writer.backend.fds_opened[writer.ls_handle_index as usize]);
+        assert!(writer.backend.fds_opened[writer.checkpoint_handle_index as usize]);
+
+        assert_ne!(writer.current_ls_file_path, old_path);
+
+        assert_eq!(writer.file_seq, 1);
+    }
+
+    #[test]
+    fn rotate_resets_offsets() {
+        let mut writer = make_writer_with_max_size(4096);
+
+        writer.write_offset = 8192;
+        writer.batch_seq = 5;
+        writer.checkpoint_write_offset = 200;
+
+        writer.rotate();
+
+        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64);
+        assert_eq!(writer.batch_seq, 0);
+        assert_eq!(writer.checkpoint_write_offset, CheckpointFileHeader::DATA_OFFSET as u64);
+    }
+
+    #[test]
+    fn rotate_increments_file_seq() {
+        let mut writer = make_writer_with_max_size(4096);
+        assert_eq!(writer.file_seq, 0);
+
+        writer.rotate();
+        assert_eq!(writer.file_seq, 1);
+
+        writer.rotate();
+        assert_eq!(writer.file_seq, 2);
+    }
+
+    #[test]
+    fn rotate_reuses_handle_indices() {
+        let mut writer = make_writer_with_max_size(4096);
+
+        let first_ls = writer.ls_handle_index;
+        let first_checkpoint = writer.checkpoint_handle_index;
+
+        writer.rotate();
+
+        assert!(writer.backend.fds_opened[writer.ls_handle_index as usize]);
+        assert!(writer.backend.fds_opened[writer.checkpoint_handle_index as usize]);
+
+        assert!(!writer.backend.fds_opened[first_ls as usize]
+            || first_ls == writer.ls_handle_index);
+        assert!(!writer.backend.fds_opened[first_checkpoint as usize]
+            || first_checkpoint == writer.checkpoint_handle_index);
+    }
+
+    #[test]
+    fn auto_rotate_after_flush_completion() {
+        let mut writer = make_writer_with_max_size(8192);
+
+        let initial_file_seq = writer.file_seq;
+
+        writer.process_message(&make_add_to_heap_slot(100));
+        writer.process_message(&make_posting_slot(100, 500));
+        writer.process_message(&make_flush_marker_slot(100, 1, 42));
+
+        writer.submit_flush();
+        writer.poll_and_handle_completions();
+
+        assert_eq!(writer.file_seq, initial_file_seq + 1);
+        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64);
+        assert_eq!(writer.batch_seq, 0);
+    }
+
+    #[test]
+    fn no_rotate_when_below_threshold() {
+        let mut writer = make_writer_with_max_size(12288);
+
+        let initial_file_seq = writer.file_seq;
+
+        writer.process_message(&make_posting_slot(100, 500));
+        writer.submit_flush();
+        writer.poll_and_handle_completions();
+
+        assert_eq!(writer.file_seq, initial_file_seq);
+    }
+
+    #[test]
+    fn generate_ls_filename_format() {
+        let name = generate_ls_filename(0, 0);
+        assert!(name.starts_with("ls_"));
+        assert!(name.ends_with("-0-0.ls"));
+        assert_eq!(name.len(), 29);
+
+        let name2 = generate_ls_filename(2, 15);
+        assert!(name2.ends_with("-2-15.ls"));
+        assert_eq!(name2.len(), 30);
+    }
+
+    #[test]
+    fn manifest_entry_layout() {
+        use crate::manifest_entry::ManifestEntry;
+        assert_eq!(ManifestEntry::SIZE, 128);
+        assert_eq!(std::mem::size_of::<ManifestEntry>(), 128);
+        assert_eq!(std::mem::align_of::<ManifestEntry>(), 64);
+
+        assert_eq!(std::mem::offset_of!(ManifestEntry, file_seq), 0);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, status), 8);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, signing_enabled), 9);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, metadata_enabled), 10);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, record_size), 12);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, rules_checksum), 16);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, gsn_min), 24);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, gsn_max), 32);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, timestamp_min_ns), 40);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, timestamp_max_ns), 48);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, checksum), 56);
+
+        assert_eq!(std::mem::offset_of!(ManifestEntry, filename), 64);
+
+    }
+
+    #[test]
+    fn manifest_entry_filename() {
+        use crate::manifest_entry::ManifestEntry;
+        let mut entry = ManifestEntry::zeroed();
+        entry.set_filename("ls_20260331-153045-123-0.ls");
+        assert_eq!(entry.filename_str(), "ls_20260331-153045-123-0.ls");
+    }
+
+    #[test]
+    fn manifest_entry_checksum() {
+        use crate::manifest_entry::ManifestEntry;
+        let mut entry = ManifestEntry::zeroed();
+        entry.file_seq = 1;
+        entry.set_filename("test.ls");
+
+        unsafe { entry.compute_checksum(); }
+        assert_ne!(entry.checksum, 0);
+        assert!(unsafe { entry.verify_checksum() });
+    }
+
+    #[test]
+    #[should_panic(expected = "Filename too long")]
+    fn manifest_entry_filename_too_long() {
+        use crate::manifest_entry::ManifestEntry;
+        let mut entry = ManifestEntry::zeroed();
+        let long_name = "a".repeat(65);
+        entry.set_filename(&long_name);
     }
 }

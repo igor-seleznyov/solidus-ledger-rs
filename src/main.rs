@@ -273,10 +273,8 @@ fn main() {
         let ls_writer_rb = Arc::clone(&ls_writer_rbs_source[i]);
         let ls_writer_flush_done_rb = Arc::clone(&flush_done_rbs[i]);
 
-        let ls_file_path = format!(
-            "{}/ls_{}_{}.ls",
-            config.storage.current_files_directory, i, 0
-        );
+        let ls_directory = config.storage.current_files_directory.clone();
+
         let max_ls_file_size = config.storage.max_ls_file_size_mb * 1024 * 1024;
         let flush_timeout_ms = config.storage.flush_timeout_ms;
         let flush_max_buffer = config.storage.flush_max_buffer_posting_records;
@@ -300,7 +298,7 @@ fn main() {
                 }
                 spawn_with_strategies(
                     i, ls_writer_rb, ls_writer_flush_done_rb, ls_writer_committed_gsn,
-                    backend, ls_file_path, max_ls_file_size,
+                    backend, ls_directory, max_ls_file_size,
                     flush_timeout_ms, flush_max_buffer, partition_count,
                     signing_enabled, metadata_enabled, metadata_record_size,
                     checkpoint_prealloc_multiplier,
@@ -313,7 +311,7 @@ fn main() {
                 let backend = PortableFlushBackend::new();
                 spawn_with_strategies(
                     i, ls_writer_rb, ls_writer_flush_done_rb, ls_writer_committed_gsn,
-                    backend, ls_file_path, max_ls_file_size,
+                    backend, ls_directory, max_ls_file_size,
                     flush_timeout_ms, flush_max_buffer, partition_count,
                     signing_enabled, metadata_enabled, metadata_record_size,
                     checkpoint_prealloc_multiplier,
@@ -329,7 +327,7 @@ fn main() {
             let backend = PortableFlushBackend::new();
             spawn_with_strategies(
                 i, ls_writer_rb, ls_writer_flush_done_rb, ls_writer_committed_gsn,
-                backend, ls_file_path, max_ls_file_size,
+                backend, ls_directory, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 signing_enabled, metadata_enabled, metadata_record_size,
             );
@@ -373,7 +371,7 @@ fn spawn_ls_writer_thread<T, S, M>(
     backend: T,
     signing: S,
     metadata: M,
-    ls_file_path: String,
+    ls_directory: String,
     max_ls_file_size: usize,
     flush_timeout_ms: u64,
     flush_max_buffer_posting_records: usize,
@@ -395,7 +393,7 @@ fn spawn_ls_writer_thread<T, S, M>(
                     backend,
                     signing,
                     metadata,
-                    ls_file_path,
+                    ls_directory,
                     max_ls_file_size,
                     1024,
                     generate_random_u64(),
@@ -417,7 +415,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
     flush_done_rb: Arc<MpscRingBuffer<FlushDoneSlot>>,
     committed_gsn_addr: usize,
     backend: T,
-    ls_file_path: String,
+    ls_directory: String,
     max_ls_file_size: usize,
     flush_timeout_ms: u64,
     flush_max_buffer: usize,
@@ -440,7 +438,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
             spawn_ls_writer_thread(
                 id, ls_writer_rb, flush_done_rb, committed_gsn_addr,
                 backend, signing, metadata,
-                ls_file_path, max_ls_file_size,
+                ls_directory, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
             );
@@ -448,7 +446,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
             spawn_ls_writer_thread(
                 id, ls_writer_rb, flush_done_rb, committed_gsn_addr,
                 backend, signing, NoMetadataStrategy,
-                ls_file_path, max_ls_file_size,
+                ls_directory, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
             );
@@ -459,7 +457,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
             spawn_ls_writer_thread(
                 id, ls_writer_rb, flush_done_rb, committed_gsn_addr,
                 backend, NoSigningStrategy, metadata,
-                ls_file_path, max_ls_file_size,
+                ls_directory, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
             );
@@ -467,7 +465,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
             spawn_ls_writer_thread(
                 id, ls_writer_rb, flush_done_rb, committed_gsn_addr,
                 backend, NoSigningStrategy, NoMetadataStrategy,
-                ls_file_path, max_ls_file_size,
+                ls_directory, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
             );

@@ -1,3 +1,4 @@
+use std::char::MAX;
 use std::ffi::CString;
 use crate::flush_backend::{FlushBackend, FlushCompletion};
 
@@ -17,10 +18,21 @@ impl PortableFlushBackend {
             pending_completion: None,
         }
     }
+
+    fn find_free_slot(&self) -> usize {
+        for i in 0..MAX_FILES {
+            if self.fds[i] == -1 {
+                return i;
+            }
+        }
+        panic!("No free slots for open another yet file (MAX_FILES = {})", MAX_FILES);
+    }
 }
 
 impl FlushBackend for PortableFlushBackend {
     fn open_file(&mut self, path: &str, _prealloc_size: usize) -> std::io::Result<u8> {
+        let handle_index = self.find_free_slot();
+
         assert!(self.fds_count < MAX_FILES, "Too many open files");
         let c_path = CString::new(path).map_err(
             |_| {
@@ -42,10 +54,8 @@ impl FlushBackend for PortableFlushBackend {
             return Err(std::io::Error::last_os_error());
         }
 
-        let handle_index = self.fds_count as u8;
-        self.fds[self.fds_count] = fd;
-        self.fds_count += 1;
-        Ok(handle_index)
+        self.fds[handle_index] = fd;
+        Ok(handle_index as u8)
     }
 
     fn submit_write(

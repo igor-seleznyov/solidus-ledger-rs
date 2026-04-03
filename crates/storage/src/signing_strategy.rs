@@ -13,8 +13,12 @@ pub trait SigningStrategy {
     ) -> Option<(*const u8, usize, u64)>;
 
     fn on_flush_complete(&mut self);
-
+    
+    fn on_rotation(&mut self) {}
+    
     fn is_enabled(&self) -> bool;
 
     fn public_key_hash(&self) -> u32;
+
+    fn chain_hash(&self) -> Option<&[u8; 32]> { None }
 }

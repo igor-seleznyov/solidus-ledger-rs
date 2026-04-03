@@ -12,7 +12,6 @@ const MAX_FILES: usize = 8;
 pub struct IoUringFlushBackend {
     ring: IoUring,
     fds: [i32; MAX_FILES],
-    fds_count: usize,
     pending_bytes: usize,
     direct_io: [bool; MAX_FILES],
 }
@@ -33,17 +32,25 @@ impl IoUringFlushBackend {
             Self {
                 ring,
                 fds: [-1; MAX_FILES],
-                fds_count: 0,
                 pending_bytes: 0,
                 direct_io: [false; MAX_FILES],
             }
         )
     }
+
+    fn find_free_slot(&self) -> usize {
+        for i in 0..MAX_FILES {
+            if self.fds[i] == -1 {
+                return i;
+            }
+        }
+        panic!("No free file slots (MAX_FILES = {})", MAX_FILES);
+    }
 }
 
 impl FlushBackend for IoUringFlushBackend {
     fn open_file(&mut self, path: &str, prealloc_size: usize) -> std::io::Result<u8> {
-        assert!(self.fds_count < MAX_FILES, "Too many open files");
+        let handle_index = self.find_free_slot();
 
         let c_path = CString::new(path).map_err(
             |_| {
@@ -73,11 +80,9 @@ impl FlushBackend for IoUringFlushBackend {
             }
         }
 
-        let handle = self.fds_count as u8;
-        self.fds[self.fds_count] = fd;
-        self.direct_io[self.fds_count] = true;
-        self.fds_count += 1;
-        Ok(handle)
+        self.fds[handle_index] = fd;
+        self.direct_io[handle_index] = true;
+        Ok(handle_index as u8)
     }
     
     fn open_file_buffered(
@@ -85,8 +90,8 @@ impl FlushBackend for IoUringFlushBackend {
         path: &str,
         prealloc_size: usize,
     ) -> std::io::Result<u8> {
-        assert!(self.fds_count < MAX_FILES, "Too many open files");
-        
+        let handle_index = self.find_free_slot();
+
         let c_path = CString::new(path).map_err(
             |_| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path")
@@ -117,11 +122,9 @@ impl FlushBackend for IoUringFlushBackend {
             }
         }
         
-        let handle = self.fds_count as u8;
-        self.fds[self.fds_count] = fd;
-        self.direct_io[self.fds_count] = false;
-        self.fds_count += 1;
-        Ok(handle)
+        self.fds[handle_index] = fd;
+        self.direct_io[handle_index] = false;
+        Ok(handle_index as u8)
     }
 
     fn submit_write(

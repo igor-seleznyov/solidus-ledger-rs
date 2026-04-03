@@ -41,10 +41,6 @@ impl Ed25519SigningStrategy {
     pub fn public_key_bytes(&self) -> [u8; 32] {
         self.signing_state.public_key_bytes()
     }
-
-    pub fn last_tx_hash(&self) -> &[u8; 32] {
-        self.signing_state.last_tx_hash()
-    }
 }
 
 unsafe impl Send for Ed25519SigningStrategy {}
@@ -156,6 +152,12 @@ impl SigningStrategy for Ed25519SigningStrategy {
         self.pending_padded_len = 0;
     }
 
+    fn on_rotation(&mut self) {
+        self.sign_write_offset = 0;
+        self.sign_buffer_len = 0;
+        self.pending_padded_len = 0;
+    }
+
     fn is_enabled(&self) -> bool {
         true
     }
@@ -165,5 +167,11 @@ impl SigningStrategy for Ed25519SigningStrategy {
         unsafe {
             common::crc32c::crc32c(public_key.as_ptr(), public_key.len())
         }
+    }
+
+    fn chain_hash(&self) -> Option<&[u8; 32]> {
+        Some(
+            self.signing_state.last_tx_hash()
+        )
     }
 }
