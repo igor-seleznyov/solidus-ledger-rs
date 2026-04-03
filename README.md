@@ -167,7 +167,7 @@ data/ikey/
 
 ## Project Status
 
-Actively developed. See [Implementation Steps](STEPS.md) for the full plan.
+Actively developed. See [Implementation Steps](steps.md) for the full plan.
 
 **Completed:**
 - Network layer (mio, binary protocol, batch validation)
@@ -189,7 +189,12 @@ Actively developed. See [Implementation Steps](STEPS.md) for the full plan.
 - Loom testing: happens-before correctness verified in C11 abstract memory model with exhaustive interleaving exploration — three-thread transitive chains (Pipeline→Actor→DM, LS Writer→DM→IO), release/acquire barriers, MPSC fetch_add atomicity
 
 **In progress (Step 8):**
-- LS file rotation and indexes
+- LS rotation: should_rotate(), rotate(), datetime filenames, handle reuse in FlushBackend
+- on_rotation() in SigningStrategy/MetadataStrategy, cross-file signing chain
+- ManifestEntry struct (128 bytes, 2 cache lines), Manifest file read/write
+- Startup logic: manifest-based file discovery, reopen or rotate on config mismatch
+- Recovery: write_offset from checkpoint + LS scan by PostingRecord magic
+- LS Index Builder, LS Sign Index
 - Snapshots and crash recovery
 
 **Planned:**

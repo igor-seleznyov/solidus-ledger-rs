@@ -16,3 +16,4 @@ common = { path = "../common" }
 
 [dev-dependencies]
 ledger = { path = "../ledger" }
+ed25519-dalek = { workspace = true }

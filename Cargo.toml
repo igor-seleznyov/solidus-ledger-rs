@@ -23,6 +23,7 @@ uuid = { version = "1.22.0", features = ["serde"] }
 io-uring = "0.7.11"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 sha2 = "0.10.9"
+chrono = "0.4.44"
 
 [dependencies]
 mio.workspace = true
@@ -39,6 +40,7 @@ ledger = { path = "crates/ledger" }
 storage = { path = "crates/storage" }
 integration_tests = { path = "crates/integration_tests" }
 sha2.workspace = true
+chrono.workspace = true
 
 [[bin]]
 name = "rust-start"
