@@ -22,3 +22,5 @@ pub mod pending_flush;
 pub mod checkpoint_record;
 pub mod checkpoint_file_header;
 pub mod manifest_entry;
+pub mod manifest_header;
+pub mod manifest;

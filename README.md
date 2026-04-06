@@ -185,15 +185,16 @@ Actively developed. See [Implementation Steps](steps.md) for the full plan.
 - Runtime backend selection: io_uring on Linux, portable fallback on other platforms
 - Parallel sign+meta flush via io_uring
 - Checkpoint files (CheckpointRecord + CheckpointFileHeader, write per flush batch)
+- LS rotation: should_rotate(), rotate(), datetime filenames, handle reuse in FlushBackend
+- on_rotation() in SigningStrategy/MetadataStrategy, cross-file signing chain
+- ManifestHeader (64 bytes) + ManifestEntry (128 bytes) + Manifest file (create, open, append, finalize, fsync)
+- Startup logic: manifest-based first launch / reopen / config mismatch rotation
+- GSN/timestamp tracking: min at first posting (persisted to manifest), max at rotation
 - Miri testing: all hash tables (PAHT, PVT, THT) and ring buffers (SPSC, MPSC) verified for unsafe correctness
 - Loom testing: happens-before correctness verified in C11 abstract memory model with exhaustive interleaving exploration — three-thread transitive chains (Pipeline→Actor→DM, LS Writer→DM→IO), release/acquire barriers, MPSC fetch_add atomicity
 
 **In progress (Step 8):**
-- LS rotation: should_rotate(), rotate(), datetime filenames, handle reuse in FlushBackend
-- on_rotation() in SigningStrategy/MetadataStrategy, cross-file signing chain
-- ManifestEntry struct (128 bytes, 2 cache lines), Manifest file read/write
-- Startup logic: manifest-based file discovery, reopen or rotate on config mismatch
-- Recovery: write_offset from checkpoint + LS scan by PostingRecord magic
+- Recovery: write_offset from checkpoint + LS scan by PostingRecord magic ← current
 - LS Index Builder, LS Sign Index
 - Snapshots and crash recovery
 

@@ -7,3 +7,4 @@ pub mod mem_barrier;
 pub mod crc32c;
 pub mod u64_pair_to_bytes;
 pub mod consts;
+pub mod make_test_dir;
