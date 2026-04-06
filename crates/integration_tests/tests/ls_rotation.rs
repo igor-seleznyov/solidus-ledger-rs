@@ -1,8 +1,6 @@
-use std::fmt::format;
 use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use common::make_test_dir::make_test_dir;
-use pipeline::posting_record::PostingRecord;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
 use storage::ls_writer::LsWriter;
 use storage::ls_writer_slot::*;

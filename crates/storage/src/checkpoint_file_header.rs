@@ -20,6 +20,10 @@ impl CheckpointFileHeader {
     pub const SIZE: usize = std::mem::size_of::<Self>();
     pub const DATA_OFFSET: u32 = Self::SIZE as u32;
 
+    pub fn zeroed() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+
     pub fn new(linked_ls_file_seq: u64) -> Self {
         let created_at_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -78,6 +82,15 @@ impl CheckpointFileHeader {
         assert!(bytes.len() >= Self::SIZE);
         unsafe {
             &*(bytes.as_ptr() as *const CheckpointFileHeader)
+        }
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self as *mut CheckpointFileHeader as *mut u8,
+                Self::SIZE,
+            )
         }
     }
 }

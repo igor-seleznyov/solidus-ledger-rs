@@ -7,6 +7,8 @@ use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
 use std::sync::Arc;
 use std::thread::current;
 use std::time::Instant;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use crate::ls_writer_slot::*;
 use crate::flush_done_slot::FlushDoneSlot;
 use crate::flush_backend::FlushBackend;
@@ -18,6 +20,8 @@ use crate::checkpoint_record::CheckpointRecord;
 use crate::checkpoint_file_header::CheckpointFileHeader;
 use crate::manifest::Manifest;
 use crate::manifest_entry::ManifestEntry;
+use crate::recovery::recover_checkpoint_state;
+use crate::recovery::recover_ls_state;
 use common::make_test_dir::make_test_dir;
 
 const CLOCK_CHECK_REPEATS_COUNT_INTERVAL: u32 = 100_000;
@@ -503,9 +507,33 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
             self.max_ls_file_size,
         ).expect("FFailed to reopen LS file");
 
-        self.write_offset = LsFileHeader::DATA_OFFSET as u64;
-        self.checkpoint_write_offset = CheckpointFileHeader::DATA_OFFSET as u64;
-        self.batch_seq = 0;
+        let checkpoint_path = format!("{}.checkpoint", self.current_ls_file_path);
+        let (recovered_checkpoint_offset, recovered_batch_seq) =
+            recover_checkpoint_state(&checkpoint_path);
+        self.checkpoint_write_offset = recovered_checkpoint_offset;
+        self.batch_seq = recovered_batch_seq;
+
+        let ls_state = recover_ls_state(&self.current_ls_file_path);
+        self.write_offset = ls_state.write_offset;
+
+        self.current_gsn_min = ls_state.gsn_min;
+        self.current_timestamp_min_ns = ls_state.timestamp_min_ns;
+        self.flushed_gsn_max = ls_state.gsn_max;
+        self.flushed_timestamp_max_ns = ls_state.timestamp_max_ns;
+
+        self.buffered_gsn_max = ls_state.gsn_max;
+        self.buffered_timestamp_max_ns = ls_state.timestamp_max_ns;
+
+        println!(
+            "[ls-writer {}] recovery: write_offset={}, postings={}, checkpoint_offset={}, batch_seq={}, gsn=[{}..{}]",
+            self.id,
+            self.write_offset,
+            ls_state.postings_count,
+            self.checkpoint_write_offset,
+            self.batch_seq,
+            ls_state.gsn_min,
+            ls_state.gsn_max,
+        );
     }
 
     fn open_strategy_files(&mut self) {
@@ -850,6 +878,63 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
     pub fn signing_chain_hash(&self) -> Option<&[u8; 32]> {
         self.signing_strategy.chain_hash()
     }
+
+    fn recover_checkpoint_state(checkpoint_path: &str) -> (u64, u32) {
+        let mut file = match File::open(checkpoint_path) {
+            Ok(file) => file,
+            Err(_) => {
+                return (CheckpointFileHeader::DATA_OFFSET as u64, 0);
+            }
+        };
+
+        let mut header = CheckpointFileHeader::zeroed();
+        if file.read_exact(
+            unsafe { header.as_bytes_mut() }
+        ).is_err() {
+            return (CheckpointFileHeader::DATA_OFFSET as u64, 0);
+        }
+
+        if header.magic != crate::checkpoint_file_header::CHECKPOINT_FILE_MAGIC
+            || !unsafe { header.verify_checksum() } {
+            panic!(
+                "Corrupt checkpoint file header: {}",
+                checkpoint_path,
+            );
+        }
+
+        let mut offset = CheckpointFileHeader::DATA_OFFSET as u64;
+        let mut last_batch_seq: u32 = 0;
+        let mut records_count: u64 = 0;
+        let mut buf = [0u8; CheckpointRecord::SIZE];
+
+        loop {
+            if file.seek(SeekFrom::Start(offset)).is_err() {
+                break;
+            }
+            match file.read_exact(&mut buf) {
+                Ok(()) => {}
+                Err(_) => break,
+            }
+
+            let record = unsafe { CheckpointRecord::from_bytes(&buf) };
+            if !unsafe { record.verify_checksum() } {
+                break;
+            }
+
+            last_batch_seq = record.batch_seq;
+            records_count += 1;
+            offset += CheckpointRecord::SIZE as u64;
+        }
+
+        let checkpoint_write_offset = CheckpointFileHeader::DATA_OFFSET as u64
+            + records_count * CheckpointRecord::SIZE as u64;
+
+        let batch_seq = if records_count > 0 {
+            last_batch_seq + 1
+        } else { 0 };
+
+        (checkpoint_write_offset, batch_seq)
+    }
 }
 
 #[cfg(test)]
@@ -875,6 +960,7 @@ mod tests {
     use crate::checkpoint_record::CheckpointRecord;
     use crate::checkpoint_file_header::CheckpointFileHeader;
     use crate::manifest_entry::MANIFEST_STATUS_ROTATED;
+    use crate::portable_flush_backend::PortableFlushBackend;
 
     const K0: u64 = 0x0123456789ABCDEF;
     const K1: u64 = 0xFEDCBA9876543210;
@@ -2123,6 +2209,367 @@ mod tests {
         let new_entry = writer.manifest.read_current_entry();
         assert_eq!(new_entry.signing_enabled, 0);
         assert_eq!(new_entry.file_seq, 1);
+
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn recover_checkpoint_state_empty_file() {
+        let dir = make_test_dir();
+        let checkpoint_path = format!("{}/test.ls.checkpoint", dir);
+
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&checkpoint_path).unwrap();
+            let header = CheckpointFileHeader::new(0);
+            f.write_all(unsafe { header.as_bytes() }).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let (offset, batch_seq) = crate::recovery::recover_checkpoint_state(&checkpoint_path);
+
+        assert_eq!(offset, CheckpointFileHeader::DATA_OFFSET as u64);
+        assert_eq!(batch_seq, 0);
+
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn recover_checkpoint_state_with_records() {
+        let dir = make_test_dir();
+        let checkpoint_path = format!("{}/test.ls.checkpoint", dir);
+
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&checkpoint_path).unwrap();
+
+            let header = CheckpointFileHeader::new(0);
+            f.write_all(unsafe { header.as_bytes() }).unwrap();
+
+            for i in 0..3u32 {
+                let record = CheckpointRecord::new(
+                    4096 + i as u64 * 4096,
+                    32,
+                    i,
+                );
+                f.write_all(unsafe { record.as_bytes() }).unwrap();
+            }
+            f.sync_all().unwrap();
+        }
+
+        let (offset, batch_seq) = crate::recovery::recover_checkpoint_state(&checkpoint_path);
+
+        assert_eq!(
+        offset,
+        CheckpointFileHeader::DATA_OFFSET as u64 + 3 * CheckpointRecord::SIZE as u64,
+    );
+        assert_eq!(batch_seq, 3);
+
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn recover_checkpoint_state_no_file() {
+        let (offset, batch_seq) = crate::recovery::recover_checkpoint_state("/tmp/nonexistent-checkpoint-file");
+
+        assert_eq!(offset, CheckpointFileHeader::DATA_OFFSET as u64);
+        assert_eq!(batch_seq, 0);
+    }
+
+    #[test]
+    fn recover_ls_state_empty_file() {
+        let dir = make_test_dir();
+        let ls_path = format!("{}/test.ls", dir);
+
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&ls_path).unwrap();
+            let header = LsFileHeader::new(false, 16, 256 * 1024 * 1024, 0, 0, false);
+            let page = header.to_page();
+            f.write_all(&page).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let state = crate::recovery::recover_ls_state(&ls_path);
+
+        assert_eq!(state.write_offset, LsFileHeader::DATA_OFFSET as u64);
+        assert_eq!(state.gsn_min, 0);
+        assert_eq!(state.gsn_max, 0);
+        assert_eq!(state.postings_count, 0);
+
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn recover_ls_state_with_postings() {
+        let dir = make_test_dir();
+        let ls_path = format!("{}/test.ls", dir);
+
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&ls_path).unwrap();
+
+            let header = LsFileHeader::new(false, 16, 256 * 1024 * 1024, 0, 0, false);
+            let page = header.to_page();
+            f.write_all(&page).unwrap();
+
+            let mut data_page = [0u8; 4096];
+            for i in 0..3u64 {
+                let mut record = PostingRecord::zeroed();
+                record.set_magic();
+                record.gsn = 100 + i;
+                record.timestamp_ns = 1700000000_000_000_000 + i * 1_000_000;
+                record.amount = (i + 1) as i64 * 100;
+                unsafe { record.compute_checksum(); }
+
+                let offset = i as usize * PostingRecord::SIZE;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &record as *const PostingRecord as *const u8,
+                        data_page[offset..].as_mut_ptr(),
+                        PostingRecord::SIZE,
+                    );
+                }
+            }
+            f.write_all(&data_page).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let state = crate::recovery::recover_ls_state(&ls_path);
+
+        assert_eq!(state.write_offset, LsFileHeader::DATA_OFFSET as u64 + 4096);
+        assert_eq!(state.gsn_min, 100);
+        assert_eq!(state.gsn_max, 102);
+        assert_eq!(state.timestamp_min_ns, 1700000000_000_000_000);
+        assert_eq!(state.timestamp_max_ns, 1700000000_002_000_000);
+        assert_eq!(state.postings_count, 3);
+
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn recover_ls_state_multiple_pages() {
+        let dir = make_test_dir();
+        let ls_path = format!("{}/test.ls", dir);
+
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&ls_path).unwrap();
+
+            let header = LsFileHeader::new(false, 16, 256 * 1024 * 1024, 0, 0, false);
+            f.write_all(&header.to_page()).unwrap();
+
+            let mut page1 = [0u8; 4096];
+            for i in 0..32u64 {
+                let mut record = PostingRecord::zeroed();
+                record.set_magic();
+                record.gsn = 1 + i;
+                record.timestamp_ns = 1700000000_000_000_000 + i;
+                unsafe { record.compute_checksum(); }
+
+                let offset = i as usize * PostingRecord::SIZE;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &record as *const PostingRecord as *const u8,
+                        page1[offset..].as_mut_ptr(),
+                        PostingRecord::SIZE,
+                    );
+                }
+            }
+            f.write_all(&page1).unwrap();
+
+            let mut page2 = [0u8; 4096];
+            for i in 0..5u64 {
+                let mut record = PostingRecord::zeroed();
+                record.set_magic();
+                record.gsn = 33 + i;
+                record.timestamp_ns = 1700000000_000_000_032 + i;
+                unsafe { record.compute_checksum(); }
+
+                let offset = i as usize * PostingRecord::SIZE;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &record as *const PostingRecord as *const u8,
+                        page2[offset..].as_mut_ptr(),
+                        PostingRecord::SIZE,
+                    );
+                }
+            }
+            f.write_all(&page2).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let state = crate::recovery::recover_ls_state(&ls_path);
+
+        assert_eq!(state.postings_count, 37);
+        assert_eq!(state.gsn_min, 1);
+        assert_eq!(state.gsn_max, 37);
+        assert_eq!(
+        state.write_offset,
+        LsFileHeader::DATA_OFFSET as u64 + 4096 + 4096,
+    );
+
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn recover_ls_state_no_file() {
+        let state = crate::recovery::recover_ls_state("/tmp/nonexistent-ls-file");
+
+        assert_eq!(state.write_offset, LsFileHeader::DATA_OFFSET as u64);
+        assert_eq!(state.gsn_min, 0);
+        assert_eq!(state.postings_count, 0);
+    }
+
+    #[test]
+    fn recover_ls_state_detects_corrupt_posting() {
+        let dir = make_test_dir();
+        let ls_path = format!("{}/test.ls", dir);
+
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&ls_path).unwrap();
+
+            let header = LsFileHeader::new(false, 16, 256 * 1024 * 1024, 0, 0, false);
+            f.write_all(&header.to_page()).unwrap();
+
+            let mut page = [0u8; 4096];
+
+            let mut r0 = PostingRecord::zeroed();
+            r0.set_magic();
+            r0.gsn = 100;
+            r0.timestamp_ns = 1700000000_000_000_000;
+            unsafe { r0.compute_checksum(); }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &r0 as *const PostingRecord as *const u8,
+                    page.as_mut_ptr(),
+                    PostingRecord::SIZE,
+                );
+            }
+
+            let mut r1 = PostingRecord::zeroed();
+            r1.set_magic();
+            r1.gsn = 200;
+            unsafe { r1.compute_checksum(); }
+            r1.amount = 999;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &r1 as *const PostingRecord as *const u8,
+                    page[PostingRecord::SIZE..].as_mut_ptr(),
+                    PostingRecord::SIZE,
+                );
+            }
+
+            f.write_all(&page).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let state = crate::recovery::recover_ls_state(&ls_path);
+
+        assert_eq!(state.postings_count, 1);
+        assert_eq!(state.gsn_min, 100);
+        assert_eq!(state.gsn_max, 100);
+
+        cleanup_dir(&dir);
+    }
+    #[test]
+    fn reopen_recovers_write_offset() {
+        let dir = make_test_dir();
+
+        let ls_path;
+        {
+            let manifest_path = format!("{}/0.manifest", dir);
+            std::fs::remove_file(&manifest_path).ok();
+            let manifest = Manifest::create(&dir, 0);
+
+            let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
+            let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+
+            unsafe { TEST_COMMITTED_GSN = 0; }
+            let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
+
+            let mut writer = LsWriter::new(
+                0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
+                PortableFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
+                dir.to_string(), 0, 64, K0, K1, 64, 2, 512, 16, 4, 0, manifest,
+            );
+            writer.startup();
+
+            let mut slot1 = make_posting_slot(100, 500);
+            slot1.posting.timestamp_ns = 1700000000_000_000_000;
+            unsafe {
+                slot1.posting.compute_checksum();
+            }
+            writer.process_message(&make_add_to_heap_slot(100));
+            writer.process_message(&slot1);
+            writer.process_message(&make_flush_marker_slot(100, 1, 42));
+
+            let mut slot2 = make_posting_slot(200, 300);
+            slot2.posting.timestamp_ns = 1700000000_001_000_000;
+            unsafe {
+                slot2.posting.compute_checksum();
+            }
+            writer.process_message(&make_add_to_heap_slot(200));
+            writer.process_message(&slot2);
+            writer.process_message(&make_flush_marker_slot(200, 2, 43));
+
+            writer.submit_flush();
+            writer.poll_and_handle_completions();
+
+            ls_path = writer.current_ls_file_path().to_string();
+        }
+
+        {
+            let manifest = Manifest::open(&dir, 0);
+
+            let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
+            let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+
+            unsafe { TEST_COMMITTED_GSN = 0; }
+            let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
+
+            let mut writer = LsWriter::new(
+                0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
+                PortableFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
+                dir.to_string(), 0, 64, K0, K1, 64, 2, 512, 16, 4, 0, manifest,
+            );
+            writer.startup();
+
+            assert_eq!(
+            writer.write_offset,
+            LsFileHeader::DATA_OFFSET as u64 + 4096,
+        );
+
+            assert_eq!(writer.batch_seq, 1);
+
+            assert_eq!(
+            writer.checkpoint_write_offset,
+            CheckpointFileHeader::DATA_OFFSET as u64 + CheckpointRecord::SIZE as u64,
+        );
+
+            assert_eq!(writer.current_gsn_min, 100);
+            assert_eq!(writer.flushed_gsn_max, 200);
+            assert_eq!(writer.current_timestamp_min_ns, 1700000000_000_000_000);
+            assert_eq!(writer.flushed_timestamp_max_ns, 1700000000_001_000_000);
+
+            let mut slot3 = make_posting_slot(300, 100);
+            slot3.posting.timestamp_ns = 1700000000_002_000_000;
+            unsafe {
+                slot3.posting.compute_checksum();
+            }
+            writer.process_message(&make_add_to_heap_slot(300));
+            writer.process_message(&slot3);
+            writer.process_message(&make_flush_marker_slot(300, 3, 44));
+
+            writer.submit_flush();
+            writer.poll_and_handle_completions();
+
+            assert_eq!(
+            writer.write_offset,
+            LsFileHeader::DATA_OFFSET as u64 + 4096 + 4096,
+        );
+        }
 
         cleanup_dir(&dir);
     }
