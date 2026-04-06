@@ -28,6 +28,7 @@ use storage::ed25519_signing_strategy::Ed25519SigningStrategy;
 use storage::posting_metadata_strategy::PostingMetadataStrategy;
 use storage::signing_state::SigningState;
 use storage::flush_backend::FlushBackend;
+use storage::manifest::Manifest;
 use storage::signing_strategy::SigningStrategy;
 use storage::metadata_strategy::MetadataStrategy;
 
@@ -275,6 +276,14 @@ fn main() {
 
         let ls_directory = config.storage.current_files_directory.clone();
 
+        let manifest = if Manifest::exists(&ls_directory, i) {
+            Manifest::open(&ls_directory, i)
+        } else {
+            Manifest::create(&ls_directory, i)
+        };
+
+        let rules_checksum: u32 = 0;
+
         let max_ls_file_size = config.storage.max_ls_file_size_mb * 1024 * 1024;
         let flush_timeout_ms = config.storage.flush_timeout_ms;
         let flush_max_buffer = config.storage.flush_max_buffer_posting_records;
@@ -302,6 +311,7 @@ fn main() {
                     flush_timeout_ms, flush_max_buffer, partition_count,
                     signing_enabled, metadata_enabled, metadata_record_size,
                     checkpoint_prealloc_multiplier,
+                    rules_checksum, manifest,
                 );
             }
             Err(e) => {
@@ -315,6 +325,7 @@ fn main() {
                     flush_timeout_ms, flush_max_buffer, partition_count,
                     signing_enabled, metadata_enabled, metadata_record_size,
                     checkpoint_prealloc_multiplier,
+                    rules_checksum, manifest,
                 );
             }
         }
@@ -330,6 +341,7 @@ fn main() {
                 backend, ls_directory, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 signing_enabled, metadata_enabled, metadata_record_size,
+                rules_checksum, manifest,
             );
         }
     }
@@ -377,6 +389,8 @@ fn spawn_ls_writer_thread<T, S, M>(
     flush_max_buffer_posting_records: usize,
     partition_count: u16,
     checkpoint_prealloc_multiplier: usize,
+    rules_checksum: u32,
+    manifest: Manifest,
 ) where
     T: FlushBackend + Send + 'static,
     S: SigningStrategy + Send + 'static,
@@ -403,6 +417,8 @@ fn spawn_ls_writer_thread<T, S, M>(
                     flush_max_buffer_posting_records,
                     partition_count,
                     checkpoint_prealloc_multiplier,
+                    rules_checksum,
+                    manifest,
                 );
                 writer.run();
             }
@@ -424,6 +440,8 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
     metadata_enabled: bool,
     metadata_record_size: usize,
     checkpoint_prealloc_multiplier: usize,
+    rules_checksum: u32,
+    manifest: Manifest,
 ) {
     if signing_enabled {
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
@@ -441,6 +459,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 ls_directory, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
+                rules_checksum, manifest,
             );
         } else {
             spawn_ls_writer_thread(
@@ -449,6 +468,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 ls_directory, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
+                rules_checksum, manifest,
             );
         }
     } else {
@@ -460,6 +480,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 ls_directory, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
+                rules_checksum, manifest,
             );
         } else {
             spawn_ls_writer_thread(
@@ -468,6 +489,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 ls_directory, max_ls_file_size,
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
+                rules_checksum, manifest,
             );
         }
     }

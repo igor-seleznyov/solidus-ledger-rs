@@ -90,4 +90,77 @@ impl ManifestEntry {
             )
         }
     }
+
+    pub unsafe fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self as *mut ManifestEntry as *mut u8,
+                Self::SIZE,
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_size() {
+        assert_eq!(ManifestEntry::SIZE, 128);
+        assert_eq!(std::mem::size_of::<ManifestEntry>(), 128);
+        assert_eq!(std::mem::align_of::<ManifestEntry>(), 64);
+    }
+
+    #[test]
+    fn layout_offsets() {
+        assert_eq!(std::mem::offset_of!(ManifestEntry, file_seq), 0);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, status), 8);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, signing_enabled), 9);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, metadata_enabled), 10);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, record_size), 12);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, rules_checksum), 16);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, gsn_min), 24);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, gsn_max), 32);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, timestamp_min_ns), 40);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, timestamp_max_ns), 48);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, checksum), 56);
+
+        assert_eq!(std::mem::offset_of!(ManifestEntry, filename), 64);
+    }
+
+    #[test]
+    fn filename_set_and_get() {
+        let mut entry = ManifestEntry::zeroed();
+        entry.set_filename("ls_20260403-120000-000-0-0.ls");
+        assert_eq!(entry.filename_str(), "ls_20260403-120000-000-0-0.ls");
+    }
+
+    #[test]
+    fn checksum_roundtrip() {
+        let mut entry = ManifestEntry::zeroed();
+        entry.file_seq = 5;
+        entry.set_filename("test.ls");
+        unsafe { entry.compute_checksum(); }
+
+        assert_ne!(entry.checksum, 0);
+        assert!(unsafe { entry.verify_checksum() });
+    }
+
+    #[test]
+    fn checksum_detects_corruption() {
+        let mut entry = ManifestEntry::zeroed();
+        entry.file_seq = 5;
+        unsafe { entry.compute_checksum(); }
+
+        entry.file_seq = 999;
+        assert!(!unsafe { entry.verify_checksum() });
+    }
+
+    #[test]
+    #[should_panic(expected = "Filename too long")]
+    fn filename_too_long() {
+        let mut entry = ManifestEntry::zeroed();
+        entry.set_filename(&"a".repeat(65));
+    }
 }

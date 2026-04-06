@@ -5,6 +5,7 @@ use pipeline::posting_record::PostingRecord;
 use pipeline::in_flight_min_heap::InFlightMinHeap;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
 use std::sync::Arc;
+use std::thread::current;
 use std::time::Instant;
 use crate::ls_writer_slot::*;
 use crate::flush_done_slot::FlushDoneSlot;
@@ -15,6 +16,9 @@ use crate::pending_flush::PendingFlush;
 use crate::signing_strategy::SigningStrategy;
 use crate::checkpoint_record::CheckpointRecord;
 use crate::checkpoint_file_header::CheckpointFileHeader;
+use crate::manifest::Manifest;
+use crate::manifest_entry::ManifestEntry;
+use common::make_test_dir::make_test_dir;
 
 const CLOCK_CHECK_REPEATS_COUNT_INTERVAL: u32 = 100_000;
 
@@ -73,6 +77,21 @@ pub struct LsWriter<T: FlushBackend, S: SigningStrategy, M: MetadataStrategy> {
     in_flushing_first_offset: u64,
     in_flushing_posting_count: u64,
     checkpoint_prealloc_size: usize,
+
+    manifest: Manifest,
+    rules_checksum: u32,
+
+    current_gsn_min: u64,
+    current_timestamp_min_ns: u64,
+
+    buffered_gsn_max: u64,
+    buffered_timestamp_max_ns: u64,
+
+    in_flushing_gsn_max: u64,
+    in_flushing_timestamp_max_ns: u64,
+
+    flushed_gsn_max: u64,
+    flushed_timestamp_max_ns: u64,
 }
 
 unsafe impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> Send for LsWriter<T, S, M> {}
@@ -96,6 +115,8 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         flush_max_buffer_posting_records: usize,
         partition_count: u16,
         checkpoint_prealloc_multiplier: usize,
+        rules_checksum: u32,
+        manifest: Manifest,
     ) -> Self {
         let flush_max_buffer_bytes = flush_max_buffer_posting_records * PostingRecord::SIZE;
         let buffer_capacity = (flush_max_buffer_bytes * 2 + 4095) & !4095;
@@ -170,11 +191,21 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
                 flush_max_buffer_posting_records,
                 checkpoint_prealloc_multiplier,
             ),
+            manifest,
+            rules_checksum,
+            current_gsn_min: 0,
+            current_timestamp_min_ns: 0,
+            buffered_gsn_max: 0,
+            buffered_timestamp_max_ns: 0,
+            in_flushing_gsn_max: 0,
+            in_flushing_timestamp_max_ns: 0,
+            flushed_gsn_max: 0,
+            flushed_timestamp_max_ns: 0,
         }
     }
 
     pub fn run(&mut self) {
-        self.initialize();
+        self.startup();
 
         println!("[ls-writer {}] started", self.id);
 
@@ -271,6 +302,9 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         self.in_flushing_first_offset = self.write_offset;
         self.in_flushing_posting_count = (self.flush_buffer_snapshot_len / PostingRecord::SIZE) as u64;
 
+        self.in_flushing_gsn_max = self.buffered_gsn_max;
+        self.in_flushing_timestamp_max_ns = self.buffered_timestamp_max_ns;
+
         std::mem::swap(&mut self.collecting_ptr, &mut self.in_flushing_ptr);
         std::mem::swap(&mut self.collecting_arena, &mut self.in_flushing_arena);
         self.in_flushing_len = self.collecting_len;
@@ -331,6 +365,9 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         }
         self.in_flushing_len = 0;
 
+        self.flushed_gsn_max = self.in_flushing_gsn_max;
+        self.flushed_timestamp_max_ns = self.in_flushing_timestamp_max_ns;
+
         self.maybe_advance_committed_gsn();
 
         self.flush_in_flight = false;
@@ -352,6 +389,19 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
                 self.maybe_advance_committed_gsn();
             }
             LS_MSG_POSTING => {
+                if self.current_gsn_min == 0 {
+                    self.current_gsn_min = slot.posting.gsn;
+                    self.current_timestamp_min_ns = slot.posting.timestamp_ns;
+                    self.manifest.update_entry_min_values(
+                        self.manifest.current_entry_index(),
+                        self.current_gsn_min,
+                        self.current_timestamp_min_ns,
+                    );
+                }
+
+                self.buffered_gsn_max = slot.posting.gsn;
+                self.buffered_timestamp_max_ns = slot.posting.timestamp_ns;
+
                 let posting_bytes = unsafe {
                     std::slice::from_raw_parts(
                         &slot.posting as *const PostingRecord as *const u8,
@@ -382,17 +432,205 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         }
     }
 
-    pub fn initialize(&mut self) {
-        self.open_files();
+    pub fn startup(&mut self) {
+        if self.manifest.entries_count() == 0 {
+            self.open_new_files();
+
+            let mut entry = self.make_manifest_entry();
+            self.manifest.append_current_entry(&mut entry);
+
+            println!(
+                "[ls-writer {}] first launch: file={}, signing={}, metadata={}",
+                self.id, self.current_ls_file_path,
+                self.signing_strategy.is_enabled(),
+                self.metadata_strategy.is_enabled(),
+            );
+        } else {
+            let current_entry = self.manifest.read_current_entry();
+
+            if self.config_matches(&current_entry) {
+                self.reopen_files(current_entry.filename_str());
+                self.file_seq = current_entry.file_seq;
+
+                println!(
+                    "[ls-writer {}] reopen: file={}, file_seq={}",
+                    self.id, self.current_ls_file_path, self.file_seq,
+                );
+            } else {
+                let current_index = self.manifest.current_entry_index();
+                self.manifest.finalize_entry(
+                    current_index,
+                    self.flushed_gsn_max,
+                    self.flushed_timestamp_max_ns,
+                );
+
+                self.file_seq = current_entry.file_seq + 1;
+
+                self.open_new_files();
+
+                let mut entry = self.make_manifest_entry();
+                self.manifest.append_current_entry(&mut entry);
+
+                println!(
+                    "[ls-writer {}] config changed, rotated to: file={}, file_seq={}",
+                    self.id, self.current_ls_file_path, self.file_seq,
+                );
+            }
+        }
 
         println!(
-            "[ls-writer {}] initialized: file={}, signing={}, metadata={}, data_offset={}, checkpoint_prealloc={}",
-            self.id, self.current_ls_file_path,
-            self.signing_strategy.is_enabled(),
-            self.metadata_strategy.is_enabled(),
-            self.write_offset,
-            self.checkpoint_prealloc_size,
+            "[ls-writer {}] startup complete: write_offset={}, checkpoint_prealloc={}",
+            self.id, self.write_offset, self.checkpoint_prealloc_size,
         );
+    }
+
+    fn open_new_files(&mut self) {
+        let filename = generate_ls_filename(self.id, self.file_seq);
+        self.current_ls_file_path = format!("{}/{}", self.ls_directory, filename);
+        self.ls_handle_index = self.backend.open_file(
+            &self.current_ls_file_path,
+            self.max_ls_file_size,
+        ).expect("Failed to open LS file");
+        self.open_strategy_files();
+        self.write_all_headers();
+    }
+
+    fn reopen_files(&mut self, filename: &str) {
+        self.current_ls_file_path = format!("{}/{}", self.ls_directory, filename);
+
+        self.ls_handle_index = self.backend.open_file(
+            &self.current_ls_file_path,
+            self.max_ls_file_size,
+        ).expect("FFailed to reopen LS file");
+
+        self.write_offset = LsFileHeader::DATA_OFFSET as u64;
+        self.checkpoint_write_offset = CheckpointFileHeader::DATA_OFFSET as u64;
+        self.batch_seq = 0;
+    }
+
+    fn open_strategy_files(&mut self) {
+        if let Some((sign_path, prealloc)) = self.signing_strategy.file_info(&self.current_ls_file_path) {
+            self.sign_handle_index = self.backend.open_file(&sign_path, prealloc)
+                .expect("Failed to open signature file");
+        }
+
+        if let Some((meta_path, prealloc)) = self.metadata_strategy.file_info(&self.current_ls_file_path) {
+            self.meta_handle_index = self.backend.open_file(&meta_path, prealloc)
+                .expect("Failed to open metadata file");
+        }
+
+        let checkpoint_path = format!("{}.checkpoint", self.current_ls_file_path);
+        self.checkpoint_handle_index = self.backend.open_file_buffered(
+            &checkpoint_path,
+            self.checkpoint_prealloc_size,
+        ).expect("Failed to open checkpoint file");
+    }
+
+    fn write_all_headers(&mut self) {
+        let signature_header = self.signing_strategy.prepare_header(self.file_seq);
+        let metadata_header = self.metadata_strategy.prepare_header(self.file_seq, self.max_ls_file_size as u64);
+
+        let mut sync_count = 0;
+
+        if let Some((data, len, offset)) = signature_header {
+            self.backend.submit_write(self.sign_handle_index, data, len, offset)
+                .expect("Failed to submit signature header write");
+            self.backend.submit_sync(self.sign_handle_index)
+                .expect("Failed to submit signature header sync");
+            sync_count += 1;
+        }
+
+        if let Some((data, len, offset)) = metadata_header {
+            self.backend.submit_write(self.meta_handle_index, data, len, offset)
+                .expect("Failed to submit posting metadata header write");
+            self.backend.submit_sync(self.meta_handle_index)
+                .expect("Failed to submit posting metadata header sync");
+            sync_count += 1;
+        }
+
+        if sync_count > 0 {
+            self.backend.flush_submissions()
+                .expect("Failed to flush header submissions");
+            self.backend.wait_completions(sync_count);
+
+            self.signing_strategy.on_header_written();
+            self.metadata_strategy.on_header_written();
+        }
+
+        let header = LsFileHeader::new(
+            self.signing_strategy.is_enabled(),
+            self.partition_count,
+            self.max_ls_file_size as u64,
+            self.file_seq,
+            self.signing_strategy.public_key_hash(),
+            self.metadata_strategy.is_enabled(),
+        );
+
+        let header_page = header.to_page();
+        self.backend.submit_write(
+            self.ls_handle_index,
+            header_page.as_ptr(),
+            header_page.len(),
+            0,
+        ).expect("Failed to submit ledger storage header write");
+
+        self.backend.submit_sync(self.ls_handle_index)
+            .expect("Failed to sync ledger storage header sync");
+        self.backend.flush_submissions()
+            .expect("Failed to flush ledger storage header");
+
+        self.backend.wait_completions(1);
+
+        self.write_offset = LsFileHeader::DATA_OFFSET as u64;
+
+        let checkpoint_header = CheckpointFileHeader::new(self.file_seq);
+        let checkpoint_header_bytes = unsafe { checkpoint_header.as_bytes() };
+
+        self.backend.submit_write(
+            self.checkpoint_handle_index,
+            checkpoint_header_bytes.as_ptr(),
+            CheckpointFileHeader::SIZE,
+            0,
+        ).expect("Failed to submit checkpoint header write");
+
+        self.backend.submit_sync(self.checkpoint_handle_index)
+            .expect("Failed to submit checkpoint header sync");
+        self.backend.flush_submissions()
+            .expect("Failed to flush checkpoint header");
+
+        self.checkpoint_write_offset = CheckpointFileHeader::DATA_OFFSET as u64;
+        self.batch_seq = 0;
+    }
+
+    fn config_matches(&self, entry: &ManifestEntry) -> bool {
+        let signing_matches = (entry.signing_enabled != 0) == self.signing_strategy.is_enabled();
+        let metadata_matches = (entry.metadata_enabled != 0) == self.metadata_strategy.is_enabled();
+        let rules_matches = entry.rules_checksum == self.rules_checksum;
+
+        signing_matches && metadata_matches && rules_matches
+    }
+
+    fn make_manifest_entry(&mut self) -> ManifestEntry {
+        let filename = self.current_ls_file_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.current_ls_file_path);
+
+        let mut entry = ManifestEntry::zeroed();
+        entry.file_seq = self.file_seq;
+        entry.signing_enabled = if self.signing_strategy.is_enabled() { 1 } else { 0 };
+        entry.metadata_enabled = if self.metadata_strategy.is_enabled() { 1 } else { 0 };
+        entry.record_size = if self.metadata_strategy.is_enabled() {
+            PostingRecord::SIZE as u32
+        } else { 0 };
+
+        entry.rules_checksum = self.rules_checksum;
+        entry.gsn_min = 0;
+        entry.gsn_max = 0;
+        entry.timestamp_min_ns = 0;
+        entry.timestamp_max_ns = 0;
+        entry.set_filename(filename);
+        entry
     }
 
     fn open_files(&mut self) {
@@ -513,6 +751,13 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
     pub fn rotate(&mut self) {
         let old_path = self.current_ls_file_path.clone();
 
+        let current_index = self.manifest.current_entry_index();
+        self.manifest.finalize_entry(
+            current_index,
+            self.flushed_gsn_max,
+            self.flushed_timestamp_max_ns,
+        );
+
         self.backend.close_file(self.checkpoint_handle_index);
 
         if self.metadata_strategy.is_enabled() {
@@ -535,7 +780,19 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         self.signing_strategy.on_rotation();
         self.metadata_strategy.on_rotation();
 
-        self.open_files();
+        self.current_gsn_min = 0;
+        self.current_timestamp_min_ns = 0;
+        self.buffered_gsn_max = 0;
+        self.buffered_timestamp_max_ns = 0;
+        self.in_flushing_gsn_max = 0;
+        self.in_flushing_timestamp_max_ns = 0;
+        self.flushed_gsn_max = 0;
+        self.flushed_timestamp_max_ns = 0;
+
+        self.open_new_files();
+
+        let mut entry = self.make_manifest_entry();
+        self.manifest.append_current_entry(&mut entry);
 
         println!(
             "[ls-writer {}] rotated: {} -> {}",
@@ -617,6 +874,7 @@ mod tests {
     use crate::signing_state::SigningState;
     use crate::checkpoint_record::CheckpointRecord;
     use crate::checkpoint_file_header::CheckpointFileHeader;
+    use crate::manifest_entry::MANIFEST_STATUS_ROTATED;
 
     const K0: u64 = 0x0123456789ABCDEF;
     const K1: u64 = 0xFEDCBA9876543210;
@@ -695,7 +953,23 @@ mod tests {
 
     static mut TEST_COMMITTED_GSN: u64 = 0;
 
+    fn make_temp_dir_for_writer(test_name: &str) -> String {
+        let dir = make_test_dir();
+        dir
+    }
+
+    fn cleanup_dir(dir: &str) {
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     fn make_writer() -> LsWriter<MockFlushBackend, NoSigningStrategy, NoMetadataStrategy> {
+        let dir = make_test_dir();
+
+        let manifest_path = format!("{}/0.manifest", dir);
+        std::fs::remove_file(&manifest_path).ok();
+
+        let manifest = Manifest::create(&dir, 0);
+
         let ls_writer_rb = Arc::new(
             MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
         );
@@ -714,7 +988,7 @@ mod tests {
             MockFlushBackend::new(),
             NoSigningStrategy,
             NoMetadataStrategy,
-            "/tmp/solidus-test".to_string(),
+            dir.to_string(),
             0,
             64,
             K0,
@@ -724,12 +998,21 @@ mod tests {
             512,
             16,
             4,
+            0,
+            manifest,
         );
-        writer.initialize();
+        writer.startup();
         writer
     }
 
     fn make_writer_with_metadata(record_size: usize) -> LsWriter<MockFlushBackend, NoSigningStrategy, PostingMetadataStrategy> {
+        let dir = make_test_dir();
+
+        let manifest_path = format!("{}/0.manifest", dir);
+        std::fs::remove_file(&manifest_path).ok();
+
+        let manifest = Manifest::create(&dir, 0);
+
         let ls_writer_rb = Arc::new(
             MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
         );
@@ -756,8 +1039,10 @@ mod tests {
             64, 2, 512,
             16,
             4,
+            0,
+            manifest
         );
-        writer.initialize();
+        writer.startup();
         writer
     }
 
@@ -765,6 +1050,13 @@ mod tests {
         LsWriter<MockFlushBackend, NoSigningStrategy, NoMetadataStrategy>,
         Arc<MpscRingBuffer<FlushDoneSlot>>,
     ) {
+        let dir = make_test_dir();
+
+        let manifest_path = format!("{}/0.manifest", dir);
+        std::fs::remove_file(&manifest_path).ok();
+
+        let manifest = Manifest::create(&dir, 0);
+
         let ls_writer_rb = Arc::new(
             MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
         );
@@ -792,8 +1084,10 @@ mod tests {
             64, 2, 512,
             16,
             4,
+            0,
+            manifest
         );
-        writer.initialize();
+        writer.startup();
 
         (writer, flush_done_rb_clone)
     }
@@ -836,6 +1130,13 @@ mod tests {
     }
 
     fn make_writer_with_signing() -> LsWriter<MockFlushBackend, Ed25519SigningStrategy, NoMetadataStrategy> {
+        let dir = make_test_dir();
+
+        let manifest_path = format!("{}/0.manifest", dir);
+        std::fs::remove_file(&manifest_path).ok();
+
+        let manifest = Manifest::create(&dir, 0);
+
         let ls_writer_rb = Arc::new(
             MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
         );
@@ -865,12 +1166,21 @@ mod tests {
             64, 2, 512,
             16,
             4,
+            0,
+            manifest
         );
-        writer.initialize();
+        writer.startup();
         writer
     }
 
     fn make_writer_with_max_size(max_size: usize) -> LsWriter<MockFlushBackend, NoSigningStrategy, NoMetadataStrategy> {
+        let dir = make_test_dir();
+
+        let manifest_path = format!("{}/0.manifest", dir);
+        std::fs::remove_file(&manifest_path).ok();
+
+        let manifest = Manifest::create(&dir, 0);
+
         let ls_writer_rb = Arc::new(
             MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
         );
@@ -899,8 +1209,10 @@ mod tests {
             512,
             16,
             4,
+            0,
+            manifest
         );
-        writer.initialize();
+        writer.startup();
         writer
     }
 
@@ -1694,5 +2006,124 @@ mod tests {
         let mut entry = ManifestEntry::zeroed();
         let long_name = "a".repeat(65);
         entry.set_filename(&long_name);
+    }
+
+    #[test]
+    fn startup_first_launch_creates_manifest_entry() {
+        let dir = make_temp_dir_for_writer("startup-first");
+        let manifest_path = format!("{}/0.manifest", dir);
+        std::fs::remove_file(&manifest_path).ok();
+
+        let manifest = Manifest::create(&dir, 0);
+
+        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
+        let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+
+        unsafe { TEST_COMMITTED_GSN = 0; }
+        let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
+
+        let mut writer = LsWriter::new(
+            0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
+            MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
+            dir.to_string(), 0, 64, K0, K1, 64, 2, 512, 16, 4,
+            0, manifest,
+        );
+        writer.startup();
+
+        assert_eq!(writer.manifest.entries_count(), 1);
+        assert_eq!(writer.manifest.current_entry_index(), 0);
+
+        let entry = writer.manifest.read_current_entry();
+        assert_eq!(entry.file_seq, 0);
+        assert_eq!(entry.signing_enabled, 0);
+        assert_eq!(entry.metadata_enabled, 0);
+        assert_eq!(entry.rules_checksum, 0);
+
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn first_posting_updates_manifest_gsn_min() {
+        let dir = make_temp_dir_for_writer("posting-gsn-min");
+        let manifest_path = format!("{}/0.manifest", dir);
+        std::fs::remove_file(&manifest_path).ok();
+
+        let manifest = Manifest::create(&dir, 0);
+
+        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
+        let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+
+        unsafe { TEST_COMMITTED_GSN = 0; }
+        let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
+
+        let mut writer = LsWriter::new(
+            0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
+            MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
+            dir.to_string(), 0, 64, K0, K1, 64, 2, 512, 16, 4,
+            0, manifest,
+        );
+        writer.startup();
+
+        let mut slot = make_posting_slot(42, 500);
+        slot.posting.timestamp_ns = 1700000000_000_000_000;
+        writer.process_message(&slot);
+
+        assert_eq!(writer.current_gsn_min, 42);
+        assert_eq!(writer.current_timestamp_min_ns, 1700000000_000_000_000);
+
+        let entry = writer.manifest.read_current_entry();
+        assert_eq!(entry.gsn_min, 42);
+        assert_eq!(entry.timestamp_min_ns, 1700000000_000_000_000);
+
+        let mut slot2 = make_posting_slot(100, 300);
+        slot2.posting.timestamp_ns = 1700000100_000_000_000;
+        writer.process_message(&slot2);
+
+        assert_eq!(writer.current_gsn_min, 42);
+
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn config_mismatch_triggers_rotation_at_startup() {
+        let dir = make_temp_dir_for_writer("config-mismatch");
+        let manifest_path = format!("{}/0.manifest", dir);
+        std::fs::remove_file(&manifest_path).ok();
+
+        let mut manifest = Manifest::create(&dir, 0);
+        let mut entry = ManifestEntry::zeroed();
+        entry.file_seq = 0;
+        entry.signing_enabled = 1;
+        entry.metadata_enabled = 0;
+        entry.rules_checksum = 0;
+        entry.set_filename("ls_old-0-0.ls");
+        manifest.append_current_entry(&mut entry);
+
+        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
+        let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+
+        unsafe { TEST_COMMITTED_GSN = 0; }
+        let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
+
+        let mut writer = LsWriter::new(
+            0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
+            MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
+            dir.to_string(), 0, 64, K0, K1, 64, 2, 512, 16, 4,
+            0, manifest,
+        );
+        writer.startup();
+
+        assert_eq!(writer.manifest.entries_count(), 2);
+        assert_eq!(writer.manifest.current_entry_index(), 1);
+        assert_eq!(writer.file_seq, 1);
+
+        let old_entry = writer.manifest.read_entry(0);
+        assert_eq!(old_entry.status, MANIFEST_STATUS_ROTATED);
+
+        let new_entry = writer.manifest.read_current_entry();
+        assert_eq!(new_entry.signing_enabled, 0);
+        assert_eq!(new_entry.file_seq, 1);
+
+        cleanup_dir(&dir);
     }
 }

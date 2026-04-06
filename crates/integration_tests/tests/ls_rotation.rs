@@ -1,5 +1,7 @@
+use std::fmt::format;
 use std::sync::Arc;
 use ed25519_dalek::SigningKey;
+use common::make_test_dir::make_test_dir;
 use pipeline::posting_record::PostingRecord;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
 use storage::ls_writer::LsWriter;
@@ -15,6 +17,7 @@ use storage::ls_file_header::LsFileHeader;
 use storage::ls_sign_file_header::LsSignFileHeader;
 use storage::ls_meta_file_header::LsMetaFileHeader;
 use storage::checkpoint_file_header::CheckpointFileHeader;
+use storage::manifest::Manifest;
 
 const K0: u64 = 0x0123456789ABCDEF;
 const K1: u64 = 0xFEDCBA9876543210;
@@ -23,12 +26,7 @@ static mut TEST_COMMITTED_GSN: u64 = 0;
 
 
 fn make_temp_dir(test_name: &str) -> String {
-    let dir = format!(
-        "/tmp/solidus-it-rotation-{}-{}",
-        test_name,
-        std::process::id()
-    );
-    std::fs::create_dir_all(&dir).expect("Failed to create temp dir");
+    let dir = make_test_dir();
     dir
 }
 
@@ -49,6 +47,10 @@ fn make_writer(
 
     unsafe { TEST_COMMITTED_GSN = 0; }
     let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
+    
+    let manifest_path = format!("{}/0.manifest", dir);
+    std::fs::remove_file(&manifest_path).ok();
+    let manifest = Manifest::create(dir, 0);
 
     let mut writer = LsWriter::new(
         0,
@@ -64,8 +66,10 @@ fn make_writer(
         64, 2, 512,
         16,
         4,
+        0,
+        manifest,
     );
-    writer.initialize();
+    writer.startup();
     writer
 }
 
@@ -88,6 +92,10 @@ fn make_writer_with_signing(
     let signing_state = SigningState::new(key, genesis);
     let signing = Ed25519SigningStrategy::new(signing_state, 512);
 
+    let manifest_path = format!("{}/0.manifest", dir);
+    std::fs::remove_file(&manifest_path).ok();
+    let manifest = Manifest::create(dir, 0);
+
     let mut writer = LsWriter::new(
         0,
         ls_writer_rb,
@@ -102,8 +110,10 @@ fn make_writer_with_signing(
         64, 2, 512,
         16,
         4,
+        0,
+        manifest,
     );
-    writer.initialize();
+    writer.startup();
     writer
 }
 
@@ -124,6 +134,10 @@ fn make_writer_with_metadata(
 
     let metadata = PostingMetadataStrategy::new(record_size, 512);
 
+    let manifest_path = format!("{}/0.manifest", dir);
+    std::fs::remove_file(&manifest_path).ok();
+    let manifest = Manifest::create(dir, 0);
+
     let mut writer = LsWriter::new(
         0,
         ls_writer_rb,
@@ -138,8 +152,10 @@ fn make_writer_with_metadata(
         64, 2, 512,
         16,
         4,
+        0,
+        manifest,
     );
-    writer.initialize();
+    writer.startup();
     writer
 }
 
