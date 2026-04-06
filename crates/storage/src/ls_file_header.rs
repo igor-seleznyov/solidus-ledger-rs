@@ -50,7 +50,6 @@ impl LsFileHeader {
         header.file_type = LS_FILE_TYPE_LS;
         header.signing_enabled = if signing_enabled { 1 } else { 0 };
         header.partition_count = partition_count;
-        header.metadata_enabled = 0;
         header.created_at_ns = Self::now_nanos();
         header.record_size = pipeline::posting_record::PostingRecord::SIZE as u32;
         header.data_offset = Self::DATA_OFFSET;
