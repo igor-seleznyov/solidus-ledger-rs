@@ -97,7 +97,7 @@ Framing, handshake, batch validation, codec.
   - 8-9-5: Manifest file + startup logic + recovery
     - 8-9-5a: ManifestHeader (64 bytes) + Manifest read/write (create, open, append entry, finalize entry, update_entry_min_values, fsync) ✅
     - 8-9-5b: Startup logic in LsWriter — read manifest → first launch / reopen existing file / rotate on config mismatch (rules_checksum, record_size, metadata_enabled). GSN/timestamp tracking: min at first posting (persisted to manifest), max at rotation. Manifest integration in rotate(). open_new_files/reopen_files/open_strategy_files/write_all_headers decomposition ✅
-    - 8-9-5c: Recovery write_offset — scan checkpoint file for checkpoint_write_offset/batch_seq + scan LS from DATA_OFFSET by PostingRecord magic+CRC32C for write_offset/gsn/timestamp recovery ← current
+    - 8-9-5c: Recovery write_offset — scan checkpoint file for checkpoint_write_offset/batch_seq + scan LS from DATA_OFFSET by PostingRecord magic+CRC32C for write_offset/gsn/timestamp recovery. Separate recovery.rs module ✅
 - 8-10: LS Index Builder — *.idx + *.index (sorted arrays by account_id, async at rotation)
 - 8-11: LS Sign Index — *.ls_sign_idx (sorted array by transfer_id, if signing enabled)
 - 8-t: Integration tests (DM → LS Writer → fdatasync → Flush Done → DM → THT cleanup)
