@@ -82,15 +82,16 @@ Framing, handshake, batch validation, codec.
 - 8-9-5: Manifest (ManifestHeader + ManifestEntry + read/write/finalize/update_entry_min_values), Startup logic (first launch / reopen / config mismatch rotation), GSN/timestamp tracking, Recovery write_offset (checkpoint scan + LS scan by PostingRecord magic+CRC32C) ✅
 - 8-10-1: Index Builder thread infrastructure — mpsc channel, IndexBuilderTask, LS Writer sends task at rotation ✅
 - 8-10-2: LS scan refactoring (PostingScanVisitor trait, scan_ls_postings), two-pass Index Builder (CountingVisitor + PlacingVisitor + compute_offsets), durable structures (AccountIndexRecord 40B, OrdinalIndexEntry 16B, TimestampIndexEntry 16B, IndexFileHeader 64B) ✅
+- 8-10-3: Index file writing — index_writer.rs, per-account sort + batch write .posting-accounts / .ordinal / .timestamp, IndexFileHeader with three magics (LDSTIDXA/LDSTIDXO/LDSTIDXT) ✅
 
 ## In Progress
 
 ### Step 8: LS Writer + Persistence (continued) ← current
-- 8-10-3: Index file writing — per-account sort + write .idx / .ordinal / .timestamp
 - 8-10-4: Page-aligned binary search lookup + range queries
 - 8-10-5: Integration tests (rotation → index build → lookup)
 - 8-10-6: Signature verification during scan
 - 8-11: LS Sign Index — *.ls_sign_idx (sorted array by transfer_id, if signing enabled)
+- 8-14: Metadata Index Builder — metadata schema parsing from config, `.meta_idx_{name}` per field, binary search by byte ranges. User-defined schema (field name, type, offset in metadata block)
 - 8-t: Integration tests (DM → LS Writer → fdatasync → Flush Done → DM → THT cleanup)
 - 8-13: Snapshots + Recovery
   - 8-13-1: SLS file format — SnapshotRecord (per account: balance, ordinal, ls_offset)

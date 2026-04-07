@@ -62,7 +62,7 @@ impl IndexBuilder {
         idx_header_size: u64,
         ordinal_header_size: u64,
         timestamp_header_size: u64,
-    ) -> (Vec<AccountIndexRecord>, HashMap<(u64, u64), AccountMeta>) {
+    ) -> (Vec<AccountIndexRecord>, Vec<(u64, u64)>, HashMap<(u64, u64), AccountMeta>) {
         let mut sorted_keys: Vec<(u64, u64)> = counts.keys().copied().collect();
         sorted_keys.sort_unstable();
 
@@ -101,7 +101,7 @@ impl IndexBuilder {
             timestamp_file_offset += count as u64 * TimestampIndexEntry::SIZE as u64;
         }
 
-        (idx_records, accounts)
+        (idx_records, sorted_keys, accounts)
     }
 
     fn build_indices(&self, task: &IndexBuilderTask) {
@@ -127,7 +127,7 @@ impl IndexBuilder {
             return;
         }
 
-        let (_idx_records, mut accounts) = Self::compute_offsets(
+        let (_idx_records, sorted_keys, mut accounts) = Self::compute_offsets(
             counting.accounts,
             IndexFileHeader::SIZE as u64,
             IndexFileHeader::SIZE as u64,
@@ -144,14 +144,29 @@ impl IndexBuilder {
             }
         );
 
-        let mut placing = PlacingVisitor::new(&mut buffer, &mut accounts);
-        crate::posting_scan_visitor::scan_ls_postings(&task.ls_path, &mut placing);
+        {
+            let mut placing = PlacingVisitor::new(&mut buffer, &mut accounts);
+            crate::posting_scan_visitor::scan_ls_postings(&task.ls_path, &mut placing);
+        }
 
         println!(
             "[index-builder {}] scanned {} postings, {} accounts for {} (file_seq={})",
             self.id, total_count, accounts_count, task.ls_path, task.file_seq,
         );
 
+        println!(
+            "[index-builder {}] scanned {} postings, {} accounts for {} (file_seq={})",
+            self.id, total_count, accounts_count, task.ls_path, task.file_seq,
+        );
+
+        crate::index_writer::write_index_files(
+            &task.ls_path,
+            task.file_seq,
+            &_idx_records,
+            &sorted_keys,
+            &mut buffer,
+            &accounts,
+        );
 
         println!(
             "[index-builder {}] indices built for {} (file_seq={})",
@@ -199,11 +214,12 @@ mod tests {
         counts.insert((1, 1), 5);
 
         let header_size = 64u64;
-        let (idx_records, accounts) = IndexBuilder::compute_offsets(
+        let (idx_records, sorted_keys, accounts) = IndexBuilder::compute_offsets(
             counts, header_size, header_size, header_size,
         );
 
         assert_eq!(idx_records.len(), 3);
+        assert_eq!(sorted_keys, vec![(0, 1), (0, 2), (1, 1)]);
         assert_eq!(idx_records[0].account_id_hi, 0);
         assert_eq!(idx_records[0].account_id_lo, 1);
         assert_eq!(idx_records[0].records_count, 3);
@@ -231,7 +247,9 @@ mod tests {
         counts.insert((0u64, 1u64), 2u32);
         counts.insert((0, 2), 1);
 
-        let (_idx_records, mut accounts) = IndexBuilder::compute_offsets(counts, 64, 64, 64);
+        let (_idx_records, _sorted_keys, mut accounts) = IndexBuilder::compute_offsets(counts, 64, 64, 64);
+
+
 
         let total = 3;
         let mut buffer: Vec<IndexBufferEntry> = Vec::with_capacity(total);
@@ -274,8 +292,9 @@ mod tests {
     #[test]
     fn compute_offsets_empty() {
         let counts = HashMap::new();
-        let (idx_records, accounts) = IndexBuilder::compute_offsets(counts, 64, 64, 64);
+        let (idx_records, sorted_keys, accounts) = IndexBuilder::compute_offsets(counts, 64, 64, 64);
         assert!(idx_records.is_empty());
+        assert!(sorted_keys.is_empty());
         assert!(accounts.is_empty());
     }
 
@@ -285,7 +304,7 @@ mod tests {
         counts.insert((0u64, 1u64), 2u32);
         counts.insert((0, 2), 3);
 
-        let (_idx_records, mut accounts) = IndexBuilder::compute_offsets(counts, 64, 64, 64);
+        let (_idx_records, _sorted_keys, mut accounts) = IndexBuilder::compute_offsets(counts, 64, 64, 64);
 
         let total = 5;
         let mut buffer: Vec<IndexBufferEntry> = Vec::with_capacity(total);
