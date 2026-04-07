@@ -5,6 +5,8 @@ use crate::checkpoint_file_header::{CheckpointFileHeader, CHECKPOINT_FILE_MAGIC}
 use crate::ls_file_header::LsFileHeader;
 use pipeline::posting_record::{PostingRecord, POSTING_RECORD_MAGIC};
 use crate::consts::LS_FILE_PAGE_SIZE;
+use crate::posting_scan_visitor::scan_ls_postings;
+use crate::recovery_visitor::RecoveryVisitor;
 
 pub struct RecoveredLsState {
     pub write_offset: u64,
@@ -75,102 +77,15 @@ pub fn recover_checkpoint_state(checkpoint_path: &str) -> (u64, u32) {
 }
 
 pub fn recover_ls_state(ls_path: &str) -> RecoveredLsState {
-    let mut file = match File::open(ls_path) {
-        Ok(file) => file,
-        Err(_) => {
-            return RecoveredLsState {
-                write_offset: LsFileHeader::DATA_OFFSET as u64,
-                gsn_min: 0,
-                gsn_max: 0,
-                timestamp_min_ns: 0,
-                timestamp_max_ns: 0,
-                postings_count: 0,
-            };
-        }
-    };
-
-    let page_size: usize = LS_FILE_PAGE_SIZE;
-    let mut page_buf = [0u8; LS_FILE_PAGE_SIZE];
-    let mut offset = LsFileHeader::DATA_OFFSET as u64;
-    let mut write_offset = offset;
-
-    let mut gsn_min: u64 = 0;
-    let mut gsn_max: u64 = 0;
-    let mut timestamp_min_ns: u64 = 0;
-    let mut timestamp_max_ns: u64 = 0;
-    let mut postings_count: u64 = 0;
-
-    loop {
-        if file.seek(SeekFrom::Start(offset)).is_err() {
-            break;
-        }
-
-        let bytes_read = match file.read(&mut page_buf) {
-            Ok(read_size) => read_size,
-            Err(_) => break
-        };
-
-        if bytes_read < PostingRecord::SIZE {
-            break;
-        }
-
-        let mut valid_in_page = 0u64;
-
-        let max_record = bytes_read / PostingRecord::SIZE;
-        for i in 0..max_record {
-            let record_start = i * PostingRecord::SIZE;
-            let record_end = record_start + PostingRecord::SIZE;
-            if record_end > bytes_read {
-                break;
-            }
-
-            let magic = u64::from_le_bytes(
-                page_buf[record_start..record_start + 8]
-                    .try_into()
-                    .unwrap()
-            );
-            if magic != pipeline::posting_record::POSTING_RECORD_MAGIC {
-                break;
-            }
-
-            let mut record = PostingRecord::zeroed();
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    page_buf[record_start..].as_ptr(),
-                    &mut record as *mut PostingRecord as *mut u8,
-                    PostingRecord::SIZE,
-                );
-            }
-
-            if !unsafe { record.verify_checksum() } {
-                break;
-            }
-
-            if gsn_min == 0 {
-                gsn_min = record.gsn;
-                timestamp_min_ns = record.timestamp_ns;
-            }
-            gsn_max = record.gsn;
-            timestamp_max_ns = record.timestamp_ns;
-            valid_in_page += 1;
-            postings_count += 1;
-        }
-
-        if valid_in_page == 0 {
-            break;
-        }
-
-        let data_end = offset + valid_in_page * PostingRecord::SIZE as u64;
-        write_offset = (data_end + page_size as u64 - 1) & !(page_size as u64 - 1);
-        offset = write_offset;
-    }
-
+    let mut visitor = RecoveryVisitor::new();
+    let write_offset = scan_ls_postings(ls_path, &mut visitor);
+    
     RecoveredLsState {
         write_offset,
-        gsn_min,
-        gsn_max,
-        timestamp_min_ns,
-        timestamp_max_ns,
-        postings_count,
+        gsn_min: visitor.gsn_min,
+        gsn_max: visitor.gsn_max,
+        timestamp_min_ns: visitor.timestamp_min_ns,
+        timestamp_max_ns: visitor.timestamp_max_ns,
+        postings_count: visitor.postings_count,
     }
 }

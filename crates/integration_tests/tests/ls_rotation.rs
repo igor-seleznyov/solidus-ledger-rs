@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use ed25519_dalek::SigningKey;
 use common::make_test_dir::make_test_dir;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
@@ -50,6 +50,8 @@ fn make_writer(
     std::fs::remove_file(&manifest_path).ok();
     let manifest = Manifest::create(dir, 0);
 
+    let (index_tx, _) = mpsc::channel();
+
     let mut writer = LsWriter::new(
         0,
         ls_writer_rb,
@@ -66,6 +68,7 @@ fn make_writer(
         4,
         0,
         manifest,
+        index_tx,
     );
     writer.startup();
     writer
@@ -94,6 +97,8 @@ fn make_writer_with_signing(
     std::fs::remove_file(&manifest_path).ok();
     let manifest = Manifest::create(dir, 0);
 
+    let (index_tx, _) = mpsc::channel();
+
     let mut writer = LsWriter::new(
         0,
         ls_writer_rb,
@@ -110,6 +115,7 @@ fn make_writer_with_signing(
         4,
         0,
         manifest,
+        index_tx,
     );
     writer.startup();
     writer
@@ -136,6 +142,8 @@ fn make_writer_with_metadata(
     std::fs::remove_file(&manifest_path).ok();
     let manifest = Manifest::create(dir, 0);
 
+    let (index_tx, _) = mpsc::channel();
+
     let mut writer = LsWriter::new(
         0,
         ls_writer_rb,
@@ -152,6 +160,7 @@ fn make_writer_with_metadata(
         4,
         0,
         manifest,
+        index_tx,
     );
     writer.startup();
     writer

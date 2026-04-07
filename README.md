@@ -132,6 +132,30 @@ Solidus Ledger uses explicit threads pinned to CPU cores. No async/await, no thr
 
 Threads communicate exclusively through lock-free ring buffers. No shared mutable state, no mutexes on the hot path. Synchronization uses memory barriers on sequence fields.
 
+### Memory Management
+
+All operations are split into **hot path** (transaction processing) and **cold path** (maintenance). Each uses a different memory strategy.
+
+**Hot path** — Pipeline, Partition Actors, Decision Maker, LS Writer flush:
+- **Arena (mmap + mlock):** all memory pre-allocated at startup, zero allocations at runtime
+- `mlock` pins pages in RAM — no page faults, predictable latency
+- All structures `repr(C, align(64))` — stable layout, cache line alignment
+- Ring buffers, hash tables (PAHT, THT, PVT), write buffers — all in Arena
+- No Mutex/RwLock — synchronization via memory barriers on sequence fields
+
+**Cold path** — Index Builder, Recovery, Manifest, startup/shutdown:
+- **Vec / standard library:** heap allocations acceptable (operations every few seconds, not microseconds)
+- `Vec::with_capacity()` — single allocation for intermediate data (sorting, grouping)
+- `std::sync::mpsc::channel` — task passing between threads (Index Builder)
+- `std::fs::File` — standard file I/O for reading/writing indexes and manifests
+
+**On-disk structures** — indexes, headers, manifests:
+- `repr(C)` guarantees field order — structs can be written to disk via pointer cast
+- Batch writes: entire Vec written in a single `write_all` syscall
+- Examples: `AccountIndexRecord` (40 bytes), `OrdinalIndexEntry` (16 bytes), `PostingRecord` (128 bytes)
+
+**Selection criteria:** components processing >100K messages/sec — Arena, zero-alloc. Components with <1K operations/sec — Vec/std, simplicity over performance.
+
 ### Account Partitioning
 
 Each account belongs to exactly one partition. Routing uses a hash function on the account identifier. Hot accounts can be pinned to specific partitions via a configuration file (override).
@@ -191,11 +215,14 @@ Actively developed. See [Implementation Steps](STEPS.md) for the full plan.
 - Startup logic: manifest-based first launch / reopen / config mismatch rotation
 - GSN/timestamp tracking: min at first posting (persisted to manifest), max at rotation
 - Recovery write_offset: checkpoint scan + LS scan by PostingRecord magic+CRC32C
+- Index Builder thread (mpsc channel, async index build at rotation)
+- Two-pass index building: CountingVisitor + PlacingVisitor, durable structures (AccountIndexRecord, OrdinalIndexEntry, TimestampIndexEntry, IndexFileHeader)
 - Miri testing: all hash tables (PAHT, PVT, THT) and ring buffers (SPSC, MPSC) verified for unsafe correctness
 - Loom testing: happens-before correctness verified in C11 abstract memory model with exhaustive interleaving exploration — three-thread transitive chains (Pipeline→Actor→DM, LS Writer→DM→IO), release/acquire barriers, MPSC fetch_add atomicity
 
 **In progress (Step 8, continued):**
-- LS Index Builder, LS Sign Index
+- Index file writing (.idx / .ordinal / .timestamp), page-aligned binary search lookup
+- LS Sign Index, signature verification during scan
 - Snapshots and crash recovery
 
 **Planned:**
