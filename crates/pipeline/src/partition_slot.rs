@@ -50,6 +50,7 @@ impl PartitionSlot {
 }
 
 #[cfg(test)]
+#[cfg(not(miri))]
 mod tests {
     use super::*;
 

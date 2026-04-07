@@ -52,6 +52,7 @@ impl CoordinatorSlot {
 }
 
 #[cfg(test)]
+#[cfg(not(miri))]
 mod tests {
     use super::*;
 

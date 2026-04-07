@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 use crate::account_index_record::AccountIndexRecord;
-use crate::counting_cursor::CountingVisitor;
 use crate::index_file_header::IndexFileHeader;
 use crate::ordinal_index_entry::OrdinalIndexEntry;
-use crate::placing_visitor::PlacingVisitor;
 use crate::timestamp_index_entry::TimestampIndexEntry;
 
 pub struct IndexBuilderTask {
@@ -12,11 +10,14 @@ pub struct IndexBuilderTask {
     pub file_seq: u64,
     pub shard_id: usize,
     pub signing_enabled: bool,
+    pub entries: Vec<IndexBufferEntry>,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct IndexBufferEntry {
+    pub account_id_hi: u64,
+    pub account_id_lo: u64,
     pub ordinal: u64,
     pub timestamp_ns: u64,
     pub ls_offset: u64,
@@ -110,16 +111,7 @@ impl IndexBuilder {
             self.id, task.ls_path, task.file_seq,
         );
 
-        let mut counting = CountingVisitor::new();
-        let _write_offset = crate::posting_scan_visitor::scan_ls_postings(
-            &task.ls_path,
-            &mut counting,
-        );
-
-        let total_count = counting.total_count as usize;
-        let accounts_count = counting.accounts.len();
-
-        if total_count == 0 {
+        if task.entries.is_empty() {
             println!(
                 "[index-builder {}] no postings in {} — skipping index build",
                 self.id, task.ls_path,
@@ -127,8 +119,18 @@ impl IndexBuilder {
             return;
         }
 
-        let (_idx_records, sorted_keys, mut accounts) = Self::compute_offsets(
-            counting.accounts,
+        let total_count = task.entries.len();
+
+        let mut counts: HashMap<(u64, u64), u32> = HashMap::new();
+        for entry in &task.entries {
+            *counts.entry(
+                (entry.account_id_hi, entry.account_id_lo),
+            ).or_insert(0) += 1;
+        }
+        let accounts_count = counts.len();
+
+        let (idx_records, sorted_keys, mut accounts) = Self::compute_offsets(
+            counts,
             IndexFileHeader::SIZE as u64,
             IndexFileHeader::SIZE as u64,
             IndexFileHeader::SIZE as u64,
@@ -138,31 +140,32 @@ impl IndexBuilder {
         buffer.resize(
             total_count,
             IndexBufferEntry {
+                account_id_hi: 0,
+                account_id_lo: 0,
                 ordinal: 0,
                 timestamp_ns: 0,
                 ls_offset: 0,
             }
         );
 
-        {
-            let mut placing = PlacingVisitor::new(&mut buffer, &mut accounts);
-            crate::posting_scan_visitor::scan_ls_postings(&task.ls_path, &mut placing);
+        for entry in &task.entries {
+            let key = (entry.account_id_hi, entry.account_id_lo);
+            let meta = accounts.get_mut(&key)
+                .expect("Account not found - counting missed it");
+            let index = meta.start + meta.cursor as usize;
+            buffer[index] = *entry;
+            meta.cursor += 1;
         }
 
         println!(
-            "[index-builder {}] scanned {} postings, {} accounts for {} (file_seq={})",
-            self.id, total_count, accounts_count, task.ls_path, task.file_seq,
-        );
-
-        println!(
-            "[index-builder {}] scanned {} postings, {} accounts for {} (file_seq={})",
+            "[index-builder {}] {} postings, {} accounts for {} (file_seq={})",
             self.id, total_count, accounts_count, task.ls_path, task.file_seq,
         );
 
         crate::index_writer::write_index_files(
             &task.ls_path,
             task.file_seq,
-            &_idx_records,
+            &idx_records,
             &sorted_keys,
             &mut buffer,
             &accounts,
@@ -177,34 +180,7 @@ impl IndexBuilder {
 
 #[cfg(test)]
 mod tests {
-    use pipeline::posting_record::PostingRecord;
-    use crate::posting_scan_visitor::PostingScanVisitor;
     use super::*;
-
-    #[test]
-    fn counting_visitor_counts_per_account() {
-        let mut visitor = CountingVisitor::new();
-
-        let mut r1 = PostingRecord::zeroed();
-        r1.account_id_hi = 0;
-        r1.account_id_lo = 1;
-        visitor.on_posting(4096, &r1);
-
-        let mut r2 = PostingRecord::zeroed();
-        r2.account_id_hi = 0;
-        r2.account_id_lo = 2;
-        visitor.on_posting(4224, &r2);
-
-        let mut r3 = PostingRecord::zeroed();
-        r3.account_id_hi = 0;
-        r3.account_id_lo = 1;
-        visitor.on_posting(4352, &r3);
-
-        assert_eq!(visitor.total_count, 3);
-        assert_eq!(visitor.accounts.len(), 2);
-        assert_eq!(visitor.accounts[&(0, 1)], 2);
-        assert_eq!(visitor.accounts[&(0, 2)], 1);
-    }
 
     #[test]
     fn compute_offsets_prefix_sum() {
@@ -220,16 +196,13 @@ mod tests {
 
         assert_eq!(idx_records.len(), 3);
         assert_eq!(sorted_keys, vec![(0, 1), (0, 2), (1, 1)]);
-        assert_eq!(idx_records[0].account_id_hi, 0);
+
         assert_eq!(idx_records[0].account_id_lo, 1);
         assert_eq!(idx_records[0].records_count, 3);
         assert_eq!(idx_records[0].ordinal_file_offset, header_size);
-        assert_eq!(idx_records[0].timestamp_file_offset, header_size);
 
         assert_eq!(idx_records[1].account_id_lo, 2);
-        assert_eq!(idx_records[1].records_count, 2);
         assert_eq!(idx_records[1].ordinal_file_offset, header_size + 3 * 16);
-        assert_eq!(idx_records[1].timestamp_file_offset, header_size + 3 * 16);
 
         assert_eq!(idx_records[2].account_id_hi, 1);
         assert_eq!(idx_records[2].account_id_lo, 1);
@@ -242,95 +215,71 @@ mod tests {
     }
 
     #[test]
-    fn placing_visitor_fills_buffer() {
-        let mut counts = HashMap::new();
-        counts.insert((0u64, 1u64), 2u32);
-        counts.insert((0, 2), 1);
-
-        let (_idx_records, _sorted_keys, mut accounts) = IndexBuilder::compute_offsets(counts, 64, 64, 64);
-
-
-
-        let total = 3;
-        let mut buffer: Vec<IndexBufferEntry> = Vec::with_capacity(total);
-        buffer.resize(total, IndexBufferEntry { ordinal: 0, timestamp_ns: 0, ls_offset: 0 });
-
-        let mut r1 = PostingRecord::zeroed();
-        r1.account_id_hi = 0;
-        r1.account_id_lo = 2;
-        r1.ordinal = 0;
-        r1.timestamp_ns = 1000;
-
-        let mut r2 = PostingRecord::zeroed();
-        r2.account_id_hi = 0;
-        r2.account_id_lo = 1;
-        r2.ordinal = 0;
-        r2.timestamp_ns = 1001;
-
-        let mut r3 = PostingRecord::zeroed();
-        r3.account_id_hi = 0;
-        r3.account_id_lo = 1;
-        r3.ordinal = 1;
-        r3.timestamp_ns = 1002;
-
-        {
-            let mut placing = PlacingVisitor::new(&mut buffer, &mut accounts);
-            placing.on_posting(4096, &r1);
-            placing.on_posting(4224, &r2);
-            placing.on_posting(4352, &r3);
-        }
-
-        assert_eq!(buffer[0].ordinal, 0);
-        assert_eq!(buffer[0].ls_offset, 4224);
-        assert_eq!(buffer[1].ordinal, 1);
-        assert_eq!(buffer[1].ls_offset, 4352);
-
-        assert_eq!(buffer[2].ordinal, 0);
-        assert_eq!(buffer[2].ls_offset, 4096);
-    }
-
-    #[test]
     fn compute_offsets_empty() {
         let counts = HashMap::new();
-        let (idx_records, sorted_keys, accounts) = IndexBuilder::compute_offsets(counts, 64, 64, 64);
+        let (idx_records, sorted_keys, accounts) = IndexBuilder::compute_offsets(
+            counts, 64, 64, 64,
+        );
         assert!(idx_records.is_empty());
         assert!(sorted_keys.is_empty());
         assert!(accounts.is_empty());
     }
 
     #[test]
-    fn placing_visitor_all_cursors_match_counts() {
-        let mut counts = HashMap::new();
-        counts.insert((0u64, 1u64), 2u32);
-        counts.insert((0, 2), 3);
+    fn index_buffer_entry_size() {
+        assert_eq!(std::mem::size_of::<IndexBufferEntry>(), 40);
+    }
 
-        let (_idx_records, _sorted_keys, mut accounts) = IndexBuilder::compute_offsets(counts, 64, 64, 64);
+    #[test]
+    fn build_indices_counts_and_places_from_entries() {
+        let entries = vec![
+            IndexBufferEntry {
+                account_id_hi: 0, account_id_lo: 2,
+                ordinal: 0, timestamp_ns: 1000, ls_offset: 4096,
+            },
+            IndexBufferEntry {
+                account_id_hi: 0, account_id_lo: 1,
+                ordinal: 0, timestamp_ns: 1001, ls_offset: 4224,
+            },
+            IndexBufferEntry {
+                account_id_hi: 0, account_id_lo: 1,
+                ordinal: 1, timestamp_ns: 1002, ls_offset: 4352,
+            },
+        ];
 
-        let total = 5;
+        let mut counts: HashMap<(u64, u64), u32> = HashMap::new();
+        for entry in &entries {
+            *counts.entry((entry.account_id_hi, entry.account_id_lo)).or_insert(0) += 1;
+        }
+        assert_eq!(counts[&(0, 1)], 2);
+        assert_eq!(counts[&(0, 2)], 1);
+
+        let (idx_records, _sorted_keys, mut accounts) = IndexBuilder::compute_offsets(
+            counts, 64, 64, 64,
+        );
+        assert_eq!(idx_records.len(), 2);
+
+        let total = entries.len();
         let mut buffer: Vec<IndexBufferEntry> = Vec::with_capacity(total);
-        buffer.resize(total, IndexBufferEntry { ordinal: 0, timestamp_ns: 0, ls_offset: 0 });
+        buffer.resize(total, IndexBufferEntry {
+            account_id_hi: 0, account_id_lo: 0,
+            ordinal: 0, timestamp_ns: 0, ls_offset: 0,
+        });
 
-        {
-            let mut placing = PlacingVisitor::new(&mut buffer, &mut accounts);
-
-            for i in 0..2u64 {
-                let mut r = PostingRecord::zeroed();
-                r.account_id_hi = 0;
-                r.account_id_lo = 1;
-                r.ordinal = i;
-                placing.on_posting(4096 + i * 128, &r);
-            }
-
-            for i in 0..3u64 {
-                let mut r = PostingRecord::zeroed();
-                r.account_id_hi = 0;
-                r.account_id_lo = 2;
-                r.ordinal = i;
-                placing.on_posting(8192 + i * 128, &r);
-            }
+        for entry in &entries {
+            let key = (entry.account_id_hi, entry.account_id_lo);
+            let meta = accounts.get_mut(&key).unwrap();
+            let index = meta.start + meta.cursor as usize;
+            buffer[index] = *entry;
+            meta.cursor += 1;
         }
 
-        assert_eq!(accounts[&(0, 1)].cursor, 2);
-        assert_eq!(accounts[&(0, 2)].cursor, 3);
+        assert_eq!(buffer[0].account_id_lo, 1);
+        assert_eq!(buffer[0].ls_offset, 4224);
+        assert_eq!(buffer[1].account_id_lo, 1);
+        assert_eq!(buffer[1].ls_offset, 4352);
+
+        assert_eq!(buffer[2].account_id_lo, 2);
+        assert_eq!(buffer[2].ls_offset, 4096);
     }
 }

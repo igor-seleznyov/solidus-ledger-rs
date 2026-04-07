@@ -22,7 +22,7 @@ use crate::manifest_entry::ManifestEntry;
 use crate::recovery::recover_checkpoint_state;
 use crate::recovery::recover_ls_state;
 use common::make_test_dir::make_test_dir;
-use crate::index_builder::IndexBuilderTask;
+use crate::index_builder::{IndexBufferEntry, IndexBuilderTask};
 
 const CLOCK_CHECK_REPEATS_COUNT_INTERVAL: u32 = 100_000;
 
@@ -97,6 +97,11 @@ pub struct LsWriter<T: FlushBackend, S: SigningStrategy, M: MetadataStrategy> {
     flushed_gsn_max: u64,
     flushed_timestamp_max_ns: u64,
 
+    index_entries_arena: ringbuf::arena::Arena,
+    index_entries_ptr: *mut IndexBufferEntry,
+    index_entries_len: usize,
+    index_entries_capacity: usize,
+
     index_builder_tx: Sender<IndexBuilderTask>,
 }
 
@@ -141,6 +146,13 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         let flush_pending_arena = ringbuf::arena::Arena::new(pending_arena_size)
             .expect("Failed to create flush_pending buffer Arena");
         let flush_pending_ptr = flush_pending_arena.as_ptr() as *mut PendingFlush;
+
+        let index_entries_capacity = max_ls_file_size / PostingRecord::SIZE;
+
+        let index_entries_arena_size = index_entries_capacity * std::mem::size_of::<IndexBufferEntry>();
+        let index_entries_arena = ringbuf::arena::Arena::new(index_entries_arena_size)
+            .expect("Failed to create index entries Arena");
+        let index_entries_ptr = index_entries_arena.as_ptr() as *mut IndexBufferEntry;
 
         Self {
             id,
@@ -208,6 +220,11 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
             in_flushing_timestamp_max_ns: 0,
             flushed_gsn_max: 0,
             flushed_timestamp_max_ns: 0,
+
+            index_entries_arena,
+            index_entries_ptr,
+            index_entries_len: 0,
+            index_entries_capacity,
 
             index_builder_tx,
         }
@@ -410,6 +427,19 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
 
                 self.buffered_gsn_max = slot.posting.gsn;
                 self.buffered_timestamp_max_ns = slot.posting.timestamp_ns;
+
+                if self.index_entries_len < self.index_entries_capacity {
+                    unsafe {
+                        let entry_ptr = self.index_entries_ptr
+                            .add(self.index_entries_len);
+                        (*entry_ptr).account_id_hi = slot.posting.account_id_hi;
+                        (*entry_ptr).account_id_lo = slot.posting.account_id_lo;
+                        (*entry_ptr).ordinal = slot.posting.ordinal;
+                        (*entry_ptr).timestamp_ns = slot.posting.timestamp_ns;
+                        (*entry_ptr).ls_offset = self.write_offset + self.buffer_len as u64;
+                    }
+                    self.index_entries_len += 1;
+                }
 
                 let posting_bytes = unsafe {
                     std::slice::from_raw_parts(
@@ -803,11 +833,23 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
 
         self.backend.close_file(self.ls_handle_index);
 
+        let mut entries = Vec::with_capacity(self.index_entries_len);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.index_entries_ptr as *const IndexBufferEntry,
+                entries.as_mut_ptr(),
+                self.index_entries_len,
+            );
+            entries.set_len(self.index_entries_len);
+        }
+        self.index_entries_len = 0;
+
         let task = IndexBuilderTask {
             ls_path: old_path.clone(),
             file_seq: self.file_seq,
             shard_id: self.id,
             signing_enabled: self.signing_strategy.is_enabled(),
+            entries,
         };
 
         if let Err(error) = self.index_builder_tx.send(task) {
@@ -1096,7 +1138,7 @@ mod tests {
             NoSigningStrategy,
             NoMetadataStrategy,
             dir.to_string(),
-            0,
+            1024 * 1024,
             64,
             K0,
             K1,
@@ -1144,7 +1186,7 @@ mod tests {
             NoSigningStrategy,
             metadata,
             "/tmp/solidus-test".to_string(),
-            0,
+            1024 * 1024,
             64, K0, K1,
             64, 2, 512,
             16,
@@ -1190,7 +1232,7 @@ mod tests {
             NoSigningStrategy,
             NoMetadataStrategy,
             "/tmp/solidus-test".to_string(),
-            0,
+            1024 * 1024,
             64,
             K0,
             K1,
@@ -1277,7 +1319,7 @@ mod tests {
             signing,
             NoMetadataStrategy,
             "/tmp/solidus-test".to_string(),
-            0,
+            1024 * 1024,
             64, K0, K1,
             64, 2, 512,
             16,
@@ -2147,7 +2189,7 @@ mod tests {
         let mut writer = LsWriter::new(
             0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
-            dir.to_string(), 0, 64, K0, K1, 64, 2, 512, 16, 4,
+            dir.to_string(), 1024 * 1024, 64, K0, K1, 64, 2, 512, 16, 4,
             0, manifest, index_tx,
         );
         writer.startup();
@@ -2183,7 +2225,7 @@ mod tests {
         let mut writer = LsWriter::new(
             0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
-            dir.to_string(), 0, 64, K0, K1, 64, 2, 512, 16, 4,
+            dir.to_string(), 1024 * 1024, 64, K0, K1, 64, 2, 512, 16, 4,
             0, manifest, index_tx,
         );
         writer.startup();
@@ -2234,7 +2276,7 @@ mod tests {
         let mut writer = LsWriter::new(
             0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
-            dir.to_string(), 0, 64, K0, K1, 64, 2, 512, 16, 4,
+            dir.to_string(), 1024, 64, K0, K1, 64, 2, 512, 16, 4,
             0, manifest, index_tx,
         );
         writer.startup();
@@ -2534,7 +2576,7 @@ mod tests {
             let mut writer = LsWriter::new(
                 0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
                 PortableFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
-                dir.to_string(), 0, 64, K0, K1,
+                dir.to_string(), 1024 * 1024, 64, K0, K1,
                 64, 2, 512, 16,
                 4, 0, manifest, index_tx,
             );
@@ -2578,7 +2620,7 @@ mod tests {
             let mut writer = LsWriter::new(
                 0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
                 PortableFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
-                dir.to_string(), 0, 64, K0, K1,
+                dir.to_string(), 1024 * 1024, 64, K0, K1,
                 64, 2, 512, 16, 4, 0,
                 manifest, index_tx,
             );
@@ -2645,6 +2687,8 @@ mod tests {
         );
         writer.startup();
 
+        writer.process_message(&make_posting_slot(100, 500));
+
         let old_path = writer.current_ls_file_path().to_string();
         writer.rotate();
 
@@ -2653,7 +2697,43 @@ mod tests {
         assert_eq!(task.file_seq, 0);
         assert_eq!(task.shard_id, 0);
         assert!(!task.signing_enabled);
+        assert_eq!(task.entries.len(), 1);
+
+        assert_eq!(writer.index_entries_len, 0);
 
         cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn posting_accumulates_index_entries() {
+        let mut writer = make_writer();
+
+        let mut slot1 = make_posting_slot(100, 500);
+        slot1.posting.account_id_hi = 0;
+        slot1.posting.account_id_lo = 1;
+        slot1.posting.ordinal = 0;
+        slot1.posting.timestamp_ns = 1000;
+        writer.process_message(&slot1);
+
+        let mut slot2 = make_posting_slot(200, 300);
+        slot2.posting.account_id_hi = 0;
+        slot2.posting.account_id_lo = 2;
+        slot2.posting.ordinal = 0;
+        slot2.posting.timestamp_ns = 2000;
+        writer.process_message(&slot2);
+
+        unsafe {
+            let entry = &*writer.index_entries_ptr.add(0);
+            assert_eq!(entry.account_id_hi, 0);
+            assert_eq!(entry.account_id_lo, 1);
+            assert_eq!(entry.ordinal, 0);
+            assert_eq!(entry.timestamp_ns, 1000);
+
+            let entry1 = &*writer.index_entries_ptr.add(1);
+            assert_eq!(entry1.account_id_lo, 2);
+            assert_eq!(entry1.timestamp_ns, 2000);
+        }
+
+        assert_eq!(writer.index_entries_len, 2);
     }
 }

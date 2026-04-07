@@ -57,6 +57,7 @@ impl PostingRecord {
 }
 
 #[cfg(test)]
+#[cfg(not(miri))]
 mod tests {
     use super::*;
 

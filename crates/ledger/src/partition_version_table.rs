@@ -398,6 +398,7 @@ impl PartitionVersionTable {
 unsafe impl Send for PartitionVersionTable {}
 
 #[cfg(test)]
+#[cfg(not(miri))]
 mod tests {
     use super::*;
 

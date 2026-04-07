@@ -253,6 +253,7 @@ impl PartitionActor {
 
 
 #[cfg(test)]
+#[cfg(not(miri))]
 mod tests {
     use common::u64_pair_to_bytes::u64_pair_to_bytes;
     use super::*;
