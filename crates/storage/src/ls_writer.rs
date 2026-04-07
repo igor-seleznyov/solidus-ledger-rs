@@ -1,11 +1,10 @@
-use std::path::PathBuf;
 use chrono::Local;
 use common::mem_barrier::release_store_u64;
 use pipeline::posting_record::PostingRecord;
 use pipeline::in_flight_min_heap::InFlightMinHeap;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
 use std::sync::Arc;
-use std::thread::current;
+use std::sync::mpsc::Sender;
 use std::time::Instant;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -23,6 +22,7 @@ use crate::manifest_entry::ManifestEntry;
 use crate::recovery::recover_checkpoint_state;
 use crate::recovery::recover_ls_state;
 use common::make_test_dir::make_test_dir;
+use crate::index_builder::IndexBuilderTask;
 
 const CLOCK_CHECK_REPEATS_COUNT_INTERVAL: u32 = 100_000;
 
@@ -96,6 +96,8 @@ pub struct LsWriter<T: FlushBackend, S: SigningStrategy, M: MetadataStrategy> {
 
     flushed_gsn_max: u64,
     flushed_timestamp_max_ns: u64,
+
+    index_builder_tx: Sender<IndexBuilderTask>,
 }
 
 unsafe impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> Send for LsWriter<T, S, M> {}
@@ -121,6 +123,7 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         checkpoint_prealloc_multiplier: usize,
         rules_checksum: u32,
         manifest: Manifest,
+        index_builder_tx: Sender<IndexBuilderTask>,
     ) -> Self {
         let flush_max_buffer_bytes = flush_max_buffer_posting_records * PostingRecord::SIZE;
         let buffer_capacity = (flush_max_buffer_bytes * 2 + 4095) & !4095;
@@ -205,6 +208,8 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
             in_flushing_timestamp_max_ns: 0,
             flushed_gsn_max: 0,
             flushed_timestamp_max_ns: 0,
+
+            index_builder_tx,
         }
     }
 
@@ -798,6 +803,20 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
 
         self.backend.close_file(self.ls_handle_index);
 
+        let task = IndexBuilderTask {
+            ls_path: old_path.clone(),
+            file_seq: self.file_seq,
+            shard_id: self.id,
+            signing_enabled: self.signing_strategy.is_enabled(),
+        };
+
+        if let Err(error) = self.index_builder_tx.send(task) {
+            println!(
+                "[ls-writer {}] WARNING: failed to send index builder task: {}",
+                self.id, error,
+            );
+        }
+
         println!(
             "[ls-writer {}] rotation: index builder stub for {}",
             self.id, old_path
@@ -939,7 +958,7 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc};
     use ed25519_dalek::SigningKey;
     use super::*;
     use crate::flush_backend::{FlushBackend, FlushCompletion};
@@ -1056,6 +1075,8 @@ mod tests {
 
         let manifest = Manifest::create(&dir, 0);
 
+        let (index_tx, _) = mpsc::channel();
+
         let ls_writer_rb = Arc::new(
             MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
         );
@@ -1086,6 +1107,7 @@ mod tests {
             4,
             0,
             manifest,
+            index_tx,
         );
         writer.startup();
         writer
@@ -1111,6 +1133,8 @@ mod tests {
 
         let metadata = PostingMetadataStrategy::new(record_size, 512);
 
+        let (index_tx, _) = mpsc::channel();
+
         let mut writer = LsWriter::new(
             0,
             ls_writer_rb,
@@ -1126,7 +1150,8 @@ mod tests {
             16,
             4,
             0,
-            manifest
+            manifest,
+            index_tx,
         );
         writer.startup();
         writer
@@ -1154,6 +1179,8 @@ mod tests {
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
 
+        let (index_tx, _) = mpsc::channel();
+
         let mut writer = LsWriter::new(
             0,
             ls_writer_rb,
@@ -1171,7 +1198,8 @@ mod tests {
             16,
             4,
             0,
-            manifest
+            manifest,
+            index_tx,
         );
         writer.startup();
 
@@ -1238,6 +1266,8 @@ mod tests {
         let signing_state = SigningState::new(key, genesis);
         let signing = Ed25519SigningStrategy::new(signing_state, 512);
 
+        let (index_tx, _) = mpsc::channel();
+
         let mut writer = LsWriter::new(
             0,
             ls_writer_rb,
@@ -1253,7 +1283,8 @@ mod tests {
             16,
             4,
             0,
-            manifest
+            manifest,
+            index_tx,
         );
         writer.startup();
         writer
@@ -1277,6 +1308,8 @@ mod tests {
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
 
+        let (index_tx, _) = mpsc::channel();
+
         let mut writer = LsWriter::new(
             0,
             ls_writer_rb,
@@ -1296,7 +1329,8 @@ mod tests {
             16,
             4,
             0,
-            manifest
+            manifest,
+            index_tx,
         );
         writer.startup();
         writer
@@ -2108,11 +2142,13 @@ mod tests {
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
 
+        let (index_tx, _) = mpsc::channel();
+
         let mut writer = LsWriter::new(
             0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
             dir.to_string(), 0, 64, K0, K1, 64, 2, 512, 16, 4,
-            0, manifest,
+            0, manifest, index_tx,
         );
         writer.startup();
 
@@ -2142,11 +2178,13 @@ mod tests {
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
 
+        let (index_tx, _) = mpsc::channel();
+
         let mut writer = LsWriter::new(
             0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
             dir.to_string(), 0, 64, K0, K1, 64, 2, 512, 16, 4,
-            0, manifest,
+            0, manifest, index_tx,
         );
         writer.startup();
 
@@ -2191,11 +2229,13 @@ mod tests {
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
 
+        let (index_tx, _) = mpsc::channel();
+
         let mut writer = LsWriter::new(
             0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
             dir.to_string(), 0, 64, K0, K1, 64, 2, 512, 16, 4,
-            0, manifest,
+            0, manifest, index_tx,
         );
         writer.startup();
 
@@ -2489,10 +2529,14 @@ mod tests {
             unsafe { TEST_COMMITTED_GSN = 0; }
             let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
 
+            let (index_tx, _) = mpsc::channel();
+
             let mut writer = LsWriter::new(
                 0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
                 PortableFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
-                dir.to_string(), 0, 64, K0, K1, 64, 2, 512, 16, 4, 0, manifest,
+                dir.to_string(), 0, 64, K0, K1,
+                64, 2, 512, 16,
+                4, 0, manifest, index_tx,
             );
             writer.startup();
 
@@ -2529,10 +2573,14 @@ mod tests {
             unsafe { TEST_COMMITTED_GSN = 0; }
             let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
 
+            let (index_tx, _) = mpsc::channel();
+
             let mut writer = LsWriter::new(
                 0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
                 PortableFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
-                dir.to_string(), 0, 64, K0, K1, 64, 2, 512, 16, 4, 0, manifest,
+                dir.to_string(), 0, 64, K0, K1,
+                64, 2, 512, 16, 4, 0,
+                manifest, index_tx,
             );
             writer.startup();
 
@@ -2570,6 +2618,41 @@ mod tests {
             LsFileHeader::DATA_OFFSET as u64 + 4096 + 4096,
         );
         }
+
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn rotate_sends_index_builder_task() {
+        let dir = make_test_dir();
+        let manifest_path = format!("{}/0.manifest", dir);
+        std::fs::remove_file(&manifest_path).ok();
+        let manifest = Manifest::create(&dir, 0);
+
+        let (index_tx, index_rx) = std::sync::mpsc::channel();
+
+        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
+        let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+
+        unsafe { TEST_COMMITTED_GSN = 0; }
+        let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
+
+        let mut writer = LsWriter::new(
+            0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
+            MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
+            dir.to_string(), 4096, 64, K0, K1, 64, 2, 512, 16, 4,
+            0, manifest, index_tx,
+        );
+        writer.startup();
+
+        let old_path = writer.current_ls_file_path().to_string();
+        writer.rotate();
+
+        let task = index_rx.try_recv().expect("Expected index builder task");
+        assert_eq!(task.ls_path, old_path);
+        assert_eq!(task.file_seq, 0);
+        assert_eq!(task.shard_id, 0);
+        assert!(!task.signing_enabled);
 
         cleanup_dir(&dir);
     }

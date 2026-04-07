@@ -1,5 +1,7 @@
+use std::ops::Index;
 use std::sync::Arc;
 use std::thread;
+use std::sync::mpsc;
 use common::consts::CPU_CACHE_LINE_SIZE;
 use common::generate_random_u64::generate_random_u64;
 use config::{Config, PartitionAccountAssignmentConfig};
@@ -31,6 +33,7 @@ use storage::flush_backend::FlushBackend;
 use storage::manifest::Manifest;
 use storage::signing_strategy::SigningStrategy;
 use storage::metadata_strategy::MetadataStrategy;
+use storage::index_builder::{IndexBuilder, IndexBuilderTask};
 
 fn main() {
     let config = Config::load("config.yaml").expect("Failed to load config");
@@ -240,7 +243,21 @@ fn main() {
                 }
             ).expect("Failed to spawn partition actor thread");
     }
+
     println!("[main] {} partition actor threads started", partitions_count);
+
+    let (index_builder_tx, index_builder_rx) = mpsc::channel::<IndexBuilderTask>();
+
+    thread::Builder::new()
+        .name("index-builder".to_string())
+        .spawn(
+            move || {
+                let builder = IndexBuilder::new(0, index_builder_rx);
+                builder.run();
+            }
+        ).expect("[main] Failed to spawn index-builder thread");
+
+    println!("[main] index builder thread started");
 
     for i in 0..decision_maker_shards {
         let decision_maker_coordinator_rb = Arc::clone(&coordinator_rbs[i]);
@@ -312,6 +329,7 @@ fn main() {
                     signing_enabled, metadata_enabled, metadata_record_size,
                     checkpoint_prealloc_multiplier,
                     rules_checksum, manifest,
+                    index_builder_tx.clone(),
                 );
             }
             Err(e) => {
@@ -326,6 +344,7 @@ fn main() {
                     signing_enabled, metadata_enabled, metadata_record_size,
                     checkpoint_prealloc_multiplier,
                     rules_checksum, manifest,
+                    index_builder_tx.clone(),
                 );
             }
         }
@@ -342,6 +361,7 @@ fn main() {
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 signing_enabled, metadata_enabled, metadata_record_size,
                 rules_checksum, manifest,
+                index_builder_tx.clone(),
             );
         }
     }
@@ -391,6 +411,7 @@ fn spawn_ls_writer_thread<T, S, M>(
     checkpoint_prealloc_multiplier: usize,
     rules_checksum: u32,
     manifest: Manifest,
+    index_builder_tx: mpsc::Sender<IndexBuilderTask>,
 ) where
     T: FlushBackend + Send + 'static,
     S: SigningStrategy + Send + 'static,
@@ -419,6 +440,7 @@ fn spawn_ls_writer_thread<T, S, M>(
                     checkpoint_prealloc_multiplier,
                     rules_checksum,
                     manifest,
+                    index_builder_tx,
                 );
                 writer.run();
             }
@@ -442,6 +464,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
     checkpoint_prealloc_multiplier: usize,
     rules_checksum: u32,
     manifest: Manifest,
+    index_builder_tx: mpsc::Sender<IndexBuilderTask>,
 ) {
     if signing_enabled {
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
@@ -460,6 +483,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
                 rules_checksum, manifest,
+                index_builder_tx,
             );
         } else {
             spawn_ls_writer_thread(
@@ -469,6 +493,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
                 rules_checksum, manifest,
+                index_builder_tx,
             );
         }
     } else {
@@ -481,6 +506,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
                 rules_checksum, manifest,
+                index_builder_tx,
             );
         } else {
             spawn_ls_writer_thread(
@@ -490,6 +516,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
                 rules_checksum, manifest,
+                index_builder_tx
             );
         }
     }

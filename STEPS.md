@@ -68,44 +68,35 @@ Framing, handshake, batch validation, codec.
   - Three-thread LS Writer→DM→IO: transitive durability guarantee — if client sees COMMITTED, fdatasync is proven complete under all interleavings (2 tests)
   - MPSC two writers: fetch_add atomicity — no double claim under any interleaving (1 test)
 
-## In Progress
-
-### Step 8: LS Writer + Persistence + Signing + CRC32C ← current
-- 8-1: PostingRecord (128 bytes, CRC32C) + LS Writer RB slot types (AddToHeap, RemoveFromHeap, Posting, FlushMarker, Metadata) ✅
+### Step 8: LS Writer + Persistence + Signing + CRC32C
+- 8-1: PostingRecord (128 bytes, CRC32C) + LS Writer RB slot types ✅
 - 8-2: IFMH (In-Flight Min-Heap) + Robin Hood index ✅
 - 8-3: Flush Done RB slot (SPSC, LS Writer → DM) + global_committed_gsn Arena ✅
-- 8-4-1: LS Writer thread — drain RB, buffer, group commit, pwrite + fdatasync (portable fallback) ✅
-- 8-4-2: LS Writer — io_uring variant (Linux 5.6+, IO_LINK, SQPOLL, O_DIRECT) ✅
-  - 8-4-2a: FlushBackend trait (submit/poll instead of sync) ✅
-  - 8-4-2b: IoUringFlushBackend (io-uring crate, IO_LINK, registered buffers, SQPOLL) ✅
-  - 8-4-2c: O_DIRECT + aligned buffers (Arena for write buffer, pad to 4096, fallocate) ✅
-  - 8-4-2d: FlushBackend trait refactoring ✅
-- 8-5: DM integration — PostingRecords + FlushMarker to LS Writer RB, Flush Done reception ✅
-- 8-6-1: CRC32C hw-accelerated (SSE4.2) + Ed25519 (ed25519-dalek) + SHA256 chain + SigningState + SigRecord (192 bytes) ✅
-- 8-6-2: Signing integration with LS Writer — ls_sign file, sign_batch, fdatasync ordering ✅
-- 8-7: LSFileHeader (128 bytes) + LSSignFileHeader + file creation/open ✅
-- 8-8: LS metadata — ls_meta file, MetaRecord, PostingMetadataStrategy, fdatasync ordering ✅
-- 8-8-strategy-rf: Strategy pattern for Signing and Metadata — generic `LsWriter<T, S, M>`, SigningStrategy/MetadataStrategy traits, Ed25519SigningStrategy, PostingMetadataStrategy, NoSigningStrategy, NoMetadataStrategy, zero-cost static dispatch ✅
-- 8-8-storage-rf: Uniform FlushBackend API — `open_file → handle_index`, `submit_write/submit_sync/flush_submissions/wait_completions/poll_completion`, O_DIRECT + io_uring for sign and meta files, parallel sign+meta flush ✅
-- 8-8-main-rf: Runtime backend selection (io_uring / portable fallback), strategy wiring in main.rs, `spawn_with_strategies<T>` + `spawn_ls_writer_thread<T, S, M>`, `#[cfg(target_os)]` for platform support ✅
-- 8-12: main.rs wiring — LS Writer RB, Flush Done RB, LS Writer threads, global_committed_gsn ✅ (done in 8-8-main-rf)
-- 8-9: LS rotation — triggers: max_file_size, metadata schema change, rule change
-  - 8-9-1: CheckpointRecord (32 bytes) + CheckpointFileHeader (40 bytes) + open_file_buffered in FlushBackend ✅
-  - 8-9-2: Checkpoint integration in LsWriter — batch_seq tracking, write_checkpoint_record after flush completion, checkpoint_prealloc_multiplier config ✅
-  - 8-9-3: on_rotation() in SigningStrategy and MetadataStrategy — state reset on rotation, cross-file chain for signing ✅
-  - 8-9-4: Rotation logic in LsWriter — should_rotate(), rotate(), open_files() refactoring, datetime filenames, handle reuse in FlushBackend, ManifestEntry struct (128 bytes), Index Builder stub ✅
-  - 8-9-5: Manifest file + startup logic + recovery
-    - 8-9-5a: ManifestHeader (64 bytes) + Manifest read/write (create, open, append entry, finalize entry, update_entry_min_values, fsync) ✅
-    - 8-9-5b: Startup logic in LsWriter — read manifest → first launch / reopen existing file / rotate on config mismatch (rules_checksum, record_size, metadata_enabled). GSN/timestamp tracking: min at first posting (persisted to manifest), max at rotation. Manifest integration in rotate(). open_new_files/reopen_files/open_strategy_files/write_all_headers decomposition ✅
-    - 8-9-5c: Recovery write_offset — scan checkpoint file for checkpoint_write_offset/batch_seq + scan LS from DATA_OFFSET by PostingRecord magic+CRC32C for write_offset/gsn/timestamp recovery. Separate recovery.rs module ✅
-- 8-10: LS Index Builder — *.idx + *.index (sorted arrays by account_id, async at rotation)
+- 8-4-1: LS Writer thread — drain RB, buffer, group commit, pwrite + fdatasync ✅
+- 8-4-2: io_uring backend (IO_LINK, SQPOLL, O_DIRECT), FlushBackend trait ✅
+- 8-5: DM integration — PostingRecords + FlushMarker, Flush Done ✅
+- 8-6: CRC32C hw-accelerated (SSE4.2) + Ed25519 + SHA256 chain + signing integration ✅
+- 8-7: LSFileHeader + LSSignFileHeader + file creation/open ✅
+- 8-8: LS metadata, Strategy pattern (SigningStrategy + MetadataStrategy), Uniform FlushBackend API, runtime backend selection, main.rs wiring ✅
+- 8-9: LS rotation — should_rotate(), rotate(), datetime filenames, handle reuse, CheckpointRecord + CheckpointFileHeader, on_rotation() signing/metadata cross-file chain ✅
+- 8-9-5: Manifest (ManifestHeader + ManifestEntry + read/write/finalize/update_entry_min_values), Startup logic (first launch / reopen / config mismatch rotation), GSN/timestamp tracking, Recovery write_offset (checkpoint scan + LS scan by PostingRecord magic+CRC32C) ✅
+- 8-10-1: Index Builder thread infrastructure — mpsc channel, IndexBuilderTask, LS Writer sends task at rotation ✅
+- 8-10-2: LS scan refactoring (PostingScanVisitor trait, scan_ls_postings), two-pass Index Builder (CountingVisitor + PlacingVisitor + compute_offsets), durable structures (AccountIndexRecord 40B, OrdinalIndexEntry 16B, TimestampIndexEntry 16B, IndexFileHeader 64B) ✅
+
+## In Progress
+
+### Step 8: LS Writer + Persistence (continued) ← current
+- 8-10-3: Index file writing — per-account sort + write .idx / .ordinal / .timestamp
+- 8-10-4: Page-aligned binary search lookup + range queries
+- 8-10-5: Integration tests (rotation → index build → lookup)
+- 8-10-6: Signature verification during scan
 - 8-11: LS Sign Index — *.ls_sign_idx (sorted array by transfer_id, if signing enabled)
 - 8-t: Integration tests (DM → LS Writer → fdatasync → Flush Done → DM → THT cleanup)
 - 8-13: Snapshots + Recovery
   - 8-13-1: SLS file format — SnapshotRecord (per account: balance, ordinal, ls_offset)
-  - 8-13-2: Snapshot Writer — trigger (ops_since_snapshot / rotation)
+  - 8-13-2: Snapshot Writer — continuous background thread, dirty flag, max-heap
   - 8-13-3: SLS Checkpoint — index for recovery
-  - 8-13-4: Recovery — load snapshot → replay LS → restore PAHT
+  - 8-13-4: Recovery — load snapshot → sequential LS scan → restore PAHT
   - 8-13-5: Recovery — signing state restoration (last_tx_hash from last SigRecord)
   - 8-13-t: Integration tests (write → crash simulation → recovery → verify balances)
 
