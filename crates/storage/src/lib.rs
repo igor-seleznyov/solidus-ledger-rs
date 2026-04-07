@@ -37,3 +37,4 @@ pub mod ordinal_index_entry;
 pub mod timestamp_index_entry;
 pub mod counting_visitor;
 pub mod index_file_header;
+pub mod index_writer;

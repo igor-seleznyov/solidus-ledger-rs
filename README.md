@@ -217,11 +217,12 @@ Actively developed. See [Implementation Steps](STEPS.md) for the full plan.
 - Recovery write_offset: checkpoint scan + LS scan by PostingRecord magic+CRC32C
 - Index Builder thread (mpsc channel, async index build at rotation)
 - Two-pass index building: CountingVisitor + PlacingVisitor, durable structures (AccountIndexRecord, OrdinalIndexEntry, TimestampIndexEntry, IndexFileHeader)
+- Index file writing: per-account sort + batch write .posting-accounts / .ordinal / .timestamp
 - Miri testing: all hash tables (PAHT, PVT, THT) and ring buffers (SPSC, MPSC) verified for unsafe correctness
 - Loom testing: happens-before correctness verified in C11 abstract memory model with exhaustive interleaving exploration — three-thread transitive chains (Pipeline→Actor→DM, LS Writer→DM→IO), release/acquire barriers, MPSC fetch_add atomicity
 
 **In progress (Step 8, continued):**
-- Index file writing (.idx / .ordinal / .timestamp), page-aligned binary search lookup
+- Page-aligned binary search lookup + range queries
 - LS Sign Index, signature verification during scan
 - Snapshots and crash recovery
 
