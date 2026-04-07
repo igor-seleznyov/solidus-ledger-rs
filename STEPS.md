@@ -83,6 +83,7 @@ Framing, handshake, batch validation, codec.
 - 8-10-1: Index Builder thread infrastructure — mpsc channel, IndexBuilderTask, LS Writer sends task at rotation ✅
 - 8-10-2: LS scan refactoring (PostingScanVisitor trait, scan_ls_postings), two-pass Index Builder (CountingVisitor + PlacingVisitor + compute_offsets), durable structures (AccountIndexRecord 40B, OrdinalIndexEntry 16B, TimestampIndexEntry 16B, IndexFileHeader 64B) ✅
 - 8-10-3: Index file writing — index_writer.rs, per-account sort + batch write .posting-accounts / .ordinal / .timestamp, IndexFileHeader with three magics (LDSTIDXA/LDSTIDXO/LDSTIDXT) ✅
+- 8-10-3-rf: In-memory accumulation — LS Writer накапливает index entries в Arena (mmap+mlock) на hot path (~3ns per posting, zero page fault). При ротации copy Arena→Vec, move через channel в Index Builder. Без scan LS файла при построении индексов. Мотивация: предсказуемый latency на hot path, переиспользование mlock'd памяти между ротациями, устранение 2x sequential read LS при ротации ✅
 
 ## In Progress
 

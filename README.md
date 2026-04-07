@@ -218,6 +218,7 @@ Actively developed. See [Implementation Steps](STEPS.md) for the full plan.
 - Index Builder thread (mpsc channel, async index build at rotation)
 - Two-pass index building: CountingVisitor + PlacingVisitor, durable structures (AccountIndexRecord, OrdinalIndexEntry, TimestampIndexEntry, IndexFileHeader)
 - Index file writing: per-account sort + batch write .posting-accounts / .ordinal / .timestamp
+- In-memory index accumulation: Arena (mmap+mlock) on hot path, zero page fault, copy to Vec at rotation — eliminates LS file scan for index building
 - Miri testing: all hash tables (PAHT, PVT, THT) and ring buffers (SPSC, MPSC) verified for unsafe correctness
 - Loom testing: happens-before correctness verified in C11 abstract memory model with exhaustive interleaving exploration — three-thread transitive chains (Pipeline→Actor→DM, LS Writer→DM→IO), release/acquire barriers, MPSC fetch_add atomicity
 
