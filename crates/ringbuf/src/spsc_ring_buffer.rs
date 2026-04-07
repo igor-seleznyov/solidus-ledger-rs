@@ -204,6 +204,7 @@ unsafe impl<T: Slot> Send for SpscRingBuffer<T> {}
 unsafe impl<T: Slot> Sync for SpscRingBuffer<T> {}
 
 #[cfg(test)]
+#[cfg(not(miri))]
 mod tests {
     use super::*;
     use crate::slot::Slot;

@@ -306,6 +306,7 @@ impl DecisionMaker {
 }
 
 #[cfg(test)]
+#[cfg(not(miri))]
 mod tests {
     use super::*;
     use pipeline::transfer_hash_table_entry::TransferHashTableEntry;

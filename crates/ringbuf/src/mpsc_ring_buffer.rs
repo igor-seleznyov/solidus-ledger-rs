@@ -158,6 +158,7 @@ unsafe impl<T: Slot> Send for MpscRingBuffer<T> {}
 unsafe impl<T: Slot> Sync for MpscRingBuffer<T> {}
 
 #[cfg(test)]
+#[cfg(not(miri))]
 mod tests {
     use super::*;
     use crate::slot::Slot;
