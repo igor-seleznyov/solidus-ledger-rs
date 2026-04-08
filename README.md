@@ -1,10 +1,35 @@
 # Solidus Ledger
 
-### High-Performance Double-Entry Ledger with Durable Persistence
+> Financial-grade double-entry ledger engine in Rust.  
+> Target: **1,000,000 TPS** · **sub-millisecond p99 latency** · **single node**
 
-Solidus Ledger is a high-performance double-entry ledger with guaranteed durability, designed for financial systems requiring low latency and high throughput. Target: 1,000,000 transactions per second with sub-millisecond latency.
+![Rust](https://img.shields.io/badge/rust-1.85+-orange?logo=rust)
+![License](https://img.shields.io/badge/license-Apache%202.0-blue)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
+![Status](https://img.shields.io/badge/status-active%20development-green)
 
-Primary data is kept in memory for fast access. Every transfer is written to disk before acknowledgment — no data is lost on crash.
+Solidus Ledger is a high-performance financial ledger designed for payment infrastructure
+where correctness and durability are non-negotiable. Every transfer is atomically applied
+and written to disk before acknowledgment — no partial states, no data loss on crash.
+
+Built without async/await. Explicit threads pinned to CPU cores, lock-free ring buffers
+on the hot path, Arena memory (mmap + mlock, zero heap allocations at runtime),
+io_uring for disk writes on Linux.
+
+---
+
+## Why Solidus Ledger
+
+- **Zero allocations on the hot path** — Arena (mmap + mlock) pre-allocated at startup,
+  no GC pressure, no page faults during transaction processing
+- **Durability by design** — every transfer fsynced to disk before the client receives
+  `COMMITTED`; group commit amortizes the cost across batches
+- **Cryptographic audit trail** — Ed25519 signature per transfer, SHA-256 hash chain
+  detects any gap or tampering in the record sequence
+- **Linear scaling** — accounts distributed across partitions, each on a dedicated thread;
+  more partitions = more throughput, no coordination on the hot path
+- **Correctness verified** — unsafe code tested with Miri; lock-free synchronization
+  verified with Loom under exhaustive thread interleaving
 
 ---
 
