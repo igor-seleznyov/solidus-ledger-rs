@@ -90,7 +90,8 @@ Framing, handshake, batch validation, codec.
 ### Step 8: LS Writer + Persistence (continued) ← current
 - 8-10-4: Page-aligned binary search lookup + range queries
 - 8-10-5: Integration tests (rotation → index build → lookup)
-- 8-10-6: Signature verification during scan
+- 8-10-6: Signature verification during scan + file integrity protection (inotify for tamper detection, chattr+i on rotated files, verify-at-first-open cache, periodic background recheck)
+- 8-10-7: Multi-file routing — manifest-based lookup across multiple LS files (gsn/timestamp ranges in ManifestEntry)
 - 8-11: LS Sign Index — *.ls_sign_idx (sorted array by transfer_id, if signing enabled)
 - 8-14: Metadata Index Builder — metadata schema parsing from config, `.meta_idx_{name}` per field, binary search by byte ranges. User-defined schema (field name, type, offset in metadata block)
 - 8-t: Integration tests (DM → LS Writer → fdatasync → Flush Done → DM → THT cleanup)
@@ -158,13 +159,21 @@ End-of-day reconciliation, business day, balance reporting by date. Architecture
 ### Step 21: Adaptive Buffer Sizes (optional, research)
 Dynamic RB capacity, batch size, flush buffer based on current load. ML-based forecasting for proactive scaling.
 
-### Step 22: Distributed Replication (hybrid approach)
+### Step 22: solidus-ledger-query Service Extraction
+- Extract read/index/query code from ledger into separate service
+- Modules to extract: index_builder, index_writer, mmap_reader, index_reader
+- Query API: lookup by account, range queries by timestamp/ordinal, metadata search
+- Independent index building (ordinal, timestamp, metadata, sign)
+- Signature verification at lookup with caching
+- Reporting: balance at date, posting history
+
+### Step 23: Distributed Replication (hybrid approach)
 - Consensus: `openraft` (Rust, battle-tested)
 - State machine replication over Raft
-- Superblock: 4 copies (~4KB x 4 = 16KB) — node metadata
+- Superblock: 4 copies (~4KB × 4 = 16KB) — node metadata
 - VOPR-like simulator for consensus + state machine testing
 
-### Step 23: VSR — Viewstamped Replication (optional, challenge, ~6-8 months)
+### Step 24: VSR — Viewstamped Replication (optional, challenge, ~6-8 months)
 - Port VSR + VOPR from TigerBeetle (Zig → Rust) as experiment
 - Replace openraft with custom VSR for maximum control
 - Deterministic simulation (VOPR) required for consensus verification
