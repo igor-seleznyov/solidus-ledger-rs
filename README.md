@@ -233,6 +233,7 @@ Actively developed. See [Implementation Steps](STEPS.md) for the full plan.
 - Deduplication (IdempotencyCheck)
 - Key Management (KEK/DEK/Shamir)
 - SHM transport
+- solidus-ledger-query: separate read/index/query service (extracted from ledger)
 - Distributed replication (Raft / VSR)
 
 ---
