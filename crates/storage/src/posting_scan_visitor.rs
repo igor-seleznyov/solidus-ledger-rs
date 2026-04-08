@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use pipeline::posting_record::{PostingRecord, POSTING_RECORD_MAGIC};
-use crate::consts::LS_FILE_PAGE_SIZE;
+use crate::consts::FILE_PAGE_SIZE;
 use crate::ls_file_header::LsFileHeader;
 
 pub trait PostingScanVisitor {
@@ -16,8 +16,8 @@ pub fn scan_ls_postings(ls_path: &str, visitor: &mut impl PostingScanVisitor) ->
         }
     };
 
-    let page_size: usize = LS_FILE_PAGE_SIZE;
-    let mut page_buf = [0u8; LS_FILE_PAGE_SIZE];
+    let page_size: usize = FILE_PAGE_SIZE;
+    let mut page_buf = [0u8; FILE_PAGE_SIZE];
     let mut offset = LsFileHeader::DATA_OFFSET as u64;
     let mut write_offset = offset;
 

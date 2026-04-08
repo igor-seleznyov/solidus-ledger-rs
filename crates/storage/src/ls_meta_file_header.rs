@@ -1,5 +1,5 @@
 use common::crc32c::crc32c;
-use crate::consts::LS_FILE_PAGE_SIZE;
+use crate::consts::FILE_PAGE_SIZE;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::ls_file_header::LS_FILE_MAGIC;
 
@@ -85,8 +85,8 @@ impl LsMetaFileHeader {
         computed == saved
     }
 
-    pub fn to_page(&self) -> [u8; LS_FILE_PAGE_SIZE] {
-        let mut page = [0u8; LS_FILE_PAGE_SIZE];
+    pub fn to_page(&self) -> [u8; FILE_PAGE_SIZE] {
+        let mut page = [0u8; FILE_PAGE_SIZE];
         let header_bytes = unsafe {
             std::slice::from_raw_parts(
                 self as *const LsMetaFileHeader as *const u8,

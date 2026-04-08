@@ -36,3 +36,4 @@ pub mod timestamp_index_entry;
 pub mod index_file_header;
 pub mod index_writer;
 pub mod mmap_reader;
+pub mod index_reader;

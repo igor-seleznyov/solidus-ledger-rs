@@ -1006,7 +1006,7 @@ mod tests {
     use crate::flush_backend::{FlushBackend, FlushCompletion};
     use pipeline::posting_record::PostingRecord;
     use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
-    use crate::consts::LS_FILE_PAGE_SIZE;
+    use crate::consts::FILE_PAGE_SIZE;
     use crate::ed25519_signing_strategy::Ed25519SigningStrategy;
     use crate::flush_done_slot::FlushDoneSlot;
     use crate::ls_writer::LsWriter;
@@ -1416,7 +1416,7 @@ mod tests {
     fn new_initializes_empty_state() {
         let writer = make_writer();
         assert_eq!(writer.buffer_len, 0);
-        assert_eq!(writer.write_offset, LS_FILE_PAGE_SIZE as u64);
+        assert_eq!(writer.write_offset, FILE_PAGE_SIZE as u64);
         assert!(!writer.flush_in_flight);
         assert_eq!(writer.flush_buffer_snapshot_len, 0);
         assert_eq!(writer.collecting_len, 0);
@@ -1485,7 +1485,7 @@ mod tests {
         writer.submit_flush();
 
         assert_eq!(writer.backend.written.len(), 3);
-        assert_eq!(writer.backend.written[2].1.len() % LS_FILE_PAGE_SIZE, 0);
+        assert_eq!(writer.backend.written[2].1.len() % FILE_PAGE_SIZE, 0);
         assert!(writer.backend.written[2].1.len() >= PostingRecord::SIZE);
         assert_eq!(writer.backend.written[2].2, LsFileHeader::DATA_OFFSET as u64);
     }
@@ -1550,7 +1550,7 @@ mod tests {
 
         writer.poll_and_handle_completions();
 
-        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64);
+        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64 + FILE_PAGE_SIZE as u64);
         assert_eq!(writer.buffer_len, 0);
         assert!(!writer.flush_in_flight);
     }
@@ -1644,7 +1644,7 @@ mod tests {
         writer.submit_flush();
 
         assert_eq!(writer.backend.written.len(), 3);
-        assert_eq!(writer.backend.written[2].1.len() % LS_FILE_PAGE_SIZE, 0);
+        assert_eq!(writer.backend.written[2].1.len() % FILE_PAGE_SIZE, 0);
         assert!(writer.backend.written[2].1.len() >= PostingRecord::SIZE * 3);
 
         writer.poll_and_handle_completions();
@@ -1653,7 +1653,7 @@ mod tests {
 
         assert!(writer.in_flight_min_heap.is_empty());
         assert_eq!(writer.buffer_len, 0);
-        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64);
+        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64 + FILE_PAGE_SIZE as u64);
     }
 
     #[test]
@@ -1667,7 +1667,7 @@ mod tests {
         writer.submit_flush();
         writer.poll_and_handle_completions();
 
-        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64);
+        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64 + FILE_PAGE_SIZE as u64);
 
         writer.process_message(&make_add_to_heap_slot(200));
         writer.process_message(&make_posting_slot(200, 300));
@@ -1676,11 +1676,11 @@ mod tests {
         writer.submit_flush();
 
         assert_eq!(writer.backend.written.len(), 5);
-        assert_eq!(writer.backend.written[4].2, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64);
+        assert_eq!(writer.backend.written[4].2, LsFileHeader::DATA_OFFSET as u64 + FILE_PAGE_SIZE as u64);
 
         writer.poll_and_handle_completions();
 
-        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64 + LS_FILE_PAGE_SIZE as u64 + LS_FILE_PAGE_SIZE as u64);
+        assert_eq!(writer.write_offset, LsFileHeader::DATA_OFFSET as u64 + FILE_PAGE_SIZE as u64 + FILE_PAGE_SIZE as u64);
     }
 
     #[test]

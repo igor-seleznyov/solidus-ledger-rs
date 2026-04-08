@@ -4,7 +4,7 @@ use crate::checkpoint_record::CheckpointRecord;
 use crate::checkpoint_file_header::{CheckpointFileHeader, CHECKPOINT_FILE_MAGIC};
 use crate::ls_file_header::LsFileHeader;
 use pipeline::posting_record::{PostingRecord, POSTING_RECORD_MAGIC};
-use crate::consts::LS_FILE_PAGE_SIZE;
+use crate::consts::FILE_PAGE_SIZE;
 use crate::posting_scan_visitor::scan_ls_postings;
 use crate::recovery_visitor::RecoveryVisitor;
 
