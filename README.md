@@ -244,15 +244,19 @@ Actively developed. See [Implementation Steps](STEPS.md) for the full plan.
 - Two-pass index building: CountingVisitor + PlacingVisitor, durable structures (AccountIndexRecord, OrdinalIndexEntry, TimestampIndexEntry, IndexFileHeader)
 - Index file writing: per-account sort + batch write .posting-accounts / .ordinal / .timestamp
 - In-memory index accumulation: Arena (mmap+mlock) on hot path, zero page fault, copy to Vec at rotation — eliminates LS file scan for index building
-- Miri testing: all hash tables (PAHT, PVT, THT) and ring buffers (SPSC, MPSC) verified for unsafe correctness
+- MmapReader: read-only file mmap for index lookup (PROT_READ, MAP_PRIVATE, OS page cache)
+- Page-aligned binary search: two-level (page-level first/last → record-level) in .posting-accounts
+- Range queries: lower/upper bound binary search in .ordinal/.timestamp
+- Miri testing: all hash tables (PAHT, PVT, THT), ring buffers (SPSC, MPSC), IndexBufferEntry Arena ops, PostingScanVisitor copy_nonoverlapping
 - Loom testing: happens-before correctness verified in C11 abstract memory model with exhaustive interleaving exploration — three-thread transitive chains (Pipeline→Actor→DM, LS Writer→DM→IO), release/acquire barriers, MPSC fetch_add atomicity
 
 **In progress (Step 8, continued):**
-- Page-aligned binary search lookup + range queries
-- LS Sign Index, signature verification during scan
+- Integration tests (rotation → index build → lookup → range query)
+- LS Sign Index, signature verification + file integrity protection
 - Snapshots and crash recovery
 
 **Planned:**
+- Adaptive hash table resize (PAHT/PVT/THT capacity check, Arena resize, lazy rehash, backpressure propagation)
 - Rule Engine (configurable chart-of-accounts)
 - TLS (rustls over mio)
 - Deduplication (IdempotencyCheck)

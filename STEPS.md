@@ -83,12 +83,15 @@ Framing, handshake, batch validation, codec.
 - 8-10-1: Index Builder thread infrastructure — mpsc channel, IndexBuilderTask, LS Writer sends task at rotation ✅
 - 8-10-2: LS scan refactoring (PostingScanVisitor trait, scan_ls_postings), two-pass Index Builder (CountingVisitor + PlacingVisitor + compute_offsets), durable structures (AccountIndexRecord 40B, OrdinalIndexEntry 16B, TimestampIndexEntry 16B, IndexFileHeader 64B) ✅
 - 8-10-3: Index file writing — index_writer.rs, per-account sort + batch write .posting-accounts / .ordinal / .timestamp, IndexFileHeader with three magics (LDSTIDXA/LDSTIDXO/LDSTIDXT) ✅
-- 8-10-3-rf: In-memory accumulation — LS Writer накапливает index entries в Arena (mmap+mlock) на hot path (~3ns per posting, zero page fault). При ротации copy Arena→Vec, move через channel в Index Builder. Без scan LS файла при построении индексов. Мотивация: предсказуемый latency на hot path, переиспользование mlock'd памяти между ротациями, устранение 2x sequential read LS при ротации ✅
+- 8-10-3-rf: In-memory accumulation — LS Writer накапливает index entries в Arena (mmap+mlock) на hot path (~3ns per posting, zero page fault). При ротации copy Arena→Vec, move через channel в Index Builder. Без scan LS файла при построении индексов ✅
+- 8-10-3-miri: Miri tests for IndexBufferEntry (Arena-style ptr write/read/copy/reset, 6 tests) and PostingScanVisitor (copy_nonoverlapping unaligned→aligned, 3 tests) ✅
+- 8-10-4a: MmapReader — read-only file mmap (PROT_READ, MAP_PRIVATE, no mlock, OS page cache, MADV_SEQUENTIAL) ✅
+- 8-10-4b: Page-aligned binary search in .posting-accounts — two-level (page-level first/last check → record-level binary search), MmapReader, compare_account_id ✅
+- 8-10-4c: Range queries in .ordinal/.timestamp — lower_bound/upper_bound binary search, generic key_fn (impl Fn, zero-cost), inclusive range [from..to] ✅
 
 ## In Progress
 
 ### Step 8: LS Writer + Persistence (continued) ← current
-- 8-10-4: Page-aligned binary search lookup + range queries
 - 8-10-5: Integration tests (rotation → index build → lookup)
 - 8-10-6: Signature verification during scan + file integrity protection (inotify for tamper detection, chattr+i on rotated files, verify-at-first-open cache, periodic background recheck)
 - 8-10-7: Multi-file routing — manifest-based lookup across multiple LS files (gsn/timestamp ranges in ManifestEntry)
@@ -123,8 +126,18 @@ copy_nonoverlapping, _mm256_load/store, transformers between RBs.
 ### Step 12: Pipeline Scaling
 N_PIPELINE > 1, AtomicU64 GSN, block-based reservation.
 
-### Step 13: PAHT Incremental Resize
-Lazy rehash: new Arena, write to primary, read with migration from secondary. Inactive accounts moved to separate table.
+### Step 13: Adaptive Resize for All Hash Tables ← moved forward, critical fix found by integration tests
+- 13-1: Configuration — initial capacity, max_resize_count, growth_factor per structure in config.yaml (config first, then code)
+- 13-2: Capacity check — PAHT, PVT, THT return Result/bool instead of panic/infinite loop
+- 13-3: Arena resize infrastructure — allocate new Arena, migrate data, free old Arena
+- 13-4: PAHT incremental resize — lazy rehash (primary + secondary Arena, write to primary, read with migration from secondary)
+- 13-5: PVT resize — similar to PAHT (Robin Hood, Arena)
+- 13-6: THT resize — Hopscotch, stable offsets (swap-free rehash, bitmap reset)
+- 13-7: Backpressure propagation — Pipeline → Actor → DM → LS Writer chain on any table overflow
+- 13-8: Integration tests — overflow each structure, verify resize trigger, backpressure, recovery after resize
+- 13-9: Miri tests — verify unsafe correctness during resize (Arena ptr migration, rehash)
+- 13-10: Loom tests — verify concurrent access during PAHT lazy rehash (Actor reads while migration in progress)
+- Inactive accounts: move to separate table {account_id, last_version} — replay protection, PAHT size reduction, cache locality
 
 ### Step 14: Load Testing (Benchmarks)
 - Micro-benchmarks (criterion): Ring Buffer throughput, claim+publish latency, hash table lookup/insert
