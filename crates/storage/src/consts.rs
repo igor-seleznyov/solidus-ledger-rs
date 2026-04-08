@@ -1,4 +1,4 @@
-pub const LS_FILE_PAGE_SIZE: usize = 4096;
+pub const FILE_PAGE_SIZE: usize = 4096;
 pub const SNAPSHOT_RECORD_MAGIC: u64 = 0x5250_4E53_5453_444C;
 
 pub const STORAGE_FILE_TYPE_POSTING: u8 = 1;

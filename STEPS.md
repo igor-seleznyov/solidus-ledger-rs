@@ -8,7 +8,7 @@ Workspace + crates layout.
 ### Step 2: Echo Server
 Single-threaded echo server on mio.
 
-### Step 3: Bo1ss/Worker + SPSC Ring Buffer
+### Step 3: Boss/Worker + SPSC Ring Buffer
 Acceptor thread dispatches connections to Worker threads via SPSC Ring Buffer.
 
 ### Step 4: Binary Protocol

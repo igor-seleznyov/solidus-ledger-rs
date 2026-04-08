@@ -1,6 +1,6 @@
 use crate::meta_record::MetaRecordWriter;
 use crate::ls_meta_file_header::LsMetaFileHeader;
-use crate::consts::LS_FILE_PAGE_SIZE;
+use crate::consts::FILE_PAGE_SIZE;
 use crate::metadata_strategy::MetadataStrategy;
 
 pub struct PostingMetadataStrategy {
@@ -22,7 +22,7 @@ impl PostingMetadataStrategy {
         flush_max_buffer_posting_records: usize,
     ) -> Self {
         let record_writer = MetaRecordWriter::new(record_size);
-        let raw = flush_max_buffer_posting_records * record_size + LS_FILE_PAGE_SIZE;
+        let raw = flush_max_buffer_posting_records * record_size + FILE_PAGE_SIZE;
         let capacity = (raw + 4095) & !4095;
         let arena = ringbuf::arena::Arena::new(capacity)
             .expect("Failed to create posting metadata buffer Arena");
@@ -85,11 +85,11 @@ impl MetadataStrategy for PostingMetadataStrategy {
             std::ptr::copy_nonoverlapping(
                 header_page.as_ptr(),
                 self.meta_buffer_ptr,
-                LS_FILE_PAGE_SIZE,
+                FILE_PAGE_SIZE,
             );
         }
         
-        Some((self.meta_buffer_ptr as *const u8, LS_FILE_PAGE_SIZE, 0))
+        Some((self.meta_buffer_ptr as *const u8, FILE_PAGE_SIZE, 0))
     }
     
     fn on_header_written(&mut self) {

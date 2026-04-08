@@ -1,5 +1,5 @@
 use common::crc32c::crc32c;
-use crate::consts::LS_FILE_PAGE_SIZE;
+use crate::consts::FILE_PAGE_SIZE;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const LS_SIGN_FILE_MAGIC: u64 = 0x4E47_4953_5453_444C;
@@ -88,8 +88,8 @@ impl LsSignFileHeader {
         computed == saved
     }
 
-    pub fn to_page(&self) -> [u8; LS_FILE_PAGE_SIZE] {
-        let mut page = [0u8; LS_FILE_PAGE_SIZE];
+    pub fn to_page(&self) -> [u8; FILE_PAGE_SIZE] {
+        let mut page = [0u8; FILE_PAGE_SIZE];
         let header_bytes = unsafe {
             std::slice::from_raw_parts(
                 self as *const LsSignFileHeader as *const u8,

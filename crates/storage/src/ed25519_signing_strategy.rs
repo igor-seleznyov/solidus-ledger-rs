@@ -2,7 +2,7 @@ use pipeline::posting_record::PostingRecord;
 use crate::signing_state::SigningState;
 use crate::sig_record::SigRecord;
 use crate::ls_sign_file_header::LsSignFileHeader;
-use crate::consts::{LS_FILE_PAGE_SIZE, STORAGE_FILE_TYPE_SIGNATURE};
+use crate::consts::{FILE_PAGE_SIZE, STORAGE_FILE_TYPE_SIGNATURE};
 use crate::signing_strategy::SigningStrategy;
 
 pub struct Ed25519SigningStrategy {
@@ -21,7 +21,7 @@ impl Ed25519SigningStrategy {
         signing_state: SigningState,
         flush_max_buffer_posting_records: usize,
     ) -> Self {
-        let raw = flush_max_buffer_posting_records * SigRecord::SIZE + LS_FILE_PAGE_SIZE;
+        let raw = flush_max_buffer_posting_records * SigRecord::SIZE + FILE_PAGE_SIZE;
         let capacity = (raw + 4095) & !4095;
         let arena = ringbuf::arena::Arena::new(capacity)
             .expect("failed to create signature buffer Arena");
@@ -67,12 +67,12 @@ impl SigningStrategy for Ed25519SigningStrategy {
             std::ptr::copy_nonoverlapping(
                 header_page.as_ptr(),
                 self.sign_buffer_ptr,
-                LS_FILE_PAGE_SIZE,
+                FILE_PAGE_SIZE,
             );
         }
 
         Some(
-            (self.sign_buffer_ptr as *const u8, LS_FILE_PAGE_SIZE, 0)
+            (self.sign_buffer_ptr as *const u8, FILE_PAGE_SIZE, 0)
         )
     }
 
