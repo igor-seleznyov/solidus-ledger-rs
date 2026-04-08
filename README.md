@@ -1,10 +1,35 @@
 # Solidus Ledger
 
-### High-Performance Double-Entry Ledger with Durable Persistence
+> Financial-grade double-entry ledger engine in Rust.  
+> Target: **1,000,000 TPS** · **sub-millisecond p99 latency** · **single node**
 
-Solidus Ledger is a high-performance double-entry ledger with guaranteed durability, designed for financial systems requiring low latency and high throughput. Target: 1,000,000 transactions per second with sub-millisecond latency.
+![Rust](https://img.shields.io/badge/rust-1.85+-orange?logo=rust)
+![License](https://img.shields.io/badge/license-Apache%202.0-blue)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
+![Status](https://img.shields.io/badge/status-active%20development-green)
 
-Primary data is kept in memory for fast access. Every transfer is written to disk before acknowledgment — no data is lost on crash.
+Solidus Ledger is a high-performance financial ledger designed for payment infrastructure
+where correctness and durability are non-negotiable. Every transfer is atomically applied
+and written to disk before acknowledgment — no partial states, no data loss on crash.
+
+Built without async/await. Explicit threads pinned to CPU cores, lock-free ring buffers
+on the hot path, Arena memory (mmap + mlock, zero heap allocations at runtime),
+io_uring for disk writes on Linux.
+
+---
+
+## Why Solidus Ledger
+
+- **Zero allocations on the hot path** — Arena (mmap + mlock) pre-allocated at startup,
+  no GC pressure, no page faults during transaction processing
+- **Durability by design** — every transfer fsynced to disk before the client receives
+  `COMMITTED`; group commit amortizes the cost across batches
+- **Cryptographic audit trail** — Ed25519 signature per transfer, SHA-256 hash chain
+  detects any gap or tampering in the record sequence
+- **Linear scaling** — accounts distributed across partitions, each on a dedicated thread;
+  more partitions = more throughput, no coordination on the hot path
+- **Correctness verified** — unsafe code tested with Miri; lock-free synchronization
+  verified with Loom under exhaustive thread interleaving
 
 ---
 
@@ -219,15 +244,19 @@ Actively developed. See [Implementation Steps](STEPS.md) for the full plan.
 - Two-pass index building: CountingVisitor + PlacingVisitor, durable structures (AccountIndexRecord, OrdinalIndexEntry, TimestampIndexEntry, IndexFileHeader)
 - Index file writing: per-account sort + batch write .posting-accounts / .ordinal / .timestamp
 - In-memory index accumulation: Arena (mmap+mlock) on hot path, zero page fault, copy to Vec at rotation — eliminates LS file scan for index building
-- Miri testing: all hash tables (PAHT, PVT, THT) and ring buffers (SPSC, MPSC) verified for unsafe correctness
+- MmapReader: read-only file mmap for index lookup (PROT_READ, MAP_PRIVATE, OS page cache)
+- Page-aligned binary search: two-level (page-level first/last → record-level) in .posting-accounts
+- Range queries: lower/upper bound binary search in .ordinal/.timestamp
+- Miri testing: all hash tables (PAHT, PVT, THT), ring buffers (SPSC, MPSC), IndexBufferEntry Arena ops, PostingScanVisitor copy_nonoverlapping
 - Loom testing: happens-before correctness verified in C11 abstract memory model with exhaustive interleaving exploration — three-thread transitive chains (Pipeline→Actor→DM, LS Writer→DM→IO), release/acquire barriers, MPSC fetch_add atomicity
 
 **In progress (Step 8, continued):**
-- Page-aligned binary search lookup + range queries
-- LS Sign Index, signature verification during scan
+- Integration tests (rotation → index build → lookup → range query)
+- LS Sign Index, signature verification + file integrity protection
 - Snapshots and crash recovery
 
 **Planned:**
+- Adaptive hash table resize (PAHT/PVT/THT capacity check, Arena resize, lazy rehash, backpressure propagation)
 - Rule Engine (configurable chart-of-accounts)
 - TLS (rustls over mio)
 - Deduplication (IdempotencyCheck)

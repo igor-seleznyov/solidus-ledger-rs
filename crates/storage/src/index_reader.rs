@@ -2,6 +2,8 @@ use crate::account_index_record::AccountIndexRecord;
 use crate::consts::FILE_PAGE_SIZE;
 use crate::index_file_header::{IndexFileHeader, INDEX_MAGIC_ACCOUNTS};
 use crate::mmap_reader::MmapReader;
+use crate::ordinal_index_entry::OrdinalIndexEntry;
+use crate::timestamp_index_entry::TimestampIndexEntry;
 
 const RECORDS_PER_PAGE: usize = FILE_PAGE_SIZE / AccountIndexRecord::SIZE;
 
@@ -167,6 +169,176 @@ fn compare_account_id(
     right_lo: u64,
 ) -> std::cmp::Ordering {
     left_hi.cmp(&right_hi).then(left_lo.cmp(&right_lo))
+}
+
+pub fn query_timestamp_range(
+    timestamp_path: &str,
+    timestamp_file_offset: u64,
+    records_count: u32,
+    from_ns: u64,
+    to_ns: u64,
+) -> Vec<u64> {
+    if records_count == 0 || from_ns > to_ns {
+        return Vec::new();
+    }
+
+    let mmap = match MmapReader::open(timestamp_path) {
+        Ok(mmap) => mmap,
+        Err(_) => return Vec::new(),
+    };
+
+    let offset = timestamp_file_offset as usize;
+    let count = records_count as usize;
+    let section_size = count * TimestampIndexEntry::SIZE;
+
+    if offset + section_size > mmap.size() {
+        return Vec::new();
+    }
+
+    let entries_ptr = unsafe {
+        mmap.as_ptr().add(offset) as *const TimestampIndexEntry
+    };
+
+    let lower = lower_bound_u64(
+        entries_ptr,
+        count,
+        from_ns,
+        |entry| {
+            unsafe { (*entry).timestamp_ns }
+        }
+    );
+
+    let upper = upper_bound_u64(
+        entries_ptr,
+        count,
+        to_ns,
+        |entry| {
+            unsafe { (*entry).timestamp_ns }
+        }
+    );
+
+    if lower >= upper {
+        return Vec::new();
+    }
+
+    let mut result = Vec::with_capacity(upper - lower);
+    for i in lower..upper {
+        let entry = unsafe { &*entries_ptr.add(i) };
+        result.push(entry.ls_offset);
+    }
+
+    result
+}
+
+pub fn query_ordinal_range(
+    ordinal_path: &str,
+    ordinal_file_offset: u64,
+    records_count: u32,
+    from_ordinal: u64,
+    to_ordinal: u64,
+) -> Vec<u64> {
+    if records_count == 0 || from_ordinal > to_ordinal {
+        return Vec::new();
+    }
+
+    let mmap = match MmapReader::open(ordinal_path) {
+        Ok(mmap) => mmap,
+        Err(_) => return Vec::new(),
+    };
+
+    let offset = ordinal_file_offset as usize;
+    let count = records_count as usize;
+    let section_size = count * OrdinalIndexEntry::SIZE;
+
+    if offset + section_size > mmap.size() {
+        return Vec::new();
+    }
+
+    let entries_ptr = unsafe {
+        mmap.as_ptr().add(offset) as *const OrdinalIndexEntry
+    };
+
+    let lower = lower_bound_u64(
+        entries_ptr,
+        count,
+        from_ordinal,
+        |entry| {
+            unsafe { (*entry).ordinal }
+        }
+    );
+
+    let upper = upper_bound_u64(
+        entries_ptr,
+        count,
+        to_ordinal,
+        |entry| {
+            unsafe { (*entry).ordinal }
+        }
+    );
+
+    if lower >= upper {
+        return Vec::new();
+    }
+
+    let mut result = Vec::with_capacity(upper - lower);
+    for i in lower..upper {
+        let entry = unsafe {
+            &*entries_ptr.add(i)
+        };
+        result.push(entry.ls_offset);
+    }
+
+    result
+}
+
+#[inline]
+fn lower_bound_u64<T>(
+    ptr: *const T,
+    count: usize,
+    target: u64,
+    key_fn: impl Fn(*const T) -> u64,
+) -> usize {
+    let mut lo = 0usize;
+    let mut hi = count;
+
+    while lo < hi {
+        let mid = lo + ((hi - lo) >> 1);
+        let value = key_fn(
+            unsafe { ptr.add(mid) }
+        );
+        if value < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    lo
+}
+
+#[inline]
+fn upper_bound_u64<T>(
+    ptr: *const T,
+    count: usize,
+    target: u64,
+    key_fn: impl Fn(*const T) -> u64,
+) -> usize {
+    let mut lo = 0usize;
+    let mut hi = count;
+
+    while lo < hi {
+        let mid = lo + ((hi - lo) >> 1);
+        let value = key_fn(
+            unsafe { ptr.add(mid) }
+        );
+        if value <= target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    lo
 }
 
 #[cfg(test)]
@@ -377,6 +549,328 @@ mod tests {
 
         let result = lookup_account(&path, 0, 1);
         assert!(result.is_none());
+
+        cleanup(&dir);
+    }
+
+    use crate::ordinal_index_entry::OrdinalIndexEntry;
+    use crate::timestamp_index_entry::TimestampIndexEntry;
+    use crate::index_file_header::{INDEX_MAGIC_ORDINAL, INDEX_MAGIC_TIMESTAMP};
+
+    fn write_timestamp_file(path: &str, entries: &Vec<(u64, u64)>) {
+        let mut f = std::fs::File::create(path).unwrap();
+
+        let header = IndexFileHeader::new(
+            INDEX_MAGIC_TIMESTAMP,
+            3,
+            entries.len() as u32,
+            0,
+        );
+        f.write_all(unsafe { header.as_bytes() }).unwrap();
+
+        for &(timestamp_ns, ls_offset) in entries {
+            let entry = TimestampIndexEntry { timestamp_ns, ls_offset };
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &entry as *const TimestampIndexEntry as *const u8,
+                    TimestampIndexEntry::SIZE,
+                )
+            };
+            f.write_all(bytes).unwrap();
+        }
+
+        f.sync_all().unwrap();
+    }
+
+    fn write_ordinal_file(path: &str, entries: &Vec<(u64, u64)>) {
+        let mut f = std::fs::File::create(path).unwrap();
+
+        let header = IndexFileHeader::new(
+            INDEX_MAGIC_ORDINAL,
+            2,
+            entries.len() as u32,
+            0,
+        );
+        f.write_all(unsafe { header.as_bytes() }).unwrap();
+
+        for &(ordinal, ls_offset) in entries {
+            let entry = OrdinalIndexEntry { ordinal, ls_offset };
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &entry as *const OrdinalIndexEntry as *const u8,
+                    OrdinalIndexEntry::SIZE,
+                )
+            };
+            f.write_all(bytes).unwrap();
+        }
+
+        f.sync_all().unwrap();
+    }
+
+    #[test]
+    fn timestamp_range_full() {
+        let dir = make_test_dir("ts-full");
+        let path = format!("{}/test.ls.timestamp", dir);
+
+        write_timestamp_file(&path, &vec![
+            (1000, 4096),
+            (2000, 4224),
+            (3000, 4352),
+            (4000, 4480),
+            (5000, 4608),
+        ]);
+
+        let offsets = query_timestamp_range(
+            &path,
+            IndexFileHeader::SIZE as u64,
+            5,
+            1000,
+            5000,
+        );
+
+        assert_eq!(offsets.len(), 5);
+        assert_eq!(offsets, vec![4096, 4224, 4352, 4480, 4608]);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn timestamp_range_partial() {
+        let dir = make_test_dir("ts-partial");
+        let path = format!("{}/test.ls.timestamp", dir);
+
+        write_timestamp_file(&path, &vec![
+            (1000, 4096),
+            (2000, 4224),
+            (3000, 4352),
+            (4000, 4480),
+            (5000, 4608),
+        ]);
+
+        let offsets = query_timestamp_range(
+            &path,
+            IndexFileHeader::SIZE as u64,
+            5,
+            2000,
+            4000,
+        );
+
+        assert_eq!(offsets.len(), 3);
+        assert_eq!(offsets, vec![4224, 4352, 4480]);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn timestamp_range_single_match() {
+        let dir = make_test_dir("ts-single");
+        let path = format!("{}/test.ls.timestamp", dir);
+
+        write_timestamp_file(&path, &vec![
+            (1000, 4096),
+            (2000, 4224),
+            (3000, 4352),
+        ]);
+
+        let offsets = query_timestamp_range(
+            &path,
+            IndexFileHeader::SIZE as u64,
+            3,
+            2000,
+            2000,
+        );
+
+        assert_eq!(offsets.len(), 1);
+        assert_eq!(offsets[0], 4224);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn timestamp_range_no_match() {
+        let dir = make_test_dir("ts-no-match");
+        let path = format!("{}/test.ls.timestamp", dir);
+
+        write_timestamp_file(&path, &vec![
+            (1000, 4096),
+            (3000, 4224),
+            (5000, 4352),
+        ]);
+
+        let offsets = query_timestamp_range(
+            &path,
+            IndexFileHeader::SIZE as u64,
+            3,
+            1500,
+            2500,
+        );
+
+        assert!(offsets.is_empty());
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn timestamp_range_before_all() {
+        let dir = make_test_dir("ts-before");
+        let path = format!("{}/test.ls.timestamp", dir);
+
+        write_timestamp_file(&path, &vec![
+            (1000, 4096),
+            (2000, 4224),
+        ]);
+
+        let offsets = query_timestamp_range(
+            &path,
+            IndexFileHeader::SIZE as u64,
+            2,
+            100,
+            500,
+        );
+
+        assert!(offsets.is_empty());
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn timestamp_range_after_all() {
+        let dir = make_test_dir("ts-after");
+        let path = format!("{}/test.ls.timestamp", dir);
+
+        write_timestamp_file(&path, &vec![
+            (1000, 4096),
+            (2000, 4224),
+        ]);
+
+        let offsets = query_timestamp_range(
+            &path,
+            IndexFileHeader::SIZE as u64,
+            2,
+            5000,
+            9000,
+        );
+
+        assert!(offsets.is_empty());
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn ordinal_range_full() {
+        let dir = make_test_dir("ord-full");
+        let path = format!("{}/test.ls.ordinal", dir);
+
+        write_ordinal_file(&path, &vec![
+            (0, 4096),
+            (1, 4224),
+            (2, 4352),
+            (3, 4480),
+        ]);
+
+        let offsets = query_ordinal_range(
+            &path,
+            IndexFileHeader::SIZE as u64,
+            4,
+            0,
+            3,
+        );
+
+        assert_eq!(offsets.len(), 4);
+        assert_eq!(offsets, vec![4096, 4224, 4352, 4480]);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn ordinal_range_partial() {
+        let dir = make_test_dir("ord-partial");
+        let path = format!("{}/test.ls.ordinal", dir);
+
+        write_ordinal_file(&path, &vec![
+            (0, 4096),
+            (1, 4224),
+            (2, 4352),
+            (3, 4480),
+            (4, 4608),
+        ]);
+
+        let offsets = query_ordinal_range(
+            &path,
+            IndexFileHeader::SIZE as u64,
+            5,
+            1,
+            3,
+        );
+
+        assert_eq!(offsets.len(), 3);
+        assert_eq!(offsets, vec![4224, 4352, 4480]);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn ordinal_range_empty_count() {
+        let offsets = query_ordinal_range(
+            "/tmp/nonexistent",
+            64,
+            0,
+            0,
+            10,
+        );
+        assert!(offsets.is_empty());
+    }
+
+    #[test]
+    fn ordinal_range_invalid_range() {
+        let offsets = query_ordinal_range(
+            "/tmp/nonexistent",
+            64,
+            5,
+            10,
+            5,
+        );
+        assert!(offsets.is_empty());
+    }
+
+    #[test]
+    fn timestamp_range_nonexistent_file() {
+        let offsets = query_timestamp_range(
+            "/tmp/nonexistent-timestamp",
+            64,
+            5,
+            1000,
+            5000,
+        );
+        assert!(offsets.is_empty());
+    }
+
+    #[test]
+    fn ordinal_range_with_offset_in_file() {
+        let dir = make_test_dir("ord-offset");
+        let path = format!("{}/test.ls.ordinal", dir);
+
+        write_ordinal_file(&path, &vec![
+            (0, 4096),
+            (1, 4224),
+            (2, 4352),
+            (0, 4480),
+            (1, 4608),
+        ]);
+
+        let account_2_offset = IndexFileHeader::SIZE as u64
+            + 3 * OrdinalIndexEntry::SIZE as u64;
+
+        let offsets = query_ordinal_range(
+            &path,
+            account_2_offset,
+            2,
+            0,
+            1,
+        );
+
+        assert_eq!(offsets.len(), 2);
+        assert_eq!(offsets, vec![4480, 4608]);
 
         cleanup(&dir);
     }
