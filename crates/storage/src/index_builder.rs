@@ -10,6 +10,7 @@ pub struct IndexBuilderTask {
     pub file_seq: u64,
     pub shard_id: usize,
     pub signing_enabled: bool,
+    pub metadata_enabled: bool,
     pub entries: Vec<IndexBufferEntry>,
 }
 
@@ -106,6 +107,19 @@ impl IndexBuilder {
     }
 
     fn build_indices(&self, task: &IndexBuilderTask) {
+        if let Err(error) = crate::file_protection::protect_rotated_files(
+            &task.ls_path,
+            task.signing_enabled,
+            task.metadata_enabled,
+            true
+        ) {
+            eprintln!(
+                "[index-builder {}] FATAL: file protection failed for {}: {}. Initiating shutdown.",
+                self.id, task.ls_path, error,
+            );
+            std::process::exit(1);
+        }
+
         println!(
             "[index-builder {}] building indices for {} (file_seq={})",
             self.id, task.ls_path, task.file_seq,

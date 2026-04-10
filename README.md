@@ -247,12 +247,14 @@ Actively developed. See [Implementation Steps](STEPS.md) for the full plan.
 - MmapReader: read-only file mmap for index lookup (PROT_READ, MAP_PRIVATE, OS page cache)
 - Page-aligned binary search: two-level (page-level first/last → record-level) in .posting-accounts
 - Range queries: lower/upper bound binary search in .ordinal/.timestamp
+- IFMH adaptive resize: Vec-based Robin Hood rehash, configurable growth, backpressure on overflow
+- Integration tests: rotation → index build → lookup → range query (real thread, 100 accounts, 180 postings)
 - Miri testing: all hash tables (PAHT, PVT, THT), ring buffers (SPSC, MPSC), IndexBufferEntry Arena ops, PostingScanVisitor copy_nonoverlapping
 - Loom testing: happens-before correctness verified in C11 abstract memory model with exhaustive interleaving exploration — three-thread transitive chains (Pipeline→Actor→DM, LS Writer→DM→IO), release/acquire barriers, MPSC fetch_add atomicity
 
 **In progress (Step 8, continued):**
-- Integration tests (rotation → index build → lookup → range query)
 - LS Sign Index, signature verification + file integrity protection
+- Multi-file routing via manifest
 - Snapshots and crash recovery
 
 **Planned:**

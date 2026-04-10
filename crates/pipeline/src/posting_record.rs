@@ -31,6 +31,32 @@ impl PostingRecord {
     pub fn zeroed() -> Self {
         unsafe { std::mem::zeroed() }
     }
+    
+    pub fn new(
+        transfer_id_hi: u64,
+        transfer_id_lo: u64,
+        gsn: u64,
+    ) -> Self {
+        Self {
+            magic: POSTING_RECORD_MAGIC,
+            transfer_id_hi,
+            transfer_id_lo,
+            gsn,
+            account_id_hi: 0,
+            account_id_lo: 0,
+            amount: 0,
+            ordinal: 0,
+            prev_posting_record_offset: 0,
+            timestamp_ns: 0,
+            transfer_sequence_id: [0u8; 16],
+            currency: [0u8; 16],
+            entry_type: 0,
+            sign: 0,
+            transfer_posting_records_count: 0,
+            _pad: [0u8; 9],
+            checksum: 0,
+        }
+    }
 
     pub unsafe fn compute_checksum(&mut self) {
         self.checksum = 0;
