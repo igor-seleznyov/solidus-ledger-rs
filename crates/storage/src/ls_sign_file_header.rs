@@ -1,6 +1,7 @@
 use common::crc32c::crc32c;
 use crate::consts::FILE_PAGE_SIZE;
 use std::time::{SystemTime, UNIX_EPOCH};
+use crate::sig_record::SigRecord;
 
 pub const LS_SIGN_FILE_MAGIC: u64 = 0x4E47_4953_5453_444C;
 pub const LS_SIGN_FORMAT_VERSION: u16 = 1;
@@ -104,6 +105,24 @@ impl LsSignFileHeader {
         assert!(bytes.len() >= Self::SIZE);
         unsafe {
             &*(bytes.as_ptr() as *const LsSignFileHeader)
+        }
+    }
+    
+    pub unsafe fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self as *mut LsSignFileHeader as *mut u8,
+                Self::SIZE
+            )
+        }
+    }
+
+    pub unsafe fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self as *const LsSignFileHeader as *const u8,
+                Self::SIZE,
+            )
         }
     }
 

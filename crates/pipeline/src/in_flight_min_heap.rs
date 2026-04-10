@@ -8,6 +8,11 @@ pub struct InFlightMinHeap {
     index_count: usize,
     seed_k0: u64,
     seed_k1: u64,
+    max_resize_count: u32,
+    growth_factor: usize,
+    load_factor_threshold_num: usize,
+    load_factor_threshold_den: usize,
+    resize_count: u32,
     last_removed_gsn: u64,
 }
 
@@ -28,8 +33,15 @@ impl IndexSlot {
 }
 
 impl InFlightMinHeap {
-    pub fn new(index_capacity: usize, seed_k0: u64, seed_k1: u64) -> Self {
+    pub fn new(
+        index_capacity: usize,
+        seed_k0: u64,
+        seed_k1: u64,
+        max_resize_count: u32,
+        growth_factor: usize,
+    ) -> Self {
         assert!(index_capacity.is_power_of_two());
+        assert!(growth_factor == 2 || growth_factor == 4, "growth_factor must be 2 or 4");
 
         let index_slots = vec![IndexSlot::zeroed(); index_capacity];
 
@@ -40,6 +52,11 @@ impl InFlightMinHeap {
             index_count: 0,
             seed_k0,
             seed_k1,
+            max_resize_count,
+            growth_factor,
+            load_factor_threshold_num: 3,
+            load_factor_threshold_den: 4,
+            resize_count: 0,
             last_removed_gsn: 0,
         }
     }
@@ -60,11 +77,79 @@ impl InFlightMinHeap {
         self.last_removed_gsn
     }
 
-    pub fn add(&mut self, gsn: u64) {
+    pub fn add(&mut self, gsn: u64) -> bool {
+        let capacity = self.index_slots.len();
+        if self.index_count * self.load_factor_threshold_den >= capacity * self.load_factor_threshold_num {
+            if !self.try_resize() {
+                return false;
+            }
+        }
+
         let pos = self.heap.len();
         self.heap.push(gsn);
         let final_pos = self.sift_up(pos);
         self.index_insert(gsn, final_pos as u32);
+        true
+    }
+
+    fn try_resize(&mut self) -> bool {
+        if self.max_resize_count > 0 && self.resize_count >= self.max_resize_count {
+            return false;
+        }
+
+        let old_capacity = self.index_slots.len();
+        let new_capacity = old_capacity * self.growth_factor;
+
+        let mut new_slots = vec![IndexSlot::zeroed(); new_capacity];
+        let new_mask = new_capacity - 1;
+
+        for i in 0..old_capacity {
+            let slot = &self.index_slots[i];
+            if slot.status == SLOT_OCCUPIED {
+                let mut pos = siphash13(
+                    self.seed_k0,
+                    self.seed_k1,
+                    slot.gsn,
+                    0,
+                ) as usize & new_mask;
+                let mut psl: u8 = 1;
+                let mut inserting = IndexSlot {
+                    gsn: slot.gsn,
+                    heap_pos: slot.heap_pos,
+                    psl: 1,
+                    status: SLOT_OCCUPIED,
+                    _pad: [0; 2],
+                };
+
+                loop {
+                    let target = &mut new_slots[pos];
+                    if target.status == SLOT_FREE {
+                        *target = inserting;
+                        break;
+                    }
+                    if target.psl < psl {
+                        std::mem::swap(target, &mut inserting);
+                        psl = inserting.psl;
+                    }
+                    pos = (pos + 1) & new_mask;
+                    psl += 1;
+                    inserting.psl = psl;
+                }
+            }
+        }
+
+        self.index_slots = new_slots;
+        self.index_mask = new_mask;
+        self.resize_count += 1;
+
+        println!(
+            "[IFMH] resized: {} -> {} (resize #{}/{})",
+            old_capacity, new_capacity,
+            self.resize_count,
+            if self.max_resize_count == 0 { "∞".to_string() } else { self.max_resize_count.to_string() },
+        );
+
+        true
     }
 
     fn sift_up(&mut self, mut pos: usize) -> usize {
@@ -251,7 +336,7 @@ mod tests {
 
     #[test]
     fn empty_heap() {
-        let ifmh = InFlightMinHeap::new(64, K0, K1);
+        let ifmh = InFlightMinHeap::new(64, K0, K1, 4, 2);
         assert!(ifmh.is_empty());
         assert_eq!(ifmh.len(), 0);
         assert_eq!(ifmh.min(), None);
@@ -260,7 +345,7 @@ mod tests {
 
     #[test]
     fn add_single() {
-        let mut ifmh = InFlightMinHeap::new(64, K0, K1);
+        let mut ifmh = InFlightMinHeap::new(64, K0, K1, 4, 2);
         ifmh.add(100);
         assert_eq!(ifmh.len(), 1);
         assert_eq!(ifmh.min(), Some(100));
@@ -268,7 +353,7 @@ mod tests {
 
     #[test]
     fn add_ascending_min_is_first() {
-        let mut ifmh = InFlightMinHeap::new(64, K0, K1);
+        let mut ifmh = InFlightMinHeap::new(64, K0, K1, 4, 2);
         ifmh.add(100);
         ifmh.add(200);
         ifmh.add(300);
@@ -278,7 +363,7 @@ mod tests {
 
     #[test]
     fn add_descending_min_is_smallest() {
-        let mut ifmh = InFlightMinHeap::new(64, K0, K1);
+        let mut ifmh = InFlightMinHeap::new(64, K0, K1, 4, 2);
         ifmh.add(300);
         ifmh.add(200);
         ifmh.add(100);
@@ -287,7 +372,7 @@ mod tests {
 
     #[test]
     fn remove_min_advances() {
-        let mut ifmh = InFlightMinHeap::new(64, K0, K1);
+        let mut ifmh = InFlightMinHeap::new(64, K0, K1, 4, 2);
         ifmh.add(100);
         ifmh.add(200);
         ifmh.add(300);
@@ -299,7 +384,7 @@ mod tests {
 
     #[test]
     fn remove_middle() {
-        let mut ifmh = InFlightMinHeap::new(64, K0, K1);
+        let mut ifmh = InFlightMinHeap::new(64, K0, K1, 4, 2);
         ifmh.add(100);
         ifmh.add(200);
         ifmh.add(300);
@@ -311,7 +396,7 @@ mod tests {
 
     #[test]
     fn remove_all_heap_empty() {
-        let mut ifmh = InFlightMinHeap::new(64, K0, K1);
+        let mut ifmh = InFlightMinHeap::new(64, K0, K1, 4, 2);
         ifmh.add(100);
         ifmh.add(200);
 
@@ -325,7 +410,7 @@ mod tests {
 
     #[test]
     fn remove_out_of_order() {
-        let mut ifmh = InFlightMinHeap::new(64, K0, K1);
+        let mut ifmh = InFlightMinHeap::new(64, K0, K1, 4, 2);
         for gsn in 1..=10u64 {
             ifmh.add(gsn * 100);
         }
@@ -343,7 +428,7 @@ mod tests {
 
     #[test]
     fn committed_gsn_calculation() {
-        let mut ifmh = InFlightMinHeap::new(64, K0, K1);
+        let mut ifmh = InFlightMinHeap::new(64, K0, K1, 4, 2);
         ifmh.add(100);
         ifmh.add(200);
         ifmh.add(300);
@@ -363,7 +448,7 @@ mod tests {
 
     #[test]
     fn remove_nonexistent_is_noop() {
-        let mut ifmh = InFlightMinHeap::new(64, K0, K1);
+        let mut ifmh = InFlightMinHeap::new(64, K0, K1, 4, 2);
         ifmh.add(100);
         ifmh.remove(999);
         assert_eq!(ifmh.len(), 1);
@@ -372,7 +457,7 @@ mod tests {
 
     #[test]
     fn large_heap() {
-        let mut ifmh = InFlightMinHeap::new(1024, K0, K1);
+        let mut ifmh = InFlightMinHeap::new(1024, K0, K1, 4, 2);
 
         for gsn in 1..=500u64 {
             ifmh.add(gsn);
@@ -392,7 +477,7 @@ mod tests {
 
     #[test]
     fn heap_property_maintained() {
-        let mut ifmh = InFlightMinHeap::new(256, K0, K1);
+        let mut ifmh = InFlightMinHeap::new(256, K0, K1, 4, 2);
 
         for gsn in (1..=100u64).rev() {
             ifmh.add(gsn);
@@ -403,5 +488,119 @@ mod tests {
             ifmh.remove(expected_min);
         }
         assert!(ifmh.is_empty());
+    }
+
+    #[test]
+    fn resize_doubles_capacity() {
+        let mut heap = InFlightMinHeap::new(8, K0, K1, 4, 2);
+
+        for i in 1..=6u64 {
+            assert!(heap.add(i));
+        }
+
+        for i in 7..=12u64 {
+            assert!(heap.add(i));
+        }
+
+        assert_eq!(heap.len(), 12);
+        assert_eq!(heap.min(), Some(1));
+    }
+
+    #[test]
+    fn resize_preserves_min_heap_order() {
+        let mut heap = InFlightMinHeap::new(8, K0, K1, 4, 2);
+
+        for i in (1..=10u64).rev() {
+            assert!(heap.add(i));
+        }
+
+        assert_eq!(heap.min(), Some(1));
+
+        for expected in 1..=10u64 {
+            assert_eq!(heap.min(), Some(expected));
+            heap.remove(expected);
+        }
+
+        assert!(heap.is_empty());
+    }
+
+    #[test]
+    fn resize_preserves_index_lookup() {
+        let mut heap = InFlightMinHeap::new(8, K0, K1, 4, 2);
+
+        for i in 1..=20u64 {
+            assert!(heap.add(i));
+        }
+
+        heap.remove(5);
+        heap.remove(15);
+        heap.remove(10);
+
+        assert_eq!(heap.len(), 17);
+        assert_eq!(heap.min(), Some(1));
+    }
+
+    #[test]
+    fn backpressure_when_max_resize_reached() {
+        let mut heap = InFlightMinHeap::new(4, K0, K1, 1, 2);
+
+        for i in 1..=3u64 {
+            assert!(heap.add(i), "Failed to add {}", i);
+        }
+
+        assert!(heap.add(4));
+
+        assert!(heap.add(5));
+        assert!(heap.add(6));
+
+        assert!(!heap.add(7));
+
+        assert_eq!(heap.len(), 6);
+    }
+
+    #[test]
+    fn unlimited_resize() {
+        let mut heap = InFlightMinHeap::new(4, K0, K1, 0, 2);
+
+        for i in 1..=1000u64 {
+            assert!(heap.add(i), "Backpressure at {}", i);
+        }
+
+        assert_eq!(heap.len(), 1000);
+        assert_eq!(heap.min(), Some(1));
+    }
+
+    #[test]
+    fn growth_factor_4() {
+        let mut heap = InFlightMinHeap::new(4, K0, K1, 2, 4);
+
+        for i in 1..=12u64 {
+            assert!(heap.add(i));
+        }
+
+        assert_eq!(heap.len(), 12);
+        assert_eq!(heap.min(), Some(1));
+    }
+
+    #[test]
+    fn add_remove_after_resize() {
+        let mut heap = InFlightMinHeap::new(8, K0, K1, 4, 2);
+
+        for i in 1..=10u64 {
+            heap.add(i);
+        }
+
+        for i in 1..=10u64 {
+            heap.remove(i);
+        }
+
+        assert!(heap.is_empty());
+        assert_eq!(heap.last_removed_gsn(), 10);
+
+        for i in 100..=110u64 {
+            assert!(heap.add(i));
+        }
+
+        assert_eq!(heap.min(), Some(100));
     }
 }

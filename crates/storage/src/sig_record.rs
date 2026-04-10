@@ -55,6 +55,15 @@ impl SigRecord {
     pub fn verify_magic(&self) -> bool {
         self.magic == SIG_RECORD_MAGIC
     }
+
+    pub unsafe fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self as *const SigRecord as *const u8,
+                Self::SIZE,
+            )
+        }
+    }
 }
 
 #[cfg(test)]

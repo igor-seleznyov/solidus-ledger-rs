@@ -169,6 +169,8 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
                 in_flight_min_heap_capacity,
                 in_flight_min_heap_seed_k0,
                 in_flight_min_heap_seed_k1,
+                4,
+                2,
             ),
             batch_size,
             buffer_arena,
@@ -408,7 +410,12 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
     pub fn process_message(&mut self, slot: &LsWriterSlot) {
         match slot.msg_type {
             LS_MSG_ADD_TO_HEAP => {
-                self.in_flight_min_heap.add(slot.gsn);
+                if !self.in_flight_min_heap.add(slot.gsn) {
+                    println!(
+                        "[ls-writer {}] WARNING: IFMH backpressure, GSN={}",
+                        self.id, slot.gsn,
+                    );
+                }
             }
             LS_MSG_REMOVE_FROM_HEAP => {
                 self.in_flight_min_heap.remove(slot.gsn);
@@ -849,6 +856,7 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
             file_seq: self.file_seq,
             shard_id: self.id,
             signing_enabled: self.signing_strategy.is_enabled(),
+            metadata_enabled: self.metadata_strategy.is_enabled(),
             entries,
         };
 
@@ -2697,6 +2705,7 @@ mod tests {
         assert_eq!(task.file_seq, 0);
         assert_eq!(task.shard_id, 0);
         assert!(!task.signing_enabled);
+        assert!(!task.metadata_enabled);
         assert_eq!(task.entries.len(), 1);
 
         assert_eq!(writer.index_entries_len, 0);

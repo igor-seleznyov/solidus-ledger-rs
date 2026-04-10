@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
-use pipeline::posting_record::PostingRecord;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
 use storage::ls_writer::LsWriter;
 use storage::ls_writer_slot::*;
@@ -16,7 +14,10 @@ use storage::index_reader::{lookup_account, query_timestamp_range, query_ordinal
 use storage::index_file_header::IndexFileHeader;
 use storage::ordinal_index_entry::OrdinalIndexEntry;
 use storage::timestamp_index_entry::TimestampIndexEntry;
-use storage::ls_file_header::LsFileHeader;
+use std::collections::HashMap;
+use storage::index_builder::AccountMeta;
+use storage::index_writer::write_index_files;
+
 
 const K0: u64 = 0x0123456789ABCDEF;
 const K1: u64 = 0xFEDCBA9876543210;
@@ -146,10 +147,6 @@ fn write_flush_rotate_build(
     let builder_rx_dummy = mpsc::channel::<IndexBuilderTask>();
     let builder = IndexBuilder::new(0, builder_rx_dummy.1);
     {
-        use std::collections::HashMap;
-        use storage::index_builder::AccountMeta;
-        use storage::index_writer::write_index_files;
-
         if !task.entries.is_empty() {
             let total_count = task.entries.len();
 
@@ -461,7 +458,7 @@ fn account_not_found_after_rotation() {
 fn index_builder_thread_builds_files() {
     let dir = make_temp_dir("real-thread");
     let (index_tx, index_rx) = mpsc::channel();
-    let mut writer = make_writer(&dir, 8192, index_tx);
+    let mut writer = make_writer(&dir, 1024 * 1024, index_tx);
 
     let builder_handle = thread::spawn(move || {
         let builder = IndexBuilder::new(0, index_rx);

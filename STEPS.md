@@ -88,6 +88,8 @@ Framing, handshake, batch validation, codec.
 - 8-10-4a: MmapReader — read-only file mmap (PROT_READ, MAP_PRIVATE, no mlock, OS page cache, MADV_SEQUENTIAL) ✅
 - 8-10-4b: Page-aligned binary search in .posting-accounts — two-level (page-level first/last check → record-level binary search), MmapReader, compare_account_id ✅
 - 8-10-4c: Range queries in .ordinal/.timestamp — lower_bound/upper_bound binary search, generic key_fn (impl Fn, zero-cost), inclusive range [from..to] ✅
+- 8-10-5-fix-ifmh: IFMH adaptive resize (Vec-based Robin Hood rehash, configurable max_resize_count + growth_factor, backpressure on overflow) ✅
+- 8-10-5: Integration tests — rotation → index build → lookup → range query, real Index Builder thread, 100 accounts, 180 postings across 3 accounts ✅
 
 ## In Progress
 
@@ -126,7 +128,7 @@ copy_nonoverlapping, _mm256_load/store, transformers between RBs.
 ### Step 12: Pipeline Scaling
 N_PIPELINE > 1, AtomicU64 GSN, block-based reservation.
 
-### Step 13: Adaptive Resize for All Hash Tables ← moved forward, critical fix found by integration tests
+### Step 13: Adaptive Resize for All Hash Tables
 - 13-1: Configuration — initial capacity, max_resize_count, growth_factor per structure in config.yaml (config first, then code)
 - 13-2: Capacity check — PAHT, PVT, THT return Result/bool instead of panic/infinite loop
 - 13-3: Arena resize infrastructure — allocate new Arena, migrate data, free old Arena
@@ -138,6 +140,12 @@ N_PIPELINE > 1, AtomicU64 GSN, block-based reservation.
 - 13-9: Miri tests — verify unsafe correctness during resize (Arena ptr migration, rehash)
 - 13-10: Loom tests — verify concurrent access during PAHT lazy rehash (Actor reads while migration in progress)
 - Inactive accounts: move to separate table {account_id, last_version} — replay protection, PAHT size reduction, cache locality
+
+### Step 13-rf: Codebase Refactoring
+- Large file decomposition: ls_writer.rs (2800+ lines), main.rs → modules/subpackages
+- Constructors with parameters for frequently created structs (PostingRecord, LsWriterSlot) — eliminate zeroed() + field assignment
+- Hot path audit: redundant operations, intermediate instances, unnecessary copies
+- Storage crate reorganization: backend/, headers/, manifest/, strategy/, writer/, records/
 
 ### Step 14: Load Testing (Benchmarks)
 - Micro-benchmarks (criterion): Ring Buffer throughput, claim+publish latency, hash table lookup/insert

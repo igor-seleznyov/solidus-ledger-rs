@@ -37,3 +37,6 @@ pub mod index_file_header;
 pub mod index_writer;
 pub mod mmap_reader;
 pub mod index_reader;
+pub mod signature_verifier;
+pub mod signature_verification_cache;
+pub mod file_protection;
