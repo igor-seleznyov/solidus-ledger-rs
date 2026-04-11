@@ -1,4 +1,3 @@
-use std::ops::Index;
 use std::sync::Arc;
 use std::thread;
 use std::sync::mpsc;
@@ -34,6 +33,7 @@ use storage::manifest::Manifest;
 use storage::signing_strategy::SigningStrategy;
 use storage::metadata_strategy::MetadataStrategy;
 use storage::index_builder::{IndexBuilder, IndexBuilderTask};
+use storage::file_watcher::{FileWatcher, FileWatcherMessage, FileWatcherSender};
 
 fn main() {
     let config = Config::load("config.yaml").expect("Failed to load config");
@@ -246,13 +246,34 @@ fn main() {
 
     println!("[main] {} partition actor threads started", partitions_count);
 
+    let file_watcher_sender: Option<FileWatcherSender> = if config.storage.file_protection.watch_enabled {
+        let (tx, rx) = mpsc::channel::<FileWatcherMessage>();
+        let watch_dir = config.storage.current_files_directory.clone();
+
+        let (mut watcher, waker) = FileWatcher::new(0, rx, watch_dir)
+            .expect("Failed to create file watcher");
+
+        thread::Builder::new()
+            .name("file-watcher".to_string())
+            .spawn(
+                move || {
+                    watcher.run();
+                }
+            ).expect("[main] Failed to spawn file-watcher thread");
+
+        println!("[main] file watcher thread started");
+        Some(FileWatcherSender::new(tx, waker))
+    } else {
+        None
+    };
+
     let (index_builder_tx, index_builder_rx) = mpsc::channel::<IndexBuilderTask>();
 
     thread::Builder::new()
         .name("index-builder".to_string())
         .spawn(
             move || {
-                let builder = IndexBuilder::new(0, index_builder_rx);
+                let builder = IndexBuilder::new(0, index_builder_rx, file_watcher_sender);
                 builder.run();
             }
         ).expect("[main] Failed to spawn index-builder thread");
@@ -313,6 +334,7 @@ fn main() {
         let signing_enabled = config.storage.signing_enabled;
         let metadata_enabled = config.storage.posting_metadata.enabled;
         let metadata_record_size = config.storage.posting_metadata.record_size;
+        let immutable_enabled = config.storage.file_protection.immutable_enabled;
         
         let checkpoint_prealloc_multiplier = config.storage.checkpoint_prealloc_multiplier;
 
@@ -329,6 +351,7 @@ fn main() {
                     signing_enabled, metadata_enabled, metadata_record_size,
                     checkpoint_prealloc_multiplier,
                     rules_checksum, manifest,
+                    immutable_enabled,
                     index_builder_tx.clone(),
                 );
             }
@@ -344,6 +367,7 @@ fn main() {
                     signing_enabled, metadata_enabled, metadata_record_size,
                     checkpoint_prealloc_multiplier,
                     rules_checksum, manifest,
+                    immutable_enabled,
                     index_builder_tx.clone(),
                 );
             }
@@ -361,6 +385,7 @@ fn main() {
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 signing_enabled, metadata_enabled, metadata_record_size,
                 rules_checksum, manifest,
+                immutable_enabled,
                 index_builder_tx.clone(),
             );
         }
@@ -411,6 +436,7 @@ fn spawn_ls_writer_thread<T, S, M>(
     checkpoint_prealloc_multiplier: usize,
     rules_checksum: u32,
     manifest: Manifest,
+    immutable_enabled: bool,
     index_builder_tx: mpsc::Sender<IndexBuilderTask>,
 ) where
     T: FlushBackend + Send + 'static,
@@ -440,6 +466,7 @@ fn spawn_ls_writer_thread<T, S, M>(
                     checkpoint_prealloc_multiplier,
                     rules_checksum,
                     manifest,
+                    immutable_enabled,
                     index_builder_tx,
                 );
                 writer.run();
@@ -464,6 +491,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
     checkpoint_prealloc_multiplier: usize,
     rules_checksum: u32,
     manifest: Manifest,
+    immutable_enabled: bool,
     index_builder_tx: mpsc::Sender<IndexBuilderTask>,
 ) {
     if signing_enabled {
@@ -483,6 +511,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
                 rules_checksum, manifest,
+                immutable_enabled,
                 index_builder_tx,
             );
         } else {
@@ -493,6 +522,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
                 rules_checksum, manifest,
+                immutable_enabled,
                 index_builder_tx,
             );
         }
@@ -506,6 +536,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
                 rules_checksum, manifest,
+                immutable_enabled,
                 index_builder_tx,
             );
         } else {
@@ -516,6 +547,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
                 flush_timeout_ms, flush_max_buffer, partition_count,
                 checkpoint_prealloc_multiplier,
                 rules_checksum, manifest,
+                immutable_enabled,
                 index_builder_tx
             );
         }

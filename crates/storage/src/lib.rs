@@ -40,3 +40,4 @@ pub mod index_reader;
 pub mod signature_verifier;
 pub mod signature_verification_cache;
 pub mod file_protection;
+pub mod file_watcher;

@@ -73,6 +73,7 @@ fn make_writer(
         4,
         0,
         manifest,
+        false,
         index_tx,
     );
     writer.startup();
@@ -145,7 +146,7 @@ fn write_flush_rotate_build(
     let task = index_rx.recv().expect("Expected index builder task");
 
     let builder_rx_dummy = mpsc::channel::<IndexBuilderTask>();
-    let builder = IndexBuilder::new(0, builder_rx_dummy.1);
+    let builder = IndexBuilder::new(0, builder_rx_dummy.1, None);
     {
         if !task.entries.is_empty() {
             let total_count = task.entries.len();
@@ -461,7 +462,7 @@ fn index_builder_thread_builds_files() {
     let mut writer = make_writer(&dir, 1024 * 1024, index_tx);
 
     let builder_handle = thread::spawn(move || {
-        let builder = IndexBuilder::new(0, index_rx);
+        let builder = IndexBuilder::new(0, index_rx, None);
         builder.run();
     });
 

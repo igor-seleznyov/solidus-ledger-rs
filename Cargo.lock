@@ -680,6 +680,7 @@ dependencies = [
  "ed25519-dalek",
  "io-uring",
  "libc",
+ "mio",
  "pipeline",
  "ringbuf",
  "sha2",

@@ -68,6 +68,7 @@ fn make_writer(
         4,
         0,
         manifest,
+        false,
         index_tx,
     );
     writer.startup();
@@ -115,6 +116,7 @@ fn make_writer_with_signing(
         4,
         0,
         manifest,
+        false,
         index_tx,
     );
     writer.startup();
@@ -160,6 +162,7 @@ fn make_writer_with_metadata(
         4,
         0,
         manifest,
+        false,
         index_tx,
     );
     writer.startup();
