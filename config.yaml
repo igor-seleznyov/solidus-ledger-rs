@@ -42,10 +42,11 @@ storage:
   posting-metadata:
     enabled: false
     record-size: 256
-  default-checkpoint-prealloc-multiplier: 4
+  checkpoint-prealloc-multiplier: 4
   in-flight-min-heap:
     initial-capacity: 1024
     max-resize-count: 4
     growth-factor: 2
   file-protection:
     immutable-enabled: true
+    watch-enabled: true

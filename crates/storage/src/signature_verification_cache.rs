@@ -14,7 +14,7 @@ struct CacheEntry {
 impl SignatureVerificationCache {
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: HashMap::new()
         }
     }
 

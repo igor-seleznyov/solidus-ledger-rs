@@ -84,6 +84,7 @@ pub struct LsWriter<T: FlushBackend, S: SigningStrategy, M: MetadataStrategy> {
 
     manifest: Manifest,
     rules_checksum: u32,
+    immutable_enabled: bool,
 
     current_gsn_min: u64,
     current_timestamp_min_ns: u64,
@@ -128,6 +129,7 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         checkpoint_prealloc_multiplier: usize,
         rules_checksum: u32,
         manifest: Manifest,
+        immutable_enables: bool,
         index_builder_tx: Sender<IndexBuilderTask>,
     ) -> Self {
         let flush_max_buffer_bytes = flush_max_buffer_posting_records * PostingRecord::SIZE;
@@ -214,6 +216,7 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
             ),
             manifest,
             rules_checksum,
+            immutable_enabled: immutable_enables,
             current_gsn_min: 0,
             current_timestamp_min_ns: 0,
             buffered_gsn_max: 0,
@@ -857,6 +860,7 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
             shard_id: self.id,
             signing_enabled: self.signing_strategy.is_enabled(),
             metadata_enabled: self.metadata_strategy.is_enabled(),
+            immutable_enabled: self.immutable_enabled,
             entries,
         };
 
@@ -1157,6 +1161,7 @@ mod tests {
             4,
             0,
             manifest,
+            false,
             index_tx,
         );
         writer.startup();
@@ -1201,6 +1206,7 @@ mod tests {
             4,
             0,
             manifest,
+            false,
             index_tx,
         );
         writer.startup();
@@ -1249,6 +1255,7 @@ mod tests {
             4,
             0,
             manifest,
+            false,
             index_tx,
         );
         writer.startup();
@@ -1334,6 +1341,7 @@ mod tests {
             4,
             0,
             manifest,
+            false,
             index_tx,
         );
         writer.startup();
@@ -1380,6 +1388,7 @@ mod tests {
             4,
             0,
             manifest,
+            false,
             index_tx,
         );
         writer.startup();
@@ -2198,7 +2207,7 @@ mod tests {
             0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
             dir.to_string(), 1024 * 1024, 64, K0, K1, 64, 2, 512, 16, 4,
-            0, manifest, index_tx,
+            0, manifest, false,index_tx,
         );
         writer.startup();
 
@@ -2234,7 +2243,7 @@ mod tests {
             0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
             dir.to_string(), 1024 * 1024, 64, K0, K1, 64, 2, 512, 16, 4,
-            0, manifest, index_tx,
+            0, manifest, false, index_tx,
         );
         writer.startup();
 
@@ -2285,7 +2294,7 @@ mod tests {
             0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
             dir.to_string(), 1024, 64, K0, K1, 64, 2, 512, 16, 4,
-            0, manifest, index_tx,
+            0, manifest, false, index_tx,
         );
         writer.startup();
 
@@ -2586,7 +2595,7 @@ mod tests {
                 PortableFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
                 dir.to_string(), 1024 * 1024, 64, K0, K1,
                 64, 2, 512, 16,
-                4, 0, manifest, index_tx,
+                4, 0, manifest, false, index_tx,
             );
             writer.startup();
 
@@ -2630,7 +2639,7 @@ mod tests {
                 PortableFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
                 dir.to_string(), 1024 * 1024, 64, K0, K1,
                 64, 2, 512, 16, 4, 0,
-                manifest, index_tx,
+                manifest, false, index_tx,
             );
             writer.startup();
 
@@ -2691,7 +2700,7 @@ mod tests {
             0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
             dir.to_string(), 4096, 64, K0, K1, 64, 2, 512, 16, 4,
-            0, manifest, index_tx,
+            0, manifest, false, index_tx,
         );
         writer.startup();
 
@@ -2706,6 +2715,7 @@ mod tests {
         assert_eq!(task.shard_id, 0);
         assert!(!task.signing_enabled);
         assert!(!task.metadata_enabled);
+        assert!(!task.immutable_enabled);
         assert_eq!(task.entries.len(), 1);
 
         assert_eq!(writer.index_entries_len, 0);

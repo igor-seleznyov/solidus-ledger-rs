@@ -85,6 +85,8 @@ pub struct StorageConfig {
     pub posting_metadata: PostingMetadata,
     #[serde(default = "default_checkpoint_prealloc_multiplier")]
     pub checkpoint_prealloc_multiplier: usize,
+    pub in_flight_min_heap: StorageInFlightMinHeap,
+    pub file_protection: StorageFileProtection,
 }
 
 fn default_checkpoint_prealloc_multiplier() -> usize { 4 }
@@ -94,6 +96,21 @@ fn default_checkpoint_prealloc_multiplier() -> usize { 4 }
 pub struct PostingMetadata {
     pub enabled: bool,
     pub record_size: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct StorageInFlightMinHeap {
+    pub initial_capacity:  usize,
+    pub max_resize_count: u16,
+    pub growth_factor: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct StorageFileProtection {
+    pub immutable_enabled: bool,
+    pub watch_enabled: bool,
 }
 
 impl Config {
@@ -126,8 +143,8 @@ impl Config {
         if !self.decision_maker.coordinator_rb_capacity.is_power_of_two() {
             return Err("decision-maker.coordinator-rb-capacity must be a power of two".into());
         }
-        if self.decision_maker.coordinator_rb_batch_size == 0 {
-            return Err("decision-maker.coordinator-rb-batch-size must be > 0".into());
+        if self.decision_maker.coordinator_rb_batch_size < 2 {
+            return Err("decision-maker.coordinator-rb-batch-size must be >= 2".into());
         }
         if self.decision_maker.coordinator_rb_batch_size > self.decision_maker.coordinator_rb_capacity {
             return Err("decision-maker.coordinator-rb-batch-size must be <= coordinator-rb-capacity".into());
@@ -191,6 +208,12 @@ impl Config {
         }
         if self.storage.checkpoint_prealloc_multiplier < 1 {
             return Err("storage.checkpoint_prealloc_multiplier must be equals or greater than 1".into());
+        }
+        if self.storage.in_flight_min_heap.initial_capacity <= 0 {
+            return Err("storage.in-flight-min-heap.initial-capacity must be > 0".into());
+        }
+        if !self.storage.in_flight_min_heap.initial_capacity.is_power_of_two() {
+            return Err("storage.in-flight-min-heap.initial-capacity must be a power of two".into());
         }
         if let Some(ref path) = self.partitions.accounts_assignment_overrides_path {
             if path.is_empty() {
@@ -281,6 +304,13 @@ storage:
     enabled: true
     record-size: 256
   checkpoint-prealloc-multiplier: 4
+  in-flight-min-heap:
+    initial-capacity: 1024
+    max-resize-count: 4
+    growth-factor: 2
+  file-protection:
+    immutable-enabled: true
+    watch-enabled: true
  ";
 
     #[test]
@@ -313,6 +343,11 @@ storage:
         assert!(config.storage.posting_metadata.enabled);
         assert_eq!(config.storage.posting_metadata.record_size, 256);
         assert_eq!(config.storage.checkpoint_prealloc_multiplier, 4);
+        assert_eq!(config.storage.in_flight_min_heap.initial_capacity, 1024);
+        assert_eq!(config.storage.in_flight_min_heap.max_resize_count, 4);
+        assert_eq!(config.storage.in_flight_min_heap.growth_factor, 2);
+        assert!(config.storage.file_protection.immutable_enabled);
+        assert!(config.storage.file_protection.watch_enabled);
     }
 
     #[test]

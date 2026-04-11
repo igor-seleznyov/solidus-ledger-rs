@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 use crate::account_index_record::AccountIndexRecord;
+use crate::file_watcher::{FileWatcherMessage, FileWatcherSender};
 use crate::index_file_header::IndexFileHeader;
 use crate::ordinal_index_entry::OrdinalIndexEntry;
 use crate::timestamp_index_entry::TimestampIndexEntry;
@@ -11,6 +12,7 @@ pub struct IndexBuilderTask {
     pub shard_id: usize,
     pub signing_enabled: bool,
     pub metadata_enabled: bool,
+    pub immutable_enabled: bool,
     pub entries: Vec<IndexBufferEntry>,
 }
 
@@ -33,14 +35,16 @@ pub struct AccountMeta {
 pub struct IndexBuilder {
     id: usize,
     rx: Receiver<IndexBuilderTask>,
+    file_watcher_tx: Option<FileWatcherSender>,
 }
 
 impl IndexBuilder {
     pub fn new(
         id: usize,
         rx: Receiver<IndexBuilderTask>,
+        file_watcher_tx: Option<FileWatcherSender>,
     ) -> Self {
-        Self { id, rx }
+        Self { id, rx, file_watcher_tx }
     }
 
     pub fn run(&self) {
@@ -107,19 +111,6 @@ impl IndexBuilder {
     }
 
     fn build_indices(&self, task: &IndexBuilderTask) {
-        if let Err(error) = crate::file_protection::protect_rotated_files(
-            &task.ls_path,
-            task.signing_enabled,
-            task.metadata_enabled,
-            true
-        ) {
-            eprintln!(
-                "[index-builder {}] FATAL: file protection failed for {}: {}. Initiating shutdown.",
-                self.id, task.ls_path, error,
-            );
-            std::process::exit(1);
-        }
-
         println!(
             "[index-builder {}] building indices for {} (file_seq={})",
             self.id, task.ls_path, task.file_seq,
@@ -184,6 +175,27 @@ impl IndexBuilder {
             &mut buffer,
             &accounts,
         );
+
+        if let Err(error) = crate::file_protection::protect_rotated_files(
+            &task.ls_path,
+            task.signing_enabled,
+            task.metadata_enabled,
+            task.immutable_enabled,
+        ) {
+            eprintln!(
+                "[index-builder {}] FATAL: file protection failed for {}: {}. Initiating shutdown.",
+                self.id, task.ls_path, error,
+            );
+            std::process::exit(1);
+        }
+
+        if let Some(ref tx) = self.file_watcher_tx {
+            let _ = tx.send(
+                FileWatcherMessage::WatchFile {
+                    ls_path: task.ls_path.clone(),
+                }
+            );
+        }
 
         println!(
             "[index-builder {}] indices built for {} (file_seq={})",
