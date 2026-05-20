@@ -7,9 +7,11 @@ edition = "2024"
 libc.workspace = true
 loom = { version = "0.7.2", optional = true }
 
+# В Cargo.toml crate'а, где будут loom-тесты (например crates/ringbuf/Cargo.toml)
 [dev-dependencies]
 loom = "0.7"
 
 [loom]
+# Loom использует feature flag
 [features]
 loom = ["dep:loom"]

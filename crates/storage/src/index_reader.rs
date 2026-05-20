@@ -362,6 +362,7 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// accounts: Vec<(hi, lo, ordinal_off, timestamp_off, count)>
     fn write_posting_accounts_file(
         path: &str,
         accounts: &Vec<(u64, u64, u64, u64, u32)>,
@@ -499,9 +500,11 @@ mod tests {
             (1, 2, 112, 112, 1),
         ]);
 
+        // (1, 1) — hi=1, lo=1
         let result = lookup_account(&path, 1, 1).unwrap();
         assert_eq!(result.ordinal_file_offset, 96);
 
+        // (0, 2) — hi=0, lo=2
         let result = lookup_account(&path, 0, 2).unwrap();
         assert_eq!(result.ordinal_file_offset, 80);
 
@@ -515,6 +518,7 @@ mod tests {
         let dir = make_test_dir("many");
         let path = format!("{}/test.ls.posting-accounts", dir);
 
+        // 1000 accounts
         let accounts: Vec<(u64, u64, u64, u64, u32)> = (0..1000u64)
             .map(|i| (0, i + 1, 64 + i * 16, 64 + i * 16, (i % 10 + 1) as u32))
             .collect();
@@ -612,6 +616,7 @@ mod tests {
         let dir = make_test_dir("ts-full");
         let path = format!("{}/test.ls.timestamp", dir);
 
+        // 5 entries sorted by timestamp
         write_timestamp_file(&path, &vec![
             (1000, 4096),
             (2000, 4224),
@@ -623,9 +628,9 @@ mod tests {
         let offsets = query_timestamp_range(
             &path,
             IndexFileHeader::SIZE as u64,
-            5,
-            1000,
-            5000,
+            5,                              // records_count
+            1000,                           // from_ns
+            5000,                           // to_ns
         );
 
         assert_eq!(offsets.len(), 5);
@@ -814,7 +819,7 @@ mod tests {
         let offsets = query_ordinal_range(
             "/tmp/nonexistent",
             64,
-            0,
+            0,  // records_count = 0
             0,
             10,
         );
@@ -827,7 +832,7 @@ mod tests {
             "/tmp/nonexistent",
             64,
             5,
-            10,
+            10,  // from > to
             5,
         );
         assert!(offsets.is_empty());
@@ -851,13 +856,16 @@ mod tests {
         let path = format!("{}/test.ls.ordinal", dir);
 
         write_ordinal_file(&path, &vec![
+            // account_1
             (0, 4096),
             (1, 4224),
             (2, 4352),
+            // account_2
             (0, 4480),
             (1, 4608),
         ]);
 
+        // Query account_2: offset = header + 3 * 16 = 64 + 48 = 112
         let account_2_offset = IndexFileHeader::SIZE as u64
             + 3 * OrdinalIndexEntry::SIZE as u64;
 

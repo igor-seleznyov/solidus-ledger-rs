@@ -41,3 +41,5 @@ pub mod signature_verifier;
 pub mod signature_verification_cache;
 pub mod file_protection;
 pub mod file_watcher;
+pub mod tampering_log;
+mod time_utils;

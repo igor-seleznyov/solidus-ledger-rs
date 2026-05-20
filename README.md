@@ -249,23 +249,45 @@ Actively developed. See [Implementation Steps](STEPS.md) for the full plan.
 - Range queries: lower/upper bound binary search in .ordinal/.timestamp
 - IFMH adaptive resize: Vec-based Robin Hood rehash, configurable growth, backpressure on overflow
 - Integration tests: rotation → index build → lookup → range query (real thread, 100 accounts, 180 postings)
-- Miri testing: all hash tables (PAHT, PVT, THT), ring buffers (SPSC, MPSC), IndexBufferEntry Arena ops, PostingScanVisitor copy_nonoverlapping
+- Signature verification at first open + per-file verification cache (`SignatureVerificationCache`)
+- inotify/kqueue FileWatcher with signature-cache invalidation on file change
+- File immutability protection on rotated files: `chattr +i` on Linux, `chflags UF_IMMUTABLE` on macOS
+- Tampering Log: append-only, CRC32C-per-entry, size-based rotation, single-writer owner (FileWatcher)
+- Periodic file integrity recheck loop: newest-first cursor, batch-paced; `depth-files AND depth-days` filter for detached files; optional allowed-windows (UTC, minute precision); log-and-continue on detection
+- Portable CRC32C with runtime SSE4.2 detection: hardware path on x86_64 SSE4.2, software Castagnoli table fallback elsewhere — single `init()` at startup, Miri-clean, zero call-site changes
+- Miri testing: all hash tables (PAHT, PVT, THT), ring buffers (SPSC, MPSC), IndexBufferEntry Arena ops, PostingScanVisitor copy_nonoverlapping, tampering log
 - Loom testing: happens-before correctness verified in C11 abstract memory model with exhaustive interleaving exploration — three-thread transitive chains (Pipeline→Actor→DM, LS Writer→DM→IO), release/acquire barriers, MPSC fetch_add atomicity
 
 **In progress (Step 8, continued):**
-- LS Sign Index, signature verification + file integrity protection
-- Multi-file routing via manifest
-- Snapshots and crash recovery
+- Canonical CRC32C pattern unification across all `repr(C)` on-disk structs (`compute_checksum(&self) -> u32` / `fill_checksum(&mut self)` / `verify_checksum(&self) -> bool`, `checksum` always last field, works on `PROT_READ` mmap)
+- `record_tampering` re-entrant lock deadlock fix + `O_NOFOLLOW` on tampering.log open / rotate
+- `repr(C)`-from-buffer alignment-UB fix + new invariant banning `&*(ptr as *const T)` on align-1 buffers
+- Project-wide padding-field naming unification (`_reserved` / `_tail_pad` → `_pad` / `_padN`)
+- Workspace clippy debt closure
+- Manifest auto-restore + `ManifestEntry.merkle_root: [u8; 32]` Phase 3 reservation
+- LS Sign Index (`*.ls_sign_idx`, sorted-array by `transfer_id`)
+- Focused integration tests before snapshots (LS Writer + flush + crash; signing + metadata end-to-end; Index Builder + rotation + lookup; FileWatcher + Immutable + Signature)
+- Snapshots + crash recovery (SLS files, continuous background snapshot writer, sequential LS scan, signing state restoration)
 
 **Planned:**
-- Adaptive hash table resize (PAHT/PVT/THT capacity check, Arena resize, lazy rehash, backpressure propagation)
-- Rule Engine (configurable chart-of-accounts)
-- TLS (rustls over mio)
-- Deduplication (IdempotencyCheck)
-- Key Management (KEK/DEK/Shamir)
-- SHM transport
-- solidus-ledger-query: separate read/index/query service (extracted from ledger)
-- Distributed replication (Raft / VSR)
+- Rule Engine (configurable chart-of-accounts, variable-length transfers)
+- TLS 1.3 mTLS (rustls over mio)
+- SIMD Ring Buffer optimizations (`copy_nonoverlapping`, `_mm256_load` / `_mm256_store`)
+- Pipeline scaling (sharded pipelines, `N_PIPELINE > 1`, `AtomicU64` GSN)
+- Adaptive hash table resize (PAHT / PVT / THT capacity check, Arena resize, lazy rehash, backpressure propagation, inactive-account compaction)
+- Codebase refactoring (consolidate post-Step-8 debt: parameter-driven constructors, large-file decomposition, hot-path allocation audit)
+- Graceful shutdown (replace `process::exit` with coordinated shutdown channel)
+- Load testing (criterion benchmarks, perf / flamegraph, target 1 M TPS)
+- Multi-platform support (Windows `VirtualAlloc` + group commit, macOS `getentropy` + group commit)
+- Deduplication (Hopscotch + Bloom filter + `.ikey` files, three-tier)
+- Key Management (KEK → DEK → private key, Shamir 3-of-5, Argon2id)
+- SHM transport for co-located clients
+- Reconciliation (end-of-day reconciliation, operational day)
+- Metrics and monitoring (Prometheus, alerting)
+- Adaptive buffer sizes (research, dynamic sizing, ML forecasting)
+- `solidus-ledger-query`: separate read / index / audit service extracted from the ledger
+- Distributed replication (hybrid approach: `openraft` + state machine replication)
+- VSR — Viewstamped Replication (optional, port from TigerBeetle, VOPR simulator)
 
 ---
 

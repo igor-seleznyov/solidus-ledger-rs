@@ -13,7 +13,7 @@ use protocol::response::BatchResponse;
 use protocol::transfer::{Transfer, TRANSFER_BASE_SIZE};
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
 use pipeline::incoming_slot::IncomingSlot;
-use config::BatchAcceptConfig;
+use config::config::BatchAcceptConfig;
 use crate::ring_buffer::RingBuffer;
 
 const METADATA_SIZE: usize = 0;
@@ -71,6 +71,7 @@ impl Worker {
 
     pub fn run(&mut self) -> io::Result<()> {
         let mut events = Events::with_capacity(128);
+        //let mut buf = [0u8; 4096];
 
         loop {
             self.poll.poll(&mut events, Some(std::time::Duration::from_millis(10)))?;
@@ -104,6 +105,7 @@ impl Worker {
                         match conn.stream.read(conn.codec.read_buf()) {
                             Ok(0) => {
                                 println!("Connection closed: {:?} by worker {}", token, self.id);
+                                //self.connections.remove(&token);
                                 to_remove.push(token);
                                 break;
                             }
@@ -141,6 +143,7 @@ impl Worker {
                                                 "Worker {} protocol error: {:?}",
                                                 self.id, err
                                             );
+                                            //self.connections.remove(&token);
                                             to_remove.push(token);
                                             break;
                                         }
@@ -151,6 +154,7 @@ impl Worker {
                             Err(e) => {
                                 println!("Error reading in worker {} from stream: {}", self.id, e);
                                 to_remove.push(token);
+                                //self.connections.remove(&token);
                                 break;
                             }
                         }

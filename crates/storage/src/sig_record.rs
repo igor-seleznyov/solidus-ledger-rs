@@ -1,3 +1,4 @@
+// 'LDSTSGNR' little-endian LeDger STorage SiGNature Record
 pub const SIG_RECORD_MAGIC: u64 = 0x524E_4753_5453_444C;
 
 #[repr(C, align(64))]
@@ -31,7 +32,7 @@ impl SigRecord {
     pub unsafe fn compute_checksum(&mut self) {
         self.checksum = 0;
         let ptr = self as *const SigRecord as *const u8;
-        self.checksum = common::crc32c::crc32c(ptr, Self::SIZE);
+        self.checksum = unsafe { common::crc32c::crc32c(ptr, Self::SIZE) };
     }
 
     pub unsafe fn verify_checksum(&self) -> bool {
@@ -41,7 +42,7 @@ impl SigRecord {
             (*self_mut).checksum = 0;
         }
         let ptr = self as *const SigRecord as *const u8;
-        let computed = common::crc32c::crc32c(ptr, Self::SIZE);
+        let computed = unsafe { common::crc32c::crc32c(ptr, Self::SIZE) };
         unsafe {
             (*self_mut).checksum = saved;
         }
@@ -118,7 +119,7 @@ mod tests {
 
         unsafe {
             record.compute_checksum();
-            record.gsn = 43;
+            record.gsn = 43; // corrupt
             assert!(!record.verify_checksum());
         }
     }

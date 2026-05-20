@@ -1,10 +1,24 @@
+use std::mem;
 use common::crc32c::crc32c;
 
+// 'LDSTPSTR' little-endian LeDgerSTorage PoSTing Record
 pub const POSTING_RECORD_MAGIC: u64 = 0x5254_5350_5453_444C;
 
+/// Posting written to the LS file. 128 B, 2 cache lines.
+///
+/// # Layout invariant (I-001)
+///
+/// `checksum` MUST remain the last field at offset 124 = SIZE - 4.
+/// `compute_checksum` reads bytes `[0..124)` as a single contiguous slice,
+/// no mutation of `self` required. Safe to call on PROT_READ mmap.
+///
+/// Future fields MUST go before `checksum` and eat into the reserved budget.
+/// When the reserved budget runs out, bump `LS_FORMAT_VERSION` in `LsFileHeader`
+/// and add version dispatch in the scanner.
 #[repr(C, align(64))]
 #[derive(Copy, Clone)]
 pub struct PostingRecord {
+    // ═══ Cache line 0: identity + amounts ═══
     pub magic: u64,
     pub transfer_id_hi: u64,
     pub transfer_id_lo: u64,
@@ -14,19 +28,22 @@ pub struct PostingRecord {
     pub amount: i64,
     pub ordinal: u64,
 
+    // ═══ Cache line 1: timestamps + metadata + checksum ═══
     pub prev_posting_record_offset: u64,
     pub timestamp_ns: u64,
     pub transfer_sequence_id: [u8; 16],
     pub currency: [u8; 16],
+
+    pub partition_seq: u64,
     pub entry_type: u8,
     pub sign: i8,
     pub transfer_posting_records_count: u8,
-    pub _pad: [u8; 9],
+    pub _pad: [u8; 1],
     pub checksum: u32,
 }
 
 impl PostingRecord {
-    pub const SIZE: usize = 128;
+    pub const SIZE: usize = std::mem::size_of::<PostingRecord>();
 
     pub fn zeroed() -> Self {
         unsafe { std::mem::zeroed() }
@@ -50,18 +67,38 @@ impl PostingRecord {
             timestamp_ns: 0,
             transfer_sequence_id: [0u8; 16],
             currency: [0u8; 16],
+            partition_seq: 0,
             entry_type: 0,
             sign: 0,
             transfer_posting_records_count: 0,
-            _pad: [0u8; 9],
+            _pad: [0u8; 1],
             checksum: 0,
         }
     }
 
-    pub unsafe fn compute_checksum(&mut self) {
-        self.checksum = 0;
-        let ptr = self as *const PostingRecord as *const u8;
-        self.checksum = unsafe { crc32c(ptr, Self::SIZE) };
+    pub fn compute_checksum(&self) -> u32 {
+        // SAFETY: `self` is a valid `PostingRecord` of exactly `SIZE` bytes.
+        // Reading `[0..SIZE - 4)` excludes only the trailing `checksum: u32`
+        // field. The struct is `Copy`, so no drop glue runs concurrently.
+        // No aliasing violation: we hold `&self`, not `&mut self`.
+        const PAYLOAD: usize = PostingRecord::SIZE - std::mem::size_of::<u32>();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                PAYLOAD,
+            )
+        };
+        unsafe {
+            crc32c(bytes.as_ptr(), bytes.len())
+        }
+    }
+
+    pub fn fill_checksum(&mut self) {
+        self.checksum = self.compute_checksum();
+    }
+
+    pub fn verify_checksum(&self) -> bool {
+        self.checksum == self.compute_checksum()
     }
 
     pub fn set_magic(&mut self) {
@@ -71,16 +108,12 @@ impl PostingRecord {
     pub fn verify_magic(&self) -> bool {
         self.magic == POSTING_RECORD_MAGIC
     }
-
-    pub unsafe fn verify_checksum(&mut self) -> bool {
-        let ptr = self as *const PostingRecord as *const u8;
-        let checksum_value = self.checksum;
-        self.checksum = 0;
-        let computed = unsafe { crc32c(ptr, Self::SIZE) };
-        self.checksum = checksum_value;
-        computed == self.checksum
-    }
 }
+
+/// Compile-time assertion for unexpected field add after checksum
+const _: () = assert!(
+    std::mem::offset_of!(PostingRecord, checksum) == PostingRecord::SIZE - std::mem::size_of::<u32>()
+);
 
 #[cfg(test)]
 #[cfg(not(miri))]
@@ -90,6 +123,7 @@ mod tests {
     #[test]
     fn size_is_128_bytes() {
         assert_eq!(std::mem::size_of::<PostingRecord>(), 128);
+        assert_eq!(PostingRecord::SIZE, 128);
     }
 
     #[test]
@@ -108,7 +142,10 @@ mod tests {
 
     #[test]
     fn checksum_at_end() {
-        assert_eq!(std::mem::offset_of!(PostingRecord, checksum), 124);
+        assert_eq!(
+              std::mem::offset_of!(PostingRecord, checksum),
+              PostingRecord::SIZE - std::mem::size_of::<u32>(),
+          );
     }
 
     #[test]
@@ -125,9 +162,11 @@ mod tests {
         assert_eq!(std::mem::offset_of!(PostingRecord, timestamp_ns), 72);
         assert_eq!(std::mem::offset_of!(PostingRecord, transfer_sequence_id), 80);
         assert_eq!(std::mem::offset_of!(PostingRecord, currency), 96);
-        assert_eq!(std::mem::offset_of!(PostingRecord, entry_type), 112);
-        assert_eq!(std::mem::offset_of!(PostingRecord, sign), 113);
-        assert_eq!(std::mem::offset_of!(PostingRecord, transfer_posting_records_count), 114);
+        assert_eq!(std::mem::offset_of!(PostingRecord, partition_seq), 112);
+        assert_eq!(std::mem::offset_of!(PostingRecord, entry_type), 120);
+        assert_eq!(std::mem::offset_of!(PostingRecord, sign), 121);
+        assert_eq!(std::mem::offset_of!(PostingRecord, transfer_posting_records_count), 122);
+        assert_eq!(std::mem::offset_of!(PostingRecord, _pad), 123);
         assert_eq!(std::mem::offset_of!(PostingRecord, checksum), 124);
     }
 
@@ -142,41 +181,62 @@ mod tests {
     }
 
     #[test]
-    fn compute_and_verify_checksum() {
+    fn fill_then_verify_succeeds() {
         let mut record = PostingRecord::zeroed();
         record.transfer_id_hi = 1;
         record.transfer_id_lo = 2;
         record.gsn = 100;
         record.amount = 500;
 
-        unsafe {
-            record.compute_checksum();
-            assert_ne!(record.checksum, 0);
-            assert!(record.verify_checksum());
-        }
+        record.fill_checksum();
+
+        assert_ne!(record.checksum, 0);
+        assert!(record.verify_checksum());
     }
 
     #[test]
-    fn corrupted_data_fails_checksum() {
+    fn corrupted_payload_fails_verify() {
         let mut record = PostingRecord::zeroed();
         record.gsn = 42;
         record.amount = 1000;
+        record.fill_checksum();
+        assert!(record.verify_checksum());
 
-        unsafe {
-            record.compute_checksum();
-            assert!(record.verify_checksum());
-
-            record.amount = 999;
-            assert!(!record.verify_checksum());
-        }
+        record.amount = 999;
+        assert!(!record.verify_checksum());
     }
 
     #[test]
-    fn zeroed_is_valid() {
+    fn compute_checksum_is_pure() {
         let mut record = PostingRecord::zeroed();
-        unsafe {
-            record.compute_checksum();
-            assert!(record.verify_checksum());
-        }
+        record.gsn = 7;
+        record.amount = 42;
+
+        let first = record.compute_checksum();
+        let second = record.compute_checksum();
+
+        assert_eq!(first, second);
+        assert_eq!(record.checksum, 0);
+    }
+
+    #[test]
+    fn zeroed_then_filled_verifies() {
+        let mut record = PostingRecord::zeroed();
+        record.fill_checksum();
+        assert!(record.verify_checksum());
+    }
+
+    #[test]
+    fn refill_after_modification_verifies() {
+        let mut record = PostingRecord::zeroed();
+        record.gsn = 1;
+        record.fill_checksum();
+        let first_checksum = record.checksum;
+
+        record.gsn = 2;
+        record.fill_checksum();
+
+        assert_ne!(record.checksum, first_checksum);
+        assert!(record.verify_checksum());
     }
 }

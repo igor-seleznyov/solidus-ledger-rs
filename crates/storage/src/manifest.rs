@@ -398,8 +398,9 @@ mod tests {
             let mut entry = make_entry(0, "ls_persist-0-0.ls");
             entry.gsn_min = 42;
             manifest.append_current_entry(&mut entry);
-        }
+        } // drop → file closed
 
+        // Reopen
         let mut manifest = Manifest::open(&dir, 0);
         assert_eq!(manifest.entries_count(), 1);
 
@@ -416,7 +417,7 @@ mod tests {
     fn read_entry_out_of_range() {
         let dir = make_temp_dir("out-of-range");
         let mut manifest = Manifest::create(&dir, 0);
-        manifest.read_entry(0);
+        manifest.read_entry(0); // entries_count = 0
         cleanup(&dir);
     }
 

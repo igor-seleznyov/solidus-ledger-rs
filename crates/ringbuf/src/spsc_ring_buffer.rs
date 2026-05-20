@@ -306,6 +306,7 @@ mod tests {
         }
         batch.publish();
 
+        // Drain batch
         let drain = rb.drain_batch(16);
         assert_eq!(drain.len(), 4);
         for i in 0..drain.len() {
@@ -360,6 +361,8 @@ mod tests {
     }
 }
 
+///
+/// cargo +nightly miri test -p ringbuf -- miri_spsc
 #[cfg(test)]
 mod miri_tests {
     use std::cell::UnsafeCell;

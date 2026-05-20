@@ -121,6 +121,8 @@ fn make_flush_marker_slot(gsn: u64, transfer_id_lo: u64, tht_offset: u32) -> LsW
     slot
 }
 
+/// Helper: write postings, flush, rotate, drain channel, build indices synchronously.
+/// Returns (ls_path_before_rotation, task).
 fn write_flush_rotate_build(
     writer: &mut LsWriter<PortableFlushBackend, NoSigningStrategy, NoMetadataStrategy>,
     index_rx: &mpsc::Receiver<IndexBuilderTask>,
@@ -143,10 +145,14 @@ fn write_flush_rotate_build(
 
     writer.rotate();
 
+    // Drain channel and build indices synchronously (approach C)
     let task = index_rx.recv().expect("Expected index builder task");
 
     let builder_rx_dummy = mpsc::channel::<IndexBuilderTask>();
     let builder = IndexBuilder::new(0, builder_rx_dummy.1, None);
+    // Call build_indices directly — we need to make it pub for this
+    // Alternative: re-implement the build logic in test
+    // For now: use the entries from task to build via index_writer
     {
         if !task.entries.is_empty() {
             let total_count = task.entries.len();
@@ -266,6 +272,7 @@ fn lookup_account_after_rotation() {
     assert!(result.is_some());
     assert_eq!(result.unwrap().records_count, 1);
 
+    // Not found
     assert!(lookup_account(&idx_path, 0, 99).is_none());
 
     cleanup(&dir);
@@ -280,24 +287,26 @@ fn lookup_100_accounts() {
     let mut postings = Vec::new();
     for i in 0..100u64 {
         postings.push(make_posting_slot(
-            100 + i,
-            (i + 1) as i64 * 100,
-            0,
-            i + 1,
-            0,
-            1_000_000_000 + i * 1000,
+            100 + i,         // gsn
+            (i + 1) as i64 * 100,  // amount
+            0,               // account_hi
+            i + 1,           // account_lo (1..100)
+            0,               // ordinal
+            1_000_000_000 + i * 1000,  // timestamp
         ));
     }
 
     let ls_path = write_flush_rotate_build(&mut writer, &index_rx, &postings);
     let idx_path = format!("{}.posting-accounts", ls_path);
 
+    // Lookup every account
     for i in 0..100u64 {
         let result = lookup_account(&idx_path, 0, i + 1);
         assert!(result.is_some(), "Account {} not found", i + 1);
         assert_eq!(result.unwrap().records_count, 1);
     }
 
+    // Not found
     assert!(lookup_account(&idx_path, 0, 0).is_none());
     assert!(lookup_account(&idx_path, 0, 101).is_none());
 
@@ -310,6 +319,7 @@ fn timestamp_range_query_after_rotation() {
     let (index_tx, index_rx) = mpsc::channel();
     let mut writer = make_writer(&dir, 1024 * 1024, index_tx);
 
+    // Account 1: 5 postings with different timestamps
     let postings = vec![
         make_posting_slot(100, 100, 0, 1, 0, 1000),
         make_posting_slot(101, 200, 0, 1, 1, 2000),
@@ -326,16 +336,19 @@ fn timestamp_range_query_after_rotation() {
     let result = lookup_account(&idx_path, 0, 1).unwrap();
     assert_eq!(result.records_count, 5);
 
+    // Full range
     let offsets = query_timestamp_range(
         &ts_path, result.timestamp_file_offset, result.records_count, 1000, 5000,
     );
     assert_eq!(offsets.len(), 5);
 
+    // Partial range: 2000..4000
     let offsets = query_timestamp_range(
         &ts_path, result.timestamp_file_offset, result.records_count, 2000, 4000,
     );
     assert_eq!(offsets.len(), 3);
 
+    // No match: 6000..9000
     let offsets = query_timestamp_range(
         &ts_path, result.timestamp_file_offset, result.records_count, 6000, 9000,
     );
@@ -350,6 +363,7 @@ fn ordinal_range_query_after_rotation() {
     let (index_tx, index_rx) = mpsc::channel();
     let mut writer = make_writer(&dir, 1024 * 1024, index_tx);
 
+    // Account 1: 5 postings
     let postings = vec![
         make_posting_slot(100, 100, 0, 1, 0, 1000),
         make_posting_slot(101, 200, 0, 1, 1, 2000),
@@ -365,11 +379,13 @@ fn ordinal_range_query_after_rotation() {
 
     let result = lookup_account(&idx_path, 0, 1).unwrap();
 
+    // Ordinal range 1..3
     let offsets = query_ordinal_range(
         &ord_path, result.ordinal_file_offset, result.records_count, 1, 3,
     );
     assert_eq!(offsets.len(), 3);
 
+    // Full range
     let offsets = query_ordinal_range(
         &ord_path, result.ordinal_file_offset, result.records_count, 0, 4,
     );
@@ -384,6 +400,7 @@ fn multiple_accounts_with_many_postings() {
     let (index_tx, index_rx) = mpsc::channel();
     let mut writer = make_writer(&dir, 1024 * 1024, index_tx);
 
+    // 3 accounts: account 1 = 100 postings, account 2 = 50 postings, account 3 = 30 postings
     let mut postings = Vec::new();
     let mut gsn = 100u64;
 
@@ -406,27 +423,33 @@ fn multiple_accounts_with_many_postings() {
     let ts_path = format!("{}.timestamp", ls_path);
     let ord_path = format!("{}.ordinal", ls_path);
 
+    // Account 1: 100 postings
     let r1 = lookup_account(&idx_path, 0, 1).unwrap();
     assert_eq!(r1.records_count, 100);
 
+    // Account 2: 50 postings
     let r2 = lookup_account(&idx_path, 0, 2).unwrap();
     assert_eq!(r2.records_count, 50);
 
+    // Account 3: 30 postings
     let r3 = lookup_account(&idx_path, 0, 3).unwrap();
     assert_eq!(r3.records_count, 30);
 
+    // Timestamp range: account 1, first 10
     let offsets = query_timestamp_range(
         &ts_path, r1.timestamp_file_offset, r1.records_count,
         1_000_000, 1_009_000,
     );
     assert_eq!(offsets.len(), 10);
 
+    // Ordinal range: account 2, ordinals 20..39
     let offsets = query_ordinal_range(
         &ord_path, r2.ordinal_file_offset, r2.records_count,
         20, 39,
     );
     assert_eq!(offsets.len(), 20);
 
+    // All ordinals account 3
     let offsets = query_ordinal_range(
         &ord_path, r3.ordinal_file_offset, r3.records_count,
         0, 29,
@@ -461,11 +484,13 @@ fn index_builder_thread_builds_files() {
     let (index_tx, index_rx) = mpsc::channel();
     let mut writer = make_writer(&dir, 1024 * 1024, index_tx);
 
+    // Spawn real Index Builder thread
     let builder_handle = thread::spawn(move || {
         let builder = IndexBuilder::new(0, index_rx, None);
         builder.run();
     });
 
+    // Write postings and rotate
     let postings = vec![
         make_posting_slot(100, 500, 0, 1, 0, 1_000_000_000),
         make_posting_slot(101, 300, 0, 2, 0, 1_000_001_000),
@@ -483,10 +508,13 @@ fn index_builder_thread_builds_files() {
     let ls_path = writer.current_ls_file_path().to_string();
     writer.rotate();
 
+    // Drop writer → drops index_tx → Index Builder thread exits after processing
     drop(writer);
 
+    // Wait for thread to finish (it will process task then exit on channel close)
     builder_handle.join().expect("Index Builder thread panicked");
 
+    // Verify files exist
     assert!(
         std::path::Path::new(&format!("{}.posting-accounts", ls_path)).exists(),
         ".posting-accounts not found"
@@ -500,6 +528,7 @@ fn index_builder_thread_builds_files() {
         ".timestamp not found"
     );
 
+    // Verify lookup works
     let idx_path = format!("{}.posting-accounts", ls_path);
     let r1 = lookup_account(&idx_path, 0, 1);
     assert!(r1.is_some(), "Account 1 not found after thread build");

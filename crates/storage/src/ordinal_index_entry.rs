@@ -8,6 +8,7 @@ impl OrdinalIndexEntry {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 }
 
+// ordinal_index_entry.rs
 #[cfg(test)]
 mod tests {
     use super::*;

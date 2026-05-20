@@ -111,6 +111,7 @@ impl FlushBackend for PortableFlushBackend {
     }
 
     fn wait_completions(&mut self, _count: usize) {
+        //nothing to do
     }
 
     fn poll_completion(&mut self) -> Option<FlushCompletion> {

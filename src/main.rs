@@ -3,7 +3,7 @@ use std::thread;
 use std::sync::mpsc;
 use common::consts::CPU_CACHE_LINE_SIZE;
 use common::generate_random_u64::generate_random_u64;
-use config::{Config, PartitionAccountAssignmentConfig};
+use config::config::{Config, PartitionAccountAssignmentConfig};
 use ledger::ledger_pipeline_handler::LedgerPipelineHandler;
 use ledger::partition_accounts_hash_table::PartitionAccountsHashTable;
 use ledger::partition_actor::PartitionActor;
@@ -33,9 +33,12 @@ use storage::manifest::Manifest;
 use storage::signing_strategy::SigningStrategy;
 use storage::metadata_strategy::MetadataStrategy;
 use storage::index_builder::{IndexBuilder, IndexBuilderTask};
-use storage::file_watcher::{FileWatcher, FileWatcherMessage, FileWatcherSender};
+use storage::file_watcher::{FileWatcher, FileWatcherMessage, FileWatcherSender, ManifestFileInfo};
+use storage::tampering_log::TamperingLogError;
+use storage::manifest_entry::MANIFEST_STATUS_ROTATED;
 
 fn main() {
+    common::crc32c::init();
     let config = Config::load("config.yaml").expect("Failed to load config");
     println!(
         "Config loaded: {} workers, {} pipeline(s), {} partitions, metadata_size={}",
@@ -246,12 +249,86 @@ fn main() {
 
     println!("[main] {} partition actor threads started", partitions_count);
 
+    // FileWatcher. The FileWatcher needs a startup snapshot of rotated LS
+    // files (ADR-016 / I-040); the per-shard LS Writer loop below consumes
+    // the same `Manifest` instances via `into_iter()` — no manifest is
+    // opened twice. `mut` is needed because `read_entry` is `&mut self`.
+    let ls_files_directory = config.storage.current_files_directory.clone();
+    std::fs::create_dir_all(&ls_files_directory)
+        .expect("Failed to create LS storage files directory");
+
+    let mut manifests: Vec<Manifest> = (0..decision_maker_shards)
+        .map(
+            |shard_index| {
+                if Manifest::exists(&ls_files_directory, shard_index) {
+                    Manifest::open(&ls_files_directory, shard_index)
+                } else {
+                    Manifest::create(&ls_files_directory, shard_index)
+                }
+            }
+        ).collect();
+
     let file_watcher_sender: Option<FileWatcherSender> = if config.storage.file_protection.watch_enabled {
         let (tx, rx) = mpsc::channel::<FileWatcherMessage>();
         let watch_dir = config.storage.current_files_directory.clone();
 
-        let (mut watcher, waker) = FileWatcher::new(0, rx, watch_dir)
-            .expect("Failed to create file watcher");
+        // Build the rotated-LS-file snapshot the FileWatcher watches.
+        // Only ROTATED entries: the CURRENT (actively-written) LS file
+        // is mutating and is not an immutability / tamper target.
+        // `created_at_ns` uses `timestamp_min_ns` (first posting's time)
+        // — a sufficient proxy for the `depth-days` age filter.
+        let mut manifest_entries: Vec<ManifestFileInfo> = Vec::new();
+        for manifest in manifests.iter_mut() {
+            for entry_index in 0..manifest.entries_count() {
+                let entry = manifest.read_entry(entry_index);
+                if entry.status != MANIFEST_STATUS_ROTATED {
+                    continue;
+                }
+                manifest_entries.push(
+                    ManifestFileInfo {
+                        file_seq: entry.file_seq,
+                        ls_path: format!(
+                            "{ls_files_directory}/{}",
+                            entry.filename_str(),
+                        ),
+                        created_at_ns: entry.timestamp_min_ns
+                    }
+                );
+            }
+        }
+
+        // round-1 D3 / ADR-018 E9: react to a failed FileWatcher
+        // startup with a FATAL log + process::exit(1), not `.expect()`.
+        // A `SecurityHalt` is a deliberate fail-stop (the live
+        // tampering log has a foreign identity or an unreadable
+        // header — ADR-017 §Amendment 2026-05-18); it gets a
+        // security-framed line. `process::exit` is acceptable at
+        // startup: no service thread is running, nothing to drain
+        // (I-042 §8).
+        let (mut watcher, handles) = match FileWatcher::new(
+            0,
+            rx,
+            watch_dir,
+            manifest_entries,
+            &config.storage.file_protection,
+        ) {
+            Ok(watcher_and_handles) => watcher_and_handles,
+            Err(TamperingLogError::SecurityHalt { reason }) => {
+                eprintln!(
+                    "[main] FATAL: SECURITY: file watcher startup halted — {reason}. \
+                         The ledger will NOT start; operator investigation is \
+                         required before restart (ADR-018 E9, I-042 §9).",
+                );
+                std::process::exit(1);
+            }
+            Err(TamperingLogError::Io(error)) => {
+                eprintln!(
+                    "[main] FATAL: failed to create file watcher: {error}. \
+                         Initiating shutdown.",
+                );
+                std::process::exit(1);
+            }
+        };
 
         thread::Builder::new()
             .name("file-watcher".to_string())
@@ -262,7 +339,7 @@ fn main() {
             ).expect("[main] Failed to spawn file-watcher thread");
 
         println!("[main] file watcher thread started");
-        Some(FileWatcherSender::new(tx, waker))
+        Some(FileWatcherSender::new(tx, handles.waker))
     } else {
         None
     };
@@ -280,7 +357,7 @@ fn main() {
 
     println!("[main] index builder thread started");
 
-    for i in 0..decision_maker_shards {
+    for (i, manifest) in manifests.into_iter().enumerate() {
         let decision_maker_coordinator_rb = Arc::clone(&coordinator_rbs[i]);
         let decision_transfer_hash_table = Arc::clone(&decision_maker_transfer_hash_tables[i]);
         let decision_maker_partition_rbs: Vec<Arc<MpscRingBuffer<PartitionSlot>>> =
@@ -314,13 +391,7 @@ fn main() {
 
         let ls_directory = config.storage.current_files_directory.clone();
 
-        let manifest = if Manifest::exists(&ls_directory, i) {
-            Manifest::open(&ls_directory, i)
-        } else {
-            Manifest::create(&ls_directory, i)
-        };
-
-        let rules_checksum: u32 = 0;
+        let rules_checksum: u32 = 0;// TODO calculate from RuleEngine
 
         let max_ls_file_size = config.storage.max_ls_file_size_mb * 1024 * 1024;
         let flush_timeout_ms = config.storage.flush_timeout_ms;
@@ -495,6 +566,7 @@ fn spawn_with_strategies<T: FlushBackend + Send + 'static>(
     index_builder_tx: mpsc::Sender<IndexBuilderTask>,
 ) {
     if signing_enabled {
+        // TODO: load ket from the managed store on step 17
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
         let genesis = [0u8; 32];
         let signing = Ed25519SigningStrategy::new(

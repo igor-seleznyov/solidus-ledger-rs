@@ -344,7 +344,7 @@ mod tests {
         Vec<Arc<MpscRingBuffer<PartitionSlot>>>,
         Arc<MpscRingBuffer<LsWriterSlot>>,
         Arc<MpscRingBuffer<FlushDoneSlot>>,
-        u32,
+        u32, // tht_offset
     ) {
         let coordinator_rb = Arc::new(
             MpscRingBuffer::<CoordinatorSlot>::new(64).unwrap(),
@@ -429,6 +429,7 @@ mod tests {
 
         batch.release();
 
+        // THT decision = COMMIT
         unsafe {
             let slot = tht.slot_ptr(tht_offset);
             assert_eq!((*slot).decision, DECISION_COMMIT);
@@ -443,13 +444,14 @@ mod tests {
             }
             b.release();
         }
-        assert_eq!(total_commits, 2);
+        assert_eq!(total_commits, 2); // 2 entries → 2 COMMIT messages
     }
 
     #[test]
     fn prepare_fail_sends_rollback() {
         let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = setup_dm_with_transfer(4);
 
+        // 1 PREPARE_OK + 1 PREPARE_FAIL
         let mut c1 = coord_rb.claim();
         *c1.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
         c1.publish();
@@ -484,6 +486,7 @@ mod tests {
     fn all_commit_ok_removes_from_tht() {
         let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = setup_dm_with_transfer(4);
 
+        // Phase 1: PREPARE_OK × 2 → COMMIT
         for _ in 0..2 {
             let mut c = coord_rb.claim();
             *c.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
@@ -499,6 +502,7 @@ mod tests {
             b.release();
         }
 
+        // Phase 2: COMMIT_OK × 2
         for _ in 0..2 {
             let mut c = coord_rb.claim();
             *c.as_mut() = make_coord_msg(COORD_COMMIT_SUCCESS, tht_offset, 0, 0);
@@ -520,6 +524,7 @@ mod tests {
     fn all_rollback_ok_removes_from_tht() {
         let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = setup_dm_with_transfer(4);
 
+        // Phase 1: 1 OK + 1 FAIL → ROLLBACK
         let mut c1 = coord_rb.claim();
         *c1.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
         c1.publish();
@@ -536,6 +541,7 @@ mod tests {
             rb.drain_batch(64).release();
         }
 
+        // Phase 2: ROLLBACK_OK × 2
         let mut c = coord_rb.claim();
         *c.as_mut() = make_coord_msg(COORD_ROLLBACK_SUCCESS, tht_offset, 0, 0);
         c.publish();
@@ -552,6 +558,7 @@ mod tests {
     fn commit_sends_correct_entry_data() {
         let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = setup_dm_with_transfer(4);
 
+        // PREPARE_OK × 2 → COMMIT
         for _ in 0..2 {
             let mut c = coord_rb.claim();
             *c.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
@@ -578,6 +585,7 @@ mod tests {
         assert_eq!(debit.gsn, 100);
         assert_eq!(debit.msg_type, MSG_TYPE_COMMIT);
         assert_eq!(debit.transfer_hash_table_offset, tht_offset);
+        // account_id reconstructed from hi=0, lo=10
         assert_eq!(debit.account_id, account_id(10));
 
         let credit = commits.iter().find(|c| c.entry_type == ENTRY_TYPE_CREDIT).unwrap();
@@ -610,6 +618,7 @@ mod tests {
         let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) =
             setup_dm_with_transfer(4);
 
+        // Phase 1: PREPARE_OK × 2 → COMMIT
         for _ in 0..2 {
             let mut c = coord_rb.claim();
             *c.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
@@ -619,10 +628,12 @@ mod tests {
         dm.process_batch(&batch, batch.len());
         batch.release();
 
+        // Drain COMMIT from partition RBs
         for rb in &partition_rbs {
             rb.drain_batch(64).release();
         }
 
+        // Phase 2: COMMIT_OK × 2
         for _ in 0..2 {
             let mut c = coord_rb.claim();
             *c.as_mut() = make_coord_msg(COORD_COMMIT_SUCCESS, tht_offset, 0, 0);
@@ -651,6 +662,7 @@ mod tests {
         let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) =
             setup_dm_with_transfer(4);
 
+        // Phase 1
         for _ in 0..2 {
             let mut c = coord_rb.claim();
             *c.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
@@ -664,6 +676,7 @@ mod tests {
             rb.drain_batch(64).release();
         }
 
+        // Phase 2
         for _ in 0..2 {
             let mut c = coord_rb.claim();
             *c.as_mut() = make_coord_msg(COORD_COMMIT_SUCCESS, tht_offset, 0, 0);

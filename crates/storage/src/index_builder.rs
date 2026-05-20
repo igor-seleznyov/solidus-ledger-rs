@@ -186,6 +186,7 @@ impl IndexBuilder {
                 "[index-builder {}] FATAL: file protection failed for {}: {}. Initiating shutdown.",
                 self.id, task.ls_path, error,
             );
+            //TODO: signing graceful shutdown to main thread
             std::process::exit(1);
         }
 
@@ -273,6 +274,7 @@ mod tests {
             },
         ];
 
+        // Count
         let mut counts: HashMap<(u64, u64), u32> = HashMap::new();
         for entry in &entries {
             *counts.entry((entry.account_id_hi, entry.account_id_lo)).or_insert(0) += 1;
@@ -280,11 +282,13 @@ mod tests {
         assert_eq!(counts[&(0, 1)], 2);
         assert_eq!(counts[&(0, 2)], 1);
 
+        // Compute offsets
         let (idx_records, _sorted_keys, mut accounts) = IndexBuilder::compute_offsets(
             counts, 64, 64, 64,
         );
         assert_eq!(idx_records.len(), 2);
 
+        // Place
         let total = entries.len();
         let mut buffer: Vec<IndexBufferEntry> = Vec::with_capacity(total);
         buffer.resize(total, IndexBufferEntry {
@@ -300,11 +304,13 @@ mod tests {
             meta.cursor += 1;
         }
 
+        // Account (0,1) at start=0: 2 entries
         assert_eq!(buffer[0].account_id_lo, 1);
         assert_eq!(buffer[0].ls_offset, 4224);
         assert_eq!(buffer[1].account_id_lo, 1);
         assert_eq!(buffer[1].ls_offset, 4352);
 
+        // Account (0,2) at start=2: 1 entry
         assert_eq!(buffer[2].account_id_lo, 2);
         assert_eq!(buffer[2].ls_offset, 4096);
     }

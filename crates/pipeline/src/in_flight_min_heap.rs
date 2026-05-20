@@ -492,12 +492,15 @@ mod tests {
 
     #[test]
     fn resize_doubles_capacity() {
+        // capacity = 8, threshold 75% = 6 elements → resize at 6th add
         let mut heap = InFlightMinHeap::new(8, K0, K1, 4, 2);
 
         for i in 1..=6u64 {
             assert!(heap.add(i));
         }
 
+        // After resize: capacity = 16
+        // Add more — should work
         for i in 7..=12u64 {
             assert!(heap.add(i));
         }
@@ -510,12 +513,15 @@ mod tests {
     fn resize_preserves_min_heap_order() {
         let mut heap = InFlightMinHeap::new(8, K0, K1, 4, 2);
 
+        // Add in reverse order
         for i in (1..=10u64).rev() {
             assert!(heap.add(i));
         }
 
+        // Min should be 1
         assert_eq!(heap.min(), Some(1));
 
+        // Remove all in order
         for expected in 1..=10u64 {
             assert_eq!(heap.min(), Some(expected));
             heap.remove(expected);
@@ -532,6 +538,7 @@ mod tests {
             assert!(heap.add(i));
         }
 
+        // Remove specific elements — index must find them after resize
         heap.remove(5);
         heap.remove(15);
         heap.remove(10);
@@ -542,17 +549,24 @@ mod tests {
 
     #[test]
     fn backpressure_when_max_resize_reached() {
+        // capacity = 4, max_resize = 1, growth = 2
+        // After 1 resize: capacity = 8
+        // 75% of 8 = 6 → at 7th element, tries resize #2 → denied → backpressure
         let mut heap = InFlightMinHeap::new(4, K0, K1, 1, 2);
 
+        // First 3: fit in original capacity (75% of 4 = 3)
         for i in 1..=3u64 {
             assert!(heap.add(i), "Failed to add {}", i);
         }
 
+        // 4th triggers resize → capacity 8
         assert!(heap.add(4));
 
+        // 5th and 6th: fit in resized capacity (75% of 8 = 6)
         assert!(heap.add(5));
         assert!(heap.add(6));
 
+        // 7th: triggers resize attempt #2 → denied → backpressure
         assert!(!heap.add(7));
 
         assert_eq!(heap.len(), 6);
@@ -562,6 +576,7 @@ mod tests {
     fn unlimited_resize() {
         let mut heap = InFlightMinHeap::new(4, K0, K1, 0, 2);
 
+        // Add 1000 elements — should never backpressure
         for i in 1..=1000u64 {
             assert!(heap.add(i), "Backpressure at {}", i);
         }
@@ -572,6 +587,7 @@ mod tests {
 
     #[test]
     fn growth_factor_4() {
+        // capacity = 4, growth = 4 → after resize: 16
         let mut heap = InFlightMinHeap::new(4, K0, K1, 2, 4);
 
         for i in 1..=12u64 {
@@ -586,10 +602,12 @@ mod tests {
     fn add_remove_after_resize() {
         let mut heap = InFlightMinHeap::new(8, K0, K1, 4, 2);
 
+        // Fill to trigger resize
         for i in 1..=10u64 {
             heap.add(i);
         }
 
+        // Remove all
         for i in 1..=10u64 {
             heap.remove(i);
         }
@@ -597,6 +615,7 @@ mod tests {
         assert!(heap.is_empty());
         assert_eq!(heap.last_removed_gsn(), 10);
 
+        // Add again after empty — should work (table slots freed)
         for i in 100..=110u64 {
             assert!(heap.add(i));
         }

@@ -50,3 +50,11 @@ storage:
   file-protection:
     immutable-enabled: true
     watch-enabled: true
+    recheck-interval-seconds: 3600,
+    recheck-batch-size: 10,
+    recheck-depth-files: 1000
+    recheck-depth-days: 30
+    recheck-allowed-windows:
+      - { start: "02:00", end: "05:30" }
+    startup-verify-recent-count: 0
+    tampering-log-max-size-mb: 64

@@ -326,6 +326,9 @@ mod tests {
     }
 }
 
+///
+///
+/// cargo +nightly miri test -p ringbuf -- miri_mpsc
 #[cfg(test)]
 mod miri_tests {
     use std::cell::UnsafeCell;
@@ -597,10 +600,12 @@ mod miri_tests {
     fn miri_mpsc_simulated_two_writers() {
         let rb = MiriMpsc::new(16);
 
+        // Writer 1
         let mut c1 = rb.claim();
         c1.as_mut().value = 1_000_000;
         c1.publish();
 
+        // Writer 2
         let mut c2 = rb.claim();
         c2.as_mut().value = 2_000_000;
         c2.publish();

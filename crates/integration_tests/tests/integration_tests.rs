@@ -48,6 +48,7 @@ fn start_full_server(batch_accept: BatchAcceptConfig) -> FullTestServer {
     let partitions_num = 4;
     let dm_shards = 1;
 
+    // Partition RBs
     let partition_rb: Vec<Arc<MpscRingBuffer<PartitionSlot>>> = (0..partitions_num)
         .map(|_| Arc::new(MpscRingBuffer::<PartitionSlot>::new(64).unwrap()))
         .collect();
@@ -57,16 +58,19 @@ fn start_full_server(batch_accept: BatchAcceptConfig) -> FullTestServer {
     let dm_partition_rbs: Vec<Arc<MpscRingBuffer<PartitionSlot>>> =
         partition_rb.iter().map(Arc::clone).collect();
 
+    // Coordinator RBs
     let coordinator_rbs: Vec<Arc<MpscRingBuffer<CoordinatorSlot>>> = (0..dm_shards)
         .map(|_| Arc::new(MpscRingBuffer::<CoordinatorSlot>::new(64).unwrap()))
         .collect();
 
+    // THT
     let transfer_hash_tables: Vec<Arc<TransferHashTable>> = (0..dm_shards)
         .map(|_| Arc::new(TransferHashTable::new(64, PARTITION_SEED_K0, PARTITION_SEED_K1, 8).unwrap()))
         .collect();
     let dm_thts: Vec<Arc<TransferHashTable>> =
         transfer_hash_tables.iter().map(Arc::clone).collect();
 
+    // Overrides
     let overrides = PartitionAssignmentsOverrides::empty();
 
     let ls_writer_rbs: Vec<Arc<MpscRingBuffer<LsWriterSlot>>> = (0..dm_shards)
@@ -80,24 +84,29 @@ fn start_full_server(batch_accept: BatchAcceptConfig) -> FullTestServer {
     let actor_ls_writer_rbs_source: Vec<Arc<MpscRingBuffer<LsWriterSlot>>> =
         ls_writer_rbs.iter().map(Arc::clone).collect();
 
+    // Handler
     let handler = LedgerPipelineHandler::new(
         PARTITION_SEED_K0, PARTITION_SEED_K1, partitions_num,
         overrides, transfer_hash_tables.clone(), ls_writer_rbs, dm_shards,
     );
 
+    // Incoming RB
     let pipeline_rb = Arc::new(
         MpscRingBuffer::<IncomingSlot>::new(1024).unwrap(),
     );
 
+    // Pipeline thread
     let pipeline_incoming = Arc::clone(&pipeline_rb);
     thread::spawn(move || {
         let mut pipeline = Pipeline::new(0, pipeline_incoming, 64, partition_rb, handler);
         pipeline.run();
     });
 
+    // PVT tails
     let pvt_tails_arena = ringbuf::arena::Arena::new(partitions_num * 64).unwrap();
     let pvt_tails_base = pvt_tails_arena.as_ptr() as *mut u64;
 
+    // Actor threads
     for (i, actor_rb) in actor_rbs.into_iter().enumerate() {
         let paht = PartitionAccountsHashTable::new(64, PARTITION_SEED_K0, PARTITION_SEED_K1).unwrap();
         let pvt = PartitionVersionTable::new(64, PARTITION_SEED_K0, PARTITION_SEED_K1).unwrap();
@@ -117,6 +126,7 @@ fn start_full_server(batch_accept: BatchAcceptConfig) -> FullTestServer {
         });
     }
 
+    // DM threads
     for i in 0..dm_shards {
         let dm_coord_rb = Arc::clone(&coordinator_rbs[i]);
         let dm_tht = Arc::clone(&dm_thts[i]);
@@ -132,6 +142,7 @@ fn start_full_server(batch_accept: BatchAcceptConfig) -> FullTestServer {
         });
     }
 
+    // Worker + Acceptor
     let queue = Arc::new(RingBuffer::new(64));
     let worker_queue = Arc::clone(&queue);
     let worker_rb = Arc::clone(&pipeline_rb);
@@ -226,7 +237,7 @@ fn batch_all_or_nothing_with_invalid_rejected() {
 
     let batch_id = uuid_from_u64(200);
     let t1 = make_transfer(uuid_from_u64(1), uuid_from_u64(10), uuid_from_u64(20), 500);
-    let t2 = make_transfer(uuid_from_u64(2), uuid_from_u64(10), uuid_from_u64(20), 0);
+    let t2 = make_transfer(uuid_from_u64(2), uuid_from_u64(10), uuid_from_u64(20), 0); // amount=0!
 
     let (status, reject_count, rejects) = send_batch(&mut stream, batch_id, &[t1, t2]);
 
@@ -253,9 +264,9 @@ fn batch_partial_with_rejects() {
     send_handshake(&mut stream);
 
     let batch_id = uuid_from_u64(300);
-    let t1 = make_transfer(uuid_from_u64(1), uuid_from_u64(10), uuid_from_u64(20), 500);
-    let t2 = make_transfer(uuid_from_u64(2), uuid_from_u64(10), uuid_from_u64(20), 0);
-    let t3 = make_transfer(uuid_from_u64(3), uuid_from_u64(10), uuid_from_u64(20), 200);
+    let t1 = make_transfer(uuid_from_u64(1), uuid_from_u64(10), uuid_from_u64(20), 500); // OK
+    let t2 = make_transfer(uuid_from_u64(2), uuid_from_u64(10), uuid_from_u64(20), 0);   // BAD
+    let t3 = make_transfer(uuid_from_u64(3), uuid_from_u64(10), uuid_from_u64(20), 200); // OK
 
     let (status, reject_count, rejects) = send_batch(
         &mut stream, batch_id, &[t1, t2, t3],
@@ -319,7 +330,7 @@ fn batch_zero_transfer_id_rejected() {
     send_handshake(&mut stream);
 
     let batch_id = uuid_from_u64(500);
-    let t1 = make_transfer([0u8; 16], uuid_from_u64(10), uuid_from_u64(20), 100);
+    let t1 = make_transfer([0u8; 16], uuid_from_u64(10), uuid_from_u64(20), 100); // zero id!
 
     let (status, reject_count, rejects) = send_batch(&mut stream, batch_id, &[t1]);
 
@@ -340,7 +351,7 @@ fn batch_zero_account_id_rejected() {
     send_handshake(&mut stream);
 
     let batch_id = uuid_from_u64(600);
-    let t1 = make_transfer(uuid_from_u64(1), [0u8; 16], uuid_from_u64(20), 100);
+    let t1 = make_transfer(uuid_from_u64(1), [0u8; 16], uuid_from_u64(20), 100); // zero debit!
 
     let (status, reject_count, rejects) = send_batch(&mut stream, batch_id, &[t1]);
 
@@ -363,7 +374,7 @@ fn handshake_unsupported_version() {
     let mut payload = Vec::new();
     payload.extend_from_slice(&client_id);
     payload.push(CONN_COMMAND);
-    payload.extend_from_slice(&99u16.to_be_bytes());
+    payload.extend_from_slice(&99u16.to_be_bytes()); // unsupported!
 
     let mut frame = Vec::new();
     Codec::encode_request(MSG_HANDSHAKE_REQUEST, &payload, &mut frame);
@@ -433,7 +444,7 @@ fn batch_partial_zero_sequence_not_grouped() {
     let batch_id = uuid_from_u64(900);
 
     let t1 = make_transfer_with_seq(uuid_from_u64(1), uuid_from_u64(10), uuid_from_u64(20), 500, [0u8; 16]);
-    let t2 = make_transfer_with_seq(uuid_from_u64(2), uuid_from_u64(10), uuid_from_u64(20), 0,   [0u8; 16]);
+    let t2 = make_transfer_with_seq(uuid_from_u64(2), uuid_from_u64(10), uuid_from_u64(20), 0,   [0u8; 16]); // BAD
 
     let (status, reject_count, rejects) = send_batch(
         &mut stream, batch_id, &[t1, t2],
@@ -481,6 +492,7 @@ fn batch_partial_all_groups_rejected() {
     drain.release();
 }
 
+//-----------------THT-------------------
 
 #[test]
 fn full_pipeline_tht_cleanup() {
@@ -508,6 +520,7 @@ fn full_pipeline_tht_cleanup() {
     );
 }
 
+//---------few batched as serial---------
 
 #[test]
 fn full_pipeline_multiple_batches() {
@@ -547,6 +560,7 @@ fn full_pipeline_multiple_batches() {
     );
 }
 
+//------------Reject batches-------------
 
 #[test]
 fn full_pipeline_rejected_batch_no_tht_entry() {
@@ -570,6 +584,7 @@ fn full_pipeline_rejected_batch_no_tht_entry() {
     assert_eq!(server.transfer_hash_tables[0].count(), 0);
 }
 
+//------------- Smoke tests--------------
 
 #[test]
 fn full_pipeline_smoke_test() {
@@ -595,6 +610,7 @@ fn full_pipeline_smoke_test() {
 
 }
 
+//---------------------------------------------------
 
 
 
@@ -631,6 +647,7 @@ fn start_server(batch_accept: BatchAcceptConfig) -> TestServer {
 
     let queue = Arc::new(RingBuffer::new(64));
 
+    // Worker thread
     let worker_queue = Arc::clone(&queue);
     let worker_rb = Arc::clone(&pipeline_rb);
     thread::spawn(move || {
@@ -672,9 +689,11 @@ fn send_handshake(stream: &mut TcpStream) -> u8 {
 
     assert_eq!(&resp_buf[0..8], &MAGIC_RESPONSE);
     assert_eq!(resp_buf[8], MSG_HANDSHAKE_RESPONSE);
+    // payload_len
     let payload_len = u32::from_be_bytes([resp_buf[9], resp_buf[10], resp_buf[11], resp_buf[12]]) as usize;
     assert_eq!(payload_len, 1);
 
+    // status
     resp_buf[HEADER_SIZE]
 }
 
@@ -685,8 +704,19 @@ fn make_transfer(
     amount: i64,
 ) -> Vec<u8> {
     make_transfer_with_seq(transfer_id, debit, credit, amount, [0u8; 16])
+    /*let mut data = Vec::with_capacity(TRANSFER_BASE_SIZE);
 
+    data.extend_from_slice(&transfer_id);            // 0..16
+    data.extend_from_slice(&[0u8; 16]);              // 16..32  idempotency_key
+    data.extend_from_slice(&debit);                  // 32..48  debit_account_id
+    data.extend_from_slice(&credit);                 // 48..64  credit_account_id
+    data.extend_from_slice(&amount.to_be_bytes());   // 64..72  amount
+    data.extend_from_slice(&[0u8; 16]);              // 72..88  currency
+    data.extend_from_slice(&[0u8; 16]);              // 88..104 transfer_sequence_id
+    data.extend_from_slice(&1u64.to_be_bytes());     // 104..112 transfer_datetime
 
+    assert_eq!(data.len(), TRANSFER_BASE_SIZE);
+    data*/
 }
 
 fn send_batch(
@@ -696,6 +726,7 @@ fn send_batch(
 ) -> (u8, u16, Vec<(u8, [u8; 16])>) {
     let mut payload = Vec::new();
 
+    // BatchRequestHeader: batch_id(16) + count(2)
     payload.extend_from_slice(&batch_id);
     payload.extend_from_slice(&(transfers.len() as u16).to_be_bytes());
 
@@ -718,6 +749,7 @@ fn send_batch(
         [resp_buf[9], resp_buf[10], resp_buf[11], resp_buf[12]]
     ) as usize;
 
+    // batch_id(16) + status(1) + reject_count(2) + rejects(17 * N)
     let p = &resp_buf[HEADER_SIZE..HEADER_SIZE + payload_len];
 
     let mut resp_batch_id = [0u8; 16];
@@ -753,14 +785,14 @@ fn make_transfer_with_seq(
 ) -> Vec<u8> {
     let mut data = Vec::with_capacity(TRANSFER_BASE_SIZE);
 
-    data.extend_from_slice(&transfer_id);
-    data.extend_from_slice(&[0u8; 16]);
-    data.extend_from_slice(&debit);
-    data.extend_from_slice(&credit);
-    data.extend_from_slice(&amount.to_be_bytes());
-    data.extend_from_slice(&[0u8; 16]);
-    data.extend_from_slice(&transfer_sequence_id);
-    data.extend_from_slice(&1u64.to_be_bytes());
+    data.extend_from_slice(&transfer_id);                    // 0..16
+    data.extend_from_slice(&[0u8; 16]);                      // 16..32  idempotency_key
+    data.extend_from_slice(&debit);                          // 32..48  debit_account_id
+    data.extend_from_slice(&credit);                         // 48..64  credit_account_id
+    data.extend_from_slice(&amount.to_be_bytes());           // 64..72  amount
+    data.extend_from_slice(&[0u8; 16]);                      // 72..88  currency
+    data.extend_from_slice(&transfer_sequence_id);           // 88..104 transfer_sequence_id
+    data.extend_from_slice(&1u64.to_be_bytes());             // 104..112 transfer_datetime
 
     assert_eq!(data.len(), TRANSFER_BASE_SIZE);
     data
