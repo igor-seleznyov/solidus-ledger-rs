@@ -1,6 +1,7 @@
 use common::crc32c;
 use common::crc32c::crc32c;
 
+// LeDger STorage ManiFest ENtry magic word = 'LDSTMFEN'
 pub const MANIFEST_ENTRY_MAGIC: u64 = 0x4E45_464D_5453_444C;
 
 pub const MANIFEST_STATUS_CURRENT: u8 = 0;
@@ -114,6 +115,7 @@ mod tests {
 
     #[test]
     fn layout_offsets() {
+        // cache line 1: metadata
         assert_eq!(std::mem::offset_of!(ManifestEntry, file_seq), 0);
         assert_eq!(std::mem::offset_of!(ManifestEntry, status), 8);
         assert_eq!(std::mem::offset_of!(ManifestEntry, signing_enabled), 9);
@@ -126,6 +128,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ManifestEntry, timestamp_max_ns), 48);
         assert_eq!(std::mem::offset_of!(ManifestEntry, checksum), 56);
 
+        // cache line 2: filename
         assert_eq!(std::mem::offset_of!(ManifestEntry, filename), 64);
     }
 

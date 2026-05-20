@@ -709,6 +709,9 @@ mod tests {
     }
 }
 
+/// copy_nonoverlapping, UnsafeCell count.
+///
+/// cargo +nightly miri test -p ledger -- miri_tht
 #[cfg(test)]
 mod miri_tests {
     use std::cell::UnsafeCell;

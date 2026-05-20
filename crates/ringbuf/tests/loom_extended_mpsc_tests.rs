@@ -14,6 +14,7 @@ mod loom_extended_mpsc_tests {
             let slot1_seq = Arc::new(AtomicU64::new(0));
             let slot1_val = Arc::new(AtomicU64::new(0));
 
+            // Writer 1
             let cs1 = claim_seq.clone();
             let s0s1 = slot0_seq.clone(); let s0v1 = slot0_val.clone();
             let s1s1 = slot1_seq.clone(); let s1v1 = slot1_val.clone();
@@ -22,13 +23,14 @@ mod loom_extended_mpsc_tests {
                 let claimed = cs1.fetch_add(1, Ordering::Relaxed);
                 if claimed == 0 {
                     s0v1.store(1000, Ordering::Relaxed);
-                    s0s1.store(2, Ordering::Release);
+                    s0s1.store(2, Ordering::Release); // published (seq = claimed + capacity)
                 } else {
                     s1v1.store(1000, Ordering::Relaxed);
                     s1s1.store(3, Ordering::Release);
                 }
             });
 
+            // Writer 2
             let cs2 = claim_seq.clone();
             let s0s2 = slot0_seq.clone(); let s0v2 = slot0_val.clone();
             let s1s2 = slot1_seq.clone(); let s1v2 = slot1_val.clone();
@@ -64,7 +66,7 @@ mod loom_extended_mpsc_tests {
                 let v1 = slot1_val.load(Ordering::Relaxed);
                 assert!(v0 == 1000 || v0 == 2000, "slot0 corrupted: {v0}");
                 assert!(v1 == 1000 || v1 == 2000, "slot1 corrupted: {v1}");
-                assert_ne!(v0, v1, "оба слота от одного writer'а — race на claim");
+                assert_ne!(v0, v1, "both slots written by the same writer — race on claim");
             }
         });
     }

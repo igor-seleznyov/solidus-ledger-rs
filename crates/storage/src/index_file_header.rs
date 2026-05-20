@@ -2,8 +2,11 @@ use common::crc32c::crc32c;
 
 pub const INDEX_FORMAT_VERSION: u16 = 1;
 
+// 'LDSTIDXA' — LeDger STorage InDeX Accounts
 pub const INDEX_MAGIC_ACCOUNTS: u64 = 0x4158_4449_5453_444C;
+// 'LDSTIDXO' — LeDger STorage InDeX Ordinal
 pub const INDEX_MAGIC_ORDINAL: u64 = 0x4F58_4449_5453_444C;
+// 'LDSTIDXT' — LeDger STorage InDeX Timestamp
 pub const INDEX_MAGIC_TIMESTAMP: u64 = 0x5458_4449_5453_444C;
 
 #[repr(C)]

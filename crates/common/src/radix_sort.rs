@@ -163,10 +163,10 @@ mod tests {
     #[test]
     fn large_keys_grouped_by_low_16_bits() {
         let keys = vec![
-            0xAAAA_BBBB_0001_0002u64,
-            0xCCCC_DDDD_0001_0001u64,
-            0xEEEE_FFFF_0001_0002u64,
-            0x1111_2222_0001_0001u64,
+            0xAAAA_BBBB_0001_0002u64,  // low16 = 0x0002
+            0xCCCC_DDDD_0001_0001u64,  // low16 = 0x0001
+            0xEEEE_FFFF_0001_0002u64,  // low16 = 0x0002
+            0x1111_2222_0001_0001u64,  // low16 = 0x0001
         ];
         let mut indices = [0u16; 4];
         let mut temp = [0u16; 4];

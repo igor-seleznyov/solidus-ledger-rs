@@ -22,6 +22,7 @@ const K1: u64 = 0xFEDCBA9876543210;
 
 static mut TEST_COMMITTED_GSN: u64 = 0;
 
+// --- Helpers ---
 
 fn make_temp_dir(test_name: &str) -> String {
     let dir = make_test_dir();
@@ -285,6 +286,7 @@ fn rotation_data_written_to_new_file() {
     let first_path = writer.current_ls_file_path().to_string();
     let first_file_size = std::fs::metadata(&first_path)
         .expect("Failed to stat first LS file").len();
+    // Header page (4096) + data page (4096) = 8192
     assert!(first_file_size >= 8192);
 
     writer.rotate();
@@ -419,6 +421,7 @@ fn rotation_meta_header_linked_file_seq() {
 
     assert!(meta_bytes.len() >= LsMetaFileHeader::SIZE);
 
+    // linked_ls_file_seq at offset 40
     let linked_seq = u64::from_le_bytes(
         meta_bytes[40..48].try_into().unwrap()
     );

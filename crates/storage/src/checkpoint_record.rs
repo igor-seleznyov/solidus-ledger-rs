@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn verify_checksum_detects_corruption() {
         let mut record = CheckpointRecord::new(4096, 10, 0);
-        record.posting_count = 999;
+        record.posting_count = 999; // corrupt
         assert!(!unsafe { record.verify_checksum() });
     }
 

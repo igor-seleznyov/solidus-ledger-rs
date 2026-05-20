@@ -184,6 +184,7 @@ pub fn protect_rotated_files(
                 println!("[file-protection] immutable set: {}", path);
             }
             Ok(false) => {
+                // File does not exist - it is Ok
             }
             Err(error) => {
                 eprintln!(
@@ -277,23 +278,29 @@ mod tests {
         assert_eq!(result.unwrap(), false);
     }
 
+    // start with:
+    // sudo cargo test -p storage -- file_protection --ignored
     #[test]
-    #[ignore]
+    #[ignore] // requires CAP_LINUX_IMMUTABLE or root
     fn set_and_remove_immutable() {
         let dir = make_test_dir("set-remove");
         let path = format!("{}/test.ls", dir);
         create_test_file(&path);
 
+        // Set immutable
         let result = set_immutable(&path);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), true);
 
+        // Cannot write to immutable file
         let write_result = std::fs::write(&path, b"modified");
         assert!(write_result.is_err());
 
+        // Remove immutable
         let result = remove_immutable(&path);
         assert!(result.is_ok());
 
+        // Can write again
         let write_result = std::fs::write(&path, b"modified");
         assert!(write_result.is_ok());
 
@@ -301,11 +308,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore] // requires CAP_LINUX_IMMUTABLE or root
     fn protect_rotated_files_all() {
         let dir = make_test_dir("protect-all");
         let ls_path = format!("{}/test.ls", dir);
 
+        // Create all files
         create_test_file(&ls_path);
         create_test_file(&format!("{}.checkpoint", ls_path));
         create_test_file(&format!("{}.posting-accounts", ls_path));
@@ -316,10 +324,12 @@ mod tests {
 
         protect_rotated_files(&ls_path, true, true, true);
 
+        // All files should be immutable
         assert!(std::fs::write(&ls_path, b"x").is_err());
         assert!(std::fs::write(&format!("{}.checkpoint", ls_path), b"x").is_err());
         assert!(std::fs::write(&format!("{}.sign", ls_path), b"x").is_err());
 
+        // Cleanup: remove immutable first
         unprotect_rotated_files(&ls_path, true, true);
 
         cleanup(&dir);
@@ -327,13 +337,14 @@ mod tests {
 
     #[test]
     fn protect_missing_files_no_panic() {
+        // Non-existent path — should not panic, just warnings
         protect_rotated_files("/tmp/nonexistent-ls", false, false, true);
     }
 
     #[test]
     fn collect_paths_no_signing_no_metadata() {
         let paths = collect_rotated_file_paths("/data/ls/file.ls", false, false);
-        assert_eq!(paths.len(), 5);
+        assert_eq!(paths.len(), 5); // ls, checkpoint, posting-accounts, ordinal, timestamp
         assert!(paths.contains(&"/data/ls/file.ls".to_string()));
         assert!(paths.contains(&"/data/ls/file.ls.checkpoint".to_string()));
         assert!(paths.contains(&"/data/ls/file.ls.posting-accounts".to_string()));

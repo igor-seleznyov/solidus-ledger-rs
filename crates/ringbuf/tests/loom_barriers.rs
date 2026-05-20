@@ -13,11 +13,13 @@ mod loom_tests {
             let ready_w = ready.clone();
             let gsn_w = gsn.clone();
 
+            // Pipeline thread (writer)
             let writer = loom::thread::spawn(move || {
-                gsn_w.store(42, Ordering::Relaxed);
-                ready_w.store(1, Ordering::Release);
+                gsn_w.store(42, Ordering::Relaxed);      // plain write GSN
+                ready_w.store(1, Ordering::Release);      // release barrier
             });
 
+            // Decision Maker thread (reader)
             let reader = loom::thread::spawn(move || {
                 if ready.load(Ordering::Acquire) == 1 {
                     assert_eq!(gsn.load(Ordering::Relaxed), 42);

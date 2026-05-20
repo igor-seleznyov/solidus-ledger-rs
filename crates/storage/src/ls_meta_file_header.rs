@@ -3,7 +3,7 @@ use crate::consts::FILE_PAGE_SIZE;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::ls_file_header::LS_FILE_MAGIC;
 
-pub const LS_META_FILE_MAGIC: u64 = 0x4154_454D_5453_444C;
+pub const LS_META_FILE_MAGIC: u64 = 0x4154_454D_5453_444C;// LDSTMETA
 pub const LS_META_FORMAT_VERSION: u16 = 1;
 pub const LS_META_FILE_TYPE: u8 = 1;
 

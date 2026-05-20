@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn psl_bounded() {
         let mut paht = PartitionAccountsHashTable::new(256, K0, K1).unwrap();
-        let fill = 192u64;
+        let fill = 192u64;  // 75% load factor
 
         unsafe {
             for i in 1..=fill {
@@ -299,12 +299,15 @@ mod tests {
             assert_eq!((*found).staged_income, 200);
             assert_eq!((*found).staged_outcome, 50);
 
+            // Effective balance = balance + staged_income - staged_outcome
             let effective = (*found).balance + (*found).staged_income - (*found).staged_outcome;
             assert_eq!(effective, 1150);
         }
     }
 }
 
+///
+/// cargo +nightly miri test -p ledger -- miri_paht
 #[cfg(test)]
 mod miri_tests {
     use crate::account_slot::AccountSlot;

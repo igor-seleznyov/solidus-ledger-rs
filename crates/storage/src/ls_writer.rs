@@ -910,7 +910,7 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         let max_batches = if max_batch_bytes > 0 {
             max_ls_file_size / max_batch_bytes
         } else {
-            1024
+            1024 //fallback
         };
         let base_size = CheckpointFileHeader::SIZE + max_batches * CheckpointRecord::SIZE;
         base_size * checkpoint_prealloc_multiplier
@@ -1038,6 +1038,7 @@ mod tests {
     const K0: u64 = 0x0123456789ABCDEF;
     const K1: u64 = 0xFEDCBA9876543210;
 
+    // --- Mock FlushBackend ---
 
     const MAX_FILES: usize = 8;
 
@@ -1159,7 +1160,7 @@ mod tests {
             512,
             16,
             4,
-            0,
+            0,          // rules_checksum
             manifest,
             false,
             index_tx,
@@ -1422,8 +1423,8 @@ mod tests {
         assert!(writer.backend.fds_opened[0]);
         assert!(writer.backend.fds_opened[1]);
         assert_eq!(writer.backend.written.len(), 2);
-        assert_eq!(writer.backend.written[0].2, 0);
-        assert_eq!(writer.backend.written[0].1.len(), 4096);
+        assert_eq!(writer.backend.written[0].2, 0); // offset = 0
+        assert_eq!(writer.backend.written[0].1.len(), 4096); // full page
 
         assert_eq!(writer.backend.written[1].2, 0);
         assert_eq!(writer.backend.written[1].1.len(), CheckpointFileHeader::SIZE);
@@ -1622,6 +1623,7 @@ mod tests {
         writer.submit_flush();
         writer.poll_and_handle_completions();
 
+        // committed_gsn = min(IFMH) - 1 = 200 - 1 = 199
         let committed = unsafe { *writer.global_committed_gsn };
         assert_eq!(committed, 199);
     }
@@ -1739,6 +1741,7 @@ mod tests {
 
         writer.process_message(&make_remove_from_heap_slot(100));
 
+        // committed_gsn = min(IFMH) - 1 = 200 - 1 = 199
         let committed = unsafe { *writer.global_committed_gsn };
         assert_eq!(committed, 199);
     }
@@ -1827,7 +1830,7 @@ mod tests {
 
         assert_eq!(page.len(), 4096);
         let magic = u64::from_le_bytes(page[0..8].try_into().unwrap());
-        assert_eq!(magic, crate::ls_file_header::LS_FILE_MAGIC);
+        assert_eq!(magic, crate::ls_file_header::LS_FILE_MAGIC); // 'LDGRSTRG'
         assert!(page[128..].iter().all(|&b| b == 0));
     }
 
@@ -1855,9 +1858,11 @@ mod tests {
         writer.process_message(&make_flush_marker_slot(100, 1, 42));
 
         writer.submit_flush();
+        // writes: LS header + checkpoint header + ls flush = 3
         assert_eq!(writer.backend.written.len(), 3);
 
         writer.poll_and_handle_completions();
+        // + checkpoint record = 4
         assert_eq!(writer.backend.written.len(), 4);
 
         let (handle, data, offset) = &writer.backend.written[3];
@@ -1937,7 +1942,7 @@ mod tests {
         writer.submit_flush();
         writer.poll_and_handle_completions();
 
-        let (_, data, _) = &writer.backend.written[3];
+        let (_, data, _) = &writer.backend.written[3]; // checkpoint record
         let record = unsafe { CheckpointRecord::from_bytes(data) };
 
         assert_eq!(record.first_posting_offset, LsFileHeader::DATA_OFFSET as u64);
@@ -1950,6 +1955,7 @@ mod tests {
     fn checkpoint_header_written_at_initialize() {
         let writer = make_writer();
 
+        // writes[1] = checkpoint header (writes[0] = LS header)
         let (handle, data, offset) = &writer.backend.written[1];
         assert_eq!(*handle, writer.checkpoint_handle_index);
         assert_eq!(data.len(), CheckpointFileHeader::SIZE);
@@ -2015,19 +2021,20 @@ mod tests {
 
     #[test]
     fn should_rotate_false_when_max_size_zero() {
-        let writer = make_writer();
+        let writer = make_writer(); // max_ls_file_size = 0
         assert!(!writer.should_rotate());
     }
 
     #[test]
     fn should_rotate_false_when_below_max_size() {
-        let mut writer = make_writer_with_max_size(1024 * 1024);
+        let mut writer = make_writer_with_max_size(1024 * 1024); // 1MB
         assert!(!writer.should_rotate());
     }
 
     #[test]
     fn should_rotate_true_when_at_max_size() {
         let mut writer = make_writer_with_max_size(4096);
+        // max_ls_file_size = 4096
         assert!(writer.should_rotate());
     }
 
@@ -2094,6 +2101,7 @@ mod tests {
 
     #[test]
     fn auto_rotate_after_flush_completion() {
+        // max_ls_file_size = 4096 + 4096 = 8192
         let mut writer = make_writer_with_max_size(8192);
 
         let initial_file_seq = writer.file_seq;
@@ -2112,6 +2120,7 @@ mod tests {
 
     #[test]
     fn no_rotate_when_below_threshold() {
+        // max_ls_file_size = 8192 + 4096 = 12288
         let mut writer = make_writer_with_max_size(12288);
 
         let initial_file_seq = writer.file_seq;
@@ -2128,7 +2137,7 @@ mod tests {
         let name = generate_ls_filename(0, 0);
         assert!(name.starts_with("ls_"));
         assert!(name.ends_with("-0-0.ls"));
-        assert_eq!(name.len(), 29);
+        assert_eq!(name.len(), 29); // ls_ + YYYYMMDD-HHMMSS-mmm + -0-0.ls
 
         let name2 = generate_ls_filename(2, 15);
         assert!(name2.ends_with("-2-15.ls"));
@@ -2154,6 +2163,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ManifestEntry, timestamp_max_ns), 48);
         assert_eq!(std::mem::offset_of!(ManifestEntry, checksum), 56);
 
+        // cache line 2: filename
         assert_eq!(std::mem::offset_of!(ManifestEntry, filename), 64);
 
     }
@@ -2345,11 +2355,12 @@ mod tests {
             let header = CheckpointFileHeader::new(0);
             f.write_all(unsafe { header.as_bytes() }).unwrap();
 
+            // 3 checkpoint records
             for i in 0..3u32 {
                 let record = CheckpointRecord::new(
-                    4096 + i as u64 * 4096,
-                    32,
-                    i,
+                    4096 + i as u64 * 4096, // first_posting_offset
+                    32,                      // posting_count
+                    i,                       // batch_seq
                 );
                 f.write_all(unsafe { record.as_bytes() }).unwrap();
             }
@@ -2362,7 +2373,7 @@ mod tests {
         offset,
         CheckpointFileHeader::DATA_OFFSET as u64 + 3 * CheckpointRecord::SIZE as u64,
     );
-        assert_eq!(batch_seq, 3);
+        assert_eq!(batch_seq, 3); // last batch_seq (2) + 1
 
         cleanup_dir(&dir);
     }
@@ -2408,6 +2419,7 @@ mod tests {
             use std::io::Write;
             let mut f = std::fs::File::create(&ls_path).unwrap();
 
+            // Header page
             let header = LsFileHeader::new(false, 16, 256 * 1024 * 1024, 0, 0, false);
             let page = header.to_page();
             f.write_all(&page).unwrap();
@@ -2419,7 +2431,8 @@ mod tests {
                 record.gsn = 100 + i;
                 record.timestamp_ns = 1700000000_000_000_000 + i * 1_000_000;
                 record.amount = (i + 1) as i64 * 100;
-                unsafe { record.compute_checksum(); }
+
+                record.fill_checksum();
 
                 let offset = i as usize * PostingRecord::SIZE;
                 unsafe {
@@ -2500,7 +2513,7 @@ mod tests {
 
         let state = crate::recovery::recover_ls_state(&ls_path);
 
-        assert_eq!(state.postings_count, 37);
+        assert_eq!(state.postings_count, 37); // 32 + 5
         assert_eq!(state.gsn_min, 1);
         assert_eq!(state.gsn_max, 37);
         assert_eq!(
@@ -2538,7 +2551,9 @@ mod tests {
             r0.set_magic();
             r0.gsn = 100;
             r0.timestamp_ns = 1700000000_000_000_000;
-            unsafe { r0.compute_checksum(); }
+
+            r0.fill_checksum();
+
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     &r0 as *const PostingRecord as *const u8,
@@ -2550,8 +2565,10 @@ mod tests {
             let mut r1 = PostingRecord::zeroed();
             r1.set_magic();
             r1.gsn = 200;
-            unsafe { r1.compute_checksum(); }
-            r1.amount = 999;
+
+            r1.fill_checksum();
+
+            r1.amount = 999; // corrupt after checksum
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     &r1 as *const PostingRecord as *const u8,
@@ -2599,20 +2616,17 @@ mod tests {
             );
             writer.startup();
 
+            // 2 postings
             let mut slot1 = make_posting_slot(100, 500);
             slot1.posting.timestamp_ns = 1700000000_000_000_000;
-            unsafe {
-                slot1.posting.compute_checksum();
-            }
+            slot1.posting.fill_checksum();
             writer.process_message(&make_add_to_heap_slot(100));
             writer.process_message(&slot1);
             writer.process_message(&make_flush_marker_slot(100, 1, 42));
 
             let mut slot2 = make_posting_slot(200, 300);
             slot2.posting.timestamp_ns = 1700000000_001_000_000;
-            unsafe {
-                slot2.posting.compute_checksum();
-            }
+            slot2.posting.fill_checksum();
             writer.process_message(&make_add_to_heap_slot(200));
             writer.process_message(&slot2);
             writer.process_message(&make_flush_marker_slot(200, 2, 43));
@@ -2621,7 +2635,7 @@ mod tests {
             writer.poll_and_handle_completions();
 
             ls_path = writer.current_ls_file_path().to_string();
-        }
+        } // writer dropped, files closed
 
         {
             let manifest = Manifest::open(&dir, 0);
@@ -2662,9 +2676,7 @@ mod tests {
 
             let mut slot3 = make_posting_slot(300, 100);
             slot3.posting.timestamp_ns = 1700000000_002_000_000;
-            unsafe {
-                slot3.posting.compute_checksum();
-            }
+            slot3.posting.fill_checksum();
             writer.process_message(&make_add_to_heap_slot(300));
             writer.process_message(&slot3);
             writer.process_message(&make_flush_marker_slot(300, 3, 44));

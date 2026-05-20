@@ -237,10 +237,10 @@ impl PartitionActor {
         ls_slot.posting.ordinal = unsafe { (*account).ordinal };
         ls_slot.posting.prev_posting_record_offset = unsafe { (*account).ls_offset };
 
-        ls_slot.posting.timestamp_ns = 0;
-        ls_slot.posting.transfer_sequence_id = [0u8; 16];
-        ls_slot.posting.currency = [0u8; 16];
-        ls_slot.posting.transfer_posting_records_count = 0;
+        ls_slot.posting.timestamp_ns = 0;// TODO: from THT
+        ls_slot.posting.transfer_sequence_id = [0u8; 16];// TODO: from THT
+        ls_slot.posting.currency = [0u8; 16];// TODO: from THT
+        ls_slot.posting.transfer_posting_records_count = 0;// TODO: from THT entries_count
 
         unsafe {
             ls_slot.posting.compute_checksum();
@@ -251,6 +251,7 @@ impl PartitionActor {
     }
 }
 
+// -----------------------------------------------------------
 
 #[cfg(test)]
 #[cfg(not(miri))]
@@ -412,7 +413,7 @@ mod tests {
 
         unsafe {
             let account = actor.partition_accounts_hash_table.lookup(0, 1).unwrap();
-            assert_eq!((*account).staged_outcome, 1000);
+            assert_eq!((*account).staged_outcome, 1000); // 300 + 400 + 300
             assert_eq!((*account).last_gsn, 3);
         }
     }
@@ -428,7 +429,9 @@ mod tests {
             (*account).balance = 100;
         }
 
+        // DEBIT 50 → accept
         actor.handle_prepare(&make_partition_slot(account_id(1), 50, ENTRY_TYPE_DEBIT, 1));
+        // DEBIT 60 → reject (effective = 100 - 50 = 50, 50 < 60)
         actor.handle_prepare(&make_partition_slot(account_id(1), 60, ENTRY_TYPE_DEBIT, 2));
 
         unsafe {
@@ -444,8 +447,10 @@ mod tests {
         let partition_accounts_hash_table = PartitionAccountsHashTable::new(64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1).unwrap();
         let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
 
+        // CREDIT 500 → staged_income = 500
         actor.handle_prepare(&make_partition_slot(account_id(1), 500, ENTRY_TYPE_CREDIT, 1));
 
+        // DEBIT 300 → effective = 0 + 500 - 0 = 500 >= 300 → accept
         actor.handle_prepare(&make_partition_slot(account_id(1), 300, ENTRY_TYPE_DEBIT, 2));
 
         unsafe {
@@ -552,8 +557,8 @@ mod tests {
 
         unsafe {
             let account = actor.partition_accounts_hash_table.lookup(0, 1).unwrap();
-            assert_eq!((*account).balance, 700);
-            assert_eq!((*account).staged_outcome, 0);
+            assert_eq!((*account).balance, 700);        // 1000 - 300
+            assert_eq!((*account).staged_outcome, 0);   // 300 - 300
             assert_eq!((*account).ordinal, 1);
             assert_eq!((*account).last_gsn, 1);
         }
@@ -579,8 +584,8 @@ mod tests {
 
         unsafe {
             let account = actor.partition_accounts_hash_table.lookup(0, 1).unwrap();
-            assert_eq!((*account).balance, 700);
-            assert_eq!((*account).staged_income, 0);
+            assert_eq!((*account).balance, 700);        // 500 + 200
+            assert_eq!((*account).staged_income, 0);    // 200 - 200
             assert_eq!((*account).ordinal, 1);
         }
 
@@ -606,7 +611,7 @@ mod tests {
         unsafe {
             let account = actor.partition_accounts_hash_table.lookup(0, 1).unwrap();
             assert_eq!((*account).balance, 1000);
-            assert_eq!((*account).staged_outcome, 0);
+            assert_eq!((*account).staged_outcome, 0);   // 300 - 300
             assert_eq!((*account).ordinal, 0);
         }
 
@@ -650,6 +655,7 @@ mod tests {
             (*account).balance = 1000;
         }
 
+        // PREPARE DEBIT 300
         actor.handle_prepare(&make_partition_slot(account_id(1), 300, ENTRY_TYPE_DEBIT, 1));
 
         unsafe {
@@ -658,10 +664,12 @@ mod tests {
             assert_eq!((*account).balance, 1000);
         }
 
+        // drain PREPARE_OK
         let batch = coordinator_rbs[0].drain_batch(64);
         assert_eq!(batch.slot(0).msg_type, COORD_PREPARE_SUCCESS);
         batch.release();
 
+        // COMMIT DEBIT 300
         actor.handle_commit(&make_commit_slot(account_id(1), 300, ENTRY_TYPE_DEBIT, 1));
 
         unsafe {
@@ -671,6 +679,7 @@ mod tests {
             assert_eq!((*account).ordinal, 1);
         }
 
+        // drain COMMIT_OK
         let batch = coordinator_rbs[0].drain_batch(64);
         assert_eq!(batch.slot(0).msg_type, COORD_COMMIT_SUCCESS);
         batch.release();
@@ -685,10 +694,13 @@ mod tests {
             (*account).balance = 1000;
         }
 
+        // PREPARE DEBIT 300
         actor.handle_prepare(&make_partition_slot(account_id(1), 300, ENTRY_TYPE_DEBIT, 1));
 
+        // drain PREPARE_OK
         coordinator_rbs[0].drain_batch(64).release();
 
+        // ROLLBACK
         actor.handle_rollback(&make_rollback_slot(account_id(1), 300, ENTRY_TYPE_DEBIT, 1));
 
         unsafe {

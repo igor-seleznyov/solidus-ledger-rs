@@ -18,7 +18,7 @@ impl SignatureVerificationCache {
         }
     }
 
-    pub fn verify_or_cached(&mut self, ls_sign_path: &str) -> &SignatureVerifyResult {
+    pub fn verify_or_cached(&mut self, ls_sign_path: &str) -> SignatureVerifyResult {
         if !self.entries.contains_key(ls_sign_path) {
             let result = verify_ls_signatures(ls_sign_path);
             self.entries.insert(
@@ -29,7 +29,7 @@ impl SignatureVerificationCache {
                 }
             );
         }
-        &self.entries[ls_sign_path].result
+        self.entries[ls_sign_path].result.clone()
     }
 
     pub fn invalidate(&mut self, ls_sign_path: &str) {

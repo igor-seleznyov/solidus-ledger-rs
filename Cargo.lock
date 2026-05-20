@@ -76,9 +76,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -95,6 +93,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_yaml",
+ "thiserror",
  "uuid",
 ]
 
@@ -658,6 +657,7 @@ dependencies = [
  "ringbuf",
  "sha2",
  "storage",
+ "thiserror",
  "uuid",
 ]
 
@@ -677,12 +677,14 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "common",
+ "config",
  "ed25519-dalek",
  "io-uring",
  "libc",
  "mio",
  "pipeline",
  "ringbuf",
+ "serde",
  "sha2",
 ]
 
@@ -701,6 +703,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

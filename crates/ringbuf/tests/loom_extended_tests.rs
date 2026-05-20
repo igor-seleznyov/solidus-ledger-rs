@@ -7,15 +7,18 @@ mod loom_extended_tests {
     #[test]
     fn loom_extended_three_threads_pipeline_actor_dm() {
         loom::model(|| {
+            // THT slot (Pipeline → DM)
             let tht_ready = Arc::new(AtomicU8::new(0));
             let tht_gsn = Arc::new(AtomicU64::new(0));
             let tht_transfer_id_hi = Arc::new(AtomicU64::new(0));
             let tht_transfer_id_lo = Arc::new(AtomicU64::new(0));
             let tht_entries_count = Arc::new(AtomicU8::new(0));
 
+            // CoordRB slot (Actor → DM)
             let coord_sequence = Arc::new(AtomicU64::new(0));
-            let coord_result = Arc::new(AtomicU8::new(0));
+            let coord_result = Arc::new(AtomicU8::new(0)); // 0=pending, 1=COMMIT_OK
 
+            // --- Pipeline thread ---
             let tht_ready_p = tht_ready.clone();
             let tht_gsn_p = tht_gsn.clone();
             let tht_id_hi_p = tht_transfer_id_hi.clone();
@@ -27,22 +30,25 @@ mod loom_extended_tests {
                 tht_id_hi_p.store(0xAAAA, Ordering::Relaxed);
                 tht_id_lo_p.store(0xBBBB, Ordering::Relaxed);
                 tht_ec_p.store(2, Ordering::Relaxed);
+                // Release barrier: publish ready=1
                 tht_ready_p.store(1, Ordering::Release);
             });
 
+            // --- Actor thread ---
             let coord_seq_a = coord_sequence.clone();
             let coord_res_a = coord_result.clone();
 
             let actor = loom::thread::spawn(move || {
-                coord_res_a.store(1, Ordering::Relaxed);
-                coord_seq_a.store(100, Ordering::Release);
+                coord_res_a.store(1, Ordering::Relaxed);  // result = COMMIT_OK
+                coord_seq_a.store(100, Ordering::Release); // sequence = published
             });
 
+            // --- DM thread ---
             let dm = loom::thread::spawn(move || {
                 let seq = coord_sequence.load(Ordering::Acquire);
                 if seq == 100 {
                     let result = coord_result.load(Ordering::Relaxed);
-                    assert_eq!(result, 1, "COMMIT_OK должен быть виден после acquire(sequence)");
+                    assert_eq!(result, 1, "COMMIT_OK must be visible after acquire(sequence)");
 
                     let ready = tht_ready.load(Ordering::Acquire);
                     if ready == 1 {
@@ -51,7 +57,7 @@ mod loom_extended_tests {
                         let id_lo = tht_transfer_id_lo.load(Ordering::Relaxed);
                         let ec = tht_entries_count.load(Ordering::Relaxed);
 
-                        assert_eq!(gsn, 42, "GSN должен быть виден после acquire(ready)");
+                        assert_eq!(gsn, 42, "GSN must be visible after acquire(ready)");
                         assert_eq!(id_hi, 0xAAAA);
                         assert_eq!(id_lo, 0xBBBB);
                         assert_eq!(ec, 2);
@@ -108,6 +114,12 @@ mod loom_extended_tests {
         });
     }
 
+    ///
+    /// happens-before:
+    ///   Pipeline: write(GSN) → release(ready)
+    ///   Actor:    acquire(partition_seq) → write(PREPARE_OK) → release(coord_seq)
+    ///   DM:       acquire(coord_seq) → acquire(ready) → read(GSN)
+    ///
     #[test]
     fn loom_extended_full_chain_pipeline_actor_dm() {
         loom::model(|| {
@@ -115,12 +127,15 @@ mod loom_extended_tests {
             let tht_gsn = Arc::new(AtomicU64::new(0));
             let tht_entries_count = Arc::new(AtomicU8::new(0));
 
+            // PartitionRB (Pipeline → Actor)
             let partition_seq = Arc::new(AtomicU64::new(0));
             let partition_amount = Arc::new(AtomicU64::new(0));
 
+            // CoordRB (Actor → DM)
             let coord_seq = Arc::new(AtomicU64::new(0));
-            let coord_msg_type = Arc::new(AtomicU8::new(0));
+            let coord_msg_type = Arc::new(AtomicU8::new(0)); // 1=PREPARE_OK
 
+            // --- Pipeline ---
             let tht_ready_p = tht_ready.clone();
             let tht_gsn_p = tht_gsn.clone();
             let tht_ec_p = tht_entries_count.clone();
@@ -136,6 +151,7 @@ mod loom_extended_tests {
                 part_seq_p.store(1, Ordering::Release);
             });
 
+            // --- Actor ---
             let part_seq_a = partition_seq.clone();
             let part_amt_a = partition_amount.clone();
             let coord_seq_a = coord_seq.clone();
@@ -152,6 +168,7 @@ mod loom_extended_tests {
                 }
             });
 
+            // --- DM ---
             let dm = loom::thread::spawn(move || {
                 let cseq = coord_seq.load(Ordering::Acquire);
                 if cseq == 1 {

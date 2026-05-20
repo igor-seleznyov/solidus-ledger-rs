@@ -2,6 +2,7 @@ use common::crc32c::crc32c;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::checkpoint_record::CheckpointRecord;
 
+// 'LDSTCKPT'
 pub const CHECKPOINT_FILE_MAGIC: u64 = 0x5450_4B43_5453_444C;
 
 #[repr(C)]

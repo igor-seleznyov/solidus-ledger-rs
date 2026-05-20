@@ -2,7 +2,7 @@ use ringbuf::arena::Arena;
 
 #[test]
 fn mlock_512mb_allocate_and_release() {
-    let size = 512 * 1024 * 1024;
+    let size = 512 * 1024 * 1024; // 512 MB
 
     let arena = Arena::new(size)
         .expect("Failed to mmap+mlock 512MB — check ulimit -l");

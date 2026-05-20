@@ -2,6 +2,7 @@ use common::crc32c::crc32c;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::manifest_entry::ManifestEntry;
 
+// 'LDSTMNFT' - LeDger STorage MaNiFesT
 pub const MANIFEST_HEADER_MAGIC: u64 = 0x5446_4E4D_5453_444C;
 pub const MANIFEST_FORMAT_VERSION: u16 = 1;
 
