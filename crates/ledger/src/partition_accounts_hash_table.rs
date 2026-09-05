@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn psl_bounded() {
         let mut paht = PartitionAccountsHashTable::new(256, K0, K1).unwrap();
-        let fill = 192u64;  // 75% load factor
+        let fill = 192u64;
 
         unsafe {
             for i in 1..=fill {
@@ -299,13 +299,15 @@ mod tests {
             assert_eq!((*found).staged_income, 200);
             assert_eq!((*found).staged_outcome, 50);
 
-            // Effective balance = balance + staged_income - staged_outcome
             let effective = (*found).balance + (*found).staged_income - (*found).staged_outcome;
             assert_eq!(effective, 1150);
         }
     }
 }
 
+/// A Miri-friendly PAHT: a Vec in place of the mmap-backed Arena.
+/// It exists only to exercise the unsafe operations — swap, ptr::write and
+/// the rest — under the interpreter.
 ///
 /// cargo +nightly miri test -p ledger -- miri_paht
 #[cfg(test)]
@@ -340,6 +342,7 @@ mod miri_tests {
             }
         }
 
+        /// Identical to PartitionAccountsHashTable::get_or_create.
         unsafe fn get_or_create(&mut self, id_hi: u64, id_lo: u64) -> *mut AccountSlot {
             let hash = siphash13(self.seed_k0, self.seed_k1, id_hi, id_lo);
             let mut pos = (hash as usize) & self.mask;

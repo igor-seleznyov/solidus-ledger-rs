@@ -5,6 +5,7 @@ server:
 workers:
   count: 4
   tcp-rb-capacity: 1024
+  pipeline-wait-max-yields: 64
 
 pipeline:
   count: 1
@@ -20,10 +21,12 @@ partitions:
 
 protocol:
   metadata-size: 0
+  max-message-payload-bytes: 1048576
 
 batch-accept:
   all-or-nothing: true
   partial-reject-by-transfer-sequence-id: false
+  max-transfers-per-batch: 1024
 
 decision-maker:
   count: 1

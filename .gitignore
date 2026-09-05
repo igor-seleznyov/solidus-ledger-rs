@@ -1,3 +1,4 @@
+/target
 target/
 .git/
 .idea/
@@ -5,3 +6,9 @@ target/
 *.swo
 Cargo.lock
 *~
+tmp/
+
+# Leftover test output written into the source tree by earlier tests.
+# The tests that produced these now write under /tmp; nothing of this
+# kind belongs in version control.
+test.ls*

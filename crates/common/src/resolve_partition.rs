@@ -15,21 +15,21 @@ pub fn resolve_partition(
 mod tests {
     use super::*;
 
-    const K0: u64 = 0x0123456789ABCDEF;
-    const K1: u64 = 0xFEDCBA9876543210;
+    const PARTITION_SEED_K0: u64 = 0x0123456789ABCDEF;
+    const PARTITION_SEED_K1: u64 = 0xFEDCBA9876543210;
 
     #[test]
     fn partition_within_range() {
         for i in 0..100u64 {
-            let p = resolve_partition(0, i, K0, K1, 15);
+            let p = resolve_partition(0, i, PARTITION_SEED_K0, PARTITION_SEED_K1, 15);
             assert!(p < 16, "partition {} out of range for 16 partitions", p);
         }
     }
 
     #[test]
     fn deterministic() {
-        let p1 = resolve_partition(0, 42, K0, K1, 15);
-        let p2 = resolve_partition(0, 42, K0, K1, 15);
+        let p1 = resolve_partition(0, 42, PARTITION_SEED_K0, PARTITION_SEED_K1, 15);
+        let p2 = resolve_partition(0, 42, PARTITION_SEED_K0, PARTITION_SEED_K1, 15);
         assert_eq!(p1, p2, "same account must always map to same partition");
     }
 
@@ -37,7 +37,7 @@ mod tests {
     fn different_accounts_distribute() {
         let mut seen = [false; 16];
         for i in 0..1000u64 {
-            let p = resolve_partition(0, i, K0, K1, 15);
+            let p = resolve_partition(0, i, PARTITION_SEED_K0, PARTITION_SEED_K1, 15);
             seen[p] = true;
         }
         for (i, &s) in seen.iter().enumerate() {
@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn different_seeds_different_mapping() {
-        let p1 = resolve_partition(0, 42, K0, K1, 15);
+        let p1 = resolve_partition(0, 42, PARTITION_SEED_K0, PARTITION_SEED_K1, 15);
         let p2 = resolve_partition(0, 42, 99, 100, 15);
         assert_ne!(p1, p2);
     }

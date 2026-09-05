@@ -26,7 +26,7 @@ pub fn verify_ls_signatures(ls_sign_path: &str) -> SignatureVerifyResult {
 
     let mut header = LsSignFileHeader::zeroed();
     if file.read_exact(
-        unsafe { header.as_bytes_mut() }
+        header.as_bytes_mut()
     ).is_err() {
         return SignatureVerifyResult::ReadError("Failed to read signature file header".to_owned());
     }
@@ -35,7 +35,7 @@ pub fn verify_ls_signatures(ls_sign_path: &str) -> SignatureVerifyResult {
         return SignatureVerifyResult::InvalidHeader("Invalid magic in header".to_string())
     };
 
-    if !unsafe { header.verify_checksum() } {
+    if !header.verify_checksum() {
         return SignatureVerifyResult::InvalidHeader("Header checksum mismatch".to_string())
     };
 
@@ -80,7 +80,7 @@ pub fn verify_ls_signatures(ls_sign_path: &str) -> SignatureVerifyResult {
             );
         }
 
-        if !unsafe { record.verify_checksum() } {
+        if !record.verify_checksum() {
             return SignatureVerifyResult::ChecksumMismatch { record_index };
         }
 
@@ -151,11 +151,12 @@ mod tests {
         SigningKey::from_bytes(&[0x42u8; 32])
     }
 
+    /// Helper: builds a .sign file with a header and N signature records.
     fn write_sign_file(
         path: &str,
         key: &SigningKey,
         genesis: [u8; 32],
-        postings: &Vec<(u64, u64, u64)>, // (gsn, transfer_id_hi, transfer_id_lo, postings_hash)
+        postings: &Vec<(u64, u64, u64)>,
     ) {
         let mut file = std::fs::File::create(path).unwrap();
 
@@ -164,14 +165,13 @@ mod tests {
         pub_key_bytes.copy_from_slice(verifying_key.as_bytes());
 
         let header = LsSignFileHeader::new(
-            1, // algorithm = Ed25519
-            0, // key_version
-            0, // linked_ls_file_seq
+            1,
+            0,
+            0,
             pub_key_bytes,
             genesis,
         );
 
-        // Write header page (4096 bytes)
         let mut page = vec![0u8; 4096];
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -182,7 +182,6 @@ mod tests {
         }
         file.write_all(&page).unwrap();
 
-        // Write sig records
         let mut state = SigningState::new(key.clone(), genesis);
 
         for &(gsn, transfer_id_hi, transfer_id_lo) in postings {
@@ -191,10 +190,10 @@ mod tests {
                 transfer_id_lo,
                 gsn,
             );
-            unsafe { posting.compute_checksum(); }
+            posting.fill_checksum();
 
             let record = state.sign_posting(transfer_id_hi, transfer_id_lo, gsn, 0, &posting);
-            let bytes = unsafe { record.as_bytes() };
+            let bytes = record.as_bytes();
             file.write_all(bytes).unwrap();
         }
 
@@ -264,23 +263,16 @@ mod tests {
             (100, 0, 1),
         ]);
 
-        // Corrupt signature bytes in the file (offset: header page + record.signature offset)
         {
             use std::io::{Seek, SeekFrom};
             let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-            // signature at offset 128 in SigRecord (prev_tx_hash=96, postings_hash=128... check actual offset)
-            // SigRecord: magic(8) + transfer_id_hi(8) + transfer_id_lo(8) + gsn(8) + ls_offset(8) +
-            //            timestamp_ns(8) + postings_count(1) + algorithm(1) + key_version(2) + checksum(4) +
-            //            batch_seq(8) + prev_tx_hash(32) + postings_hash(32) + signature(64)
-            // signature starts at offset 128 from record start
-            let sig_offset = 4096 + 128; // DATA_OFFSET + offset of signature in record
+            let sig_offset = 4096 + 128;
             f.seek(SeekFrom::Start(sig_offset)).unwrap();
-            f.write_all(&[0xFF; 8]).unwrap(); // corrupt 8 bytes of signature
+            f.write_all(&[0xFF; 8]).unwrap();
             f.sync_all().unwrap();
         }
 
         let result = verify_ls_signatures(&path);
-        // CRC32C will fail first (before Ed25519)
         match result {
             SignatureVerifyResult::ChecksumMismatch { record_index } => {
                 assert_eq!(record_index, 0);
@@ -308,20 +300,16 @@ mod tests {
 
         let mut cache = SignatureVerificationCache::new();
 
-        // First call — verification happens
         let result = cache.verify_or_cached(&path);
         assert!(matches!(result, SignatureVerifyResult::Ok { records_count: 1 }));
         assert!(cache.last_verified(&path).is_some());
 
-        // Second call — cached, no re-verification
         let result2 = cache.verify_or_cached(&path);
         assert!(matches!(result2, SignatureVerifyResult::Ok { records_count: 1 }));
 
-        // Invalidate
         cache.invalidate(&path);
         assert!(cache.last_verified(&path).is_none());
 
-        // Third call — re-verification
         let result3 = cache.verify_or_cached(&path);
         assert!(matches!(result3, SignatureVerifyResult::Ok { records_count: 1 }));
 

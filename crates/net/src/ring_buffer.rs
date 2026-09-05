@@ -19,10 +19,10 @@ pub struct RingBuffer<T> {
 }
 
 #[repr(C, align(64))]
-struct CacheLinePad([u8; 56]);
+struct CacheLinePad([u8; 64]);
 
 impl CacheLinePad {
-    fn new() -> Self { Self([0; 56]) }
+    fn new() -> Self { Self([0; 64]) }
 }
 
 unsafe impl<T: Send> Send for RingBuffer<T> {}

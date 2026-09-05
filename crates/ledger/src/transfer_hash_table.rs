@@ -9,6 +9,22 @@ use ringbuf::hash_table_slot_status::{SLOT_DELETED, SLOT_FREE, SLOT_OCCUPIED};
 
 const NEIGHBOURHOOD_SIZE: usize = 32;
 
+
+/// **For defence:** `main` owns the DM shards' tables as a contiguous
+/// `Vec<TransferHashTable>`, so without explicit alignment each
+/// ~136-byte header would share a cache line with its neighbour's.
+/// The header mixes one per-message-mutable field (`count` — written
+/// on every insert and remove) with the read-mostly lookup fields
+/// (`slots`, `mask`, the SipHash seeds, `hop_bitmaps`) that the
+/// neighbouring shard's Decision Maker re-reads on every message:
+/// each `count` write would invalidate the neighbour's hot line
+/// (a ~40-70 ns coherence miss instead of an L1 hit whenever
+/// `decision-maker.count >= 2`). `align(64)` places every header on
+/// its own cache-line boundary, so cross-shard false sharing is
+/// impossible by layout. This is a stopgap: the THT-retirement
+/// redesign removes the per-message header writes entirely and
+/// re-evaluates this attribute (docs/STEPS.md §8-tht-retirement).
+#[repr(align(64))]
 pub struct TransferHashTable {
     #[allow(dead_code)]
     arena: Arena,
@@ -24,6 +40,7 @@ pub struct TransferHashTable {
     seed_k0: u64,
     seed_k1: u64,
 }
+
 
 unsafe impl Send for TransferHashTable {}
 unsafe impl Sync for TransferHashTable {}
@@ -101,7 +118,7 @@ impl TransferHashTable {
         transfer_sequence_id: &[u8; 16],
     ) -> u32 {
         let hash = siphash13(self.seed_k0, self.seed_k1, id_hi, id_lo);
-        let fp = (hash >> 56) as u8;
+        let fingerprint = (hash >> 56) as u8;
         let home = (hash as usize) & self.mask;
 
         let bitmap = self.hop_bitmaps[home];
@@ -117,7 +134,7 @@ impl TransferHashTable {
             let slot_transfer_id_lo = unsafe { (*slot).transfer_id_lo };
             let slot_status = unsafe { (*slot).status };
 
-            if slot_fingerprint == fp
+            if slot_fingerprint == fingerprint
                 && slot_transfer_id_hi == id_hi
                 && slot_transfer_id_lo == id_lo
                 && slot_status == SLOT_OCCUPIED {
@@ -134,7 +151,7 @@ impl TransferHashTable {
             if slot_status == SLOT_FREE || slot_status == SLOT_DELETED {
                 unsafe {
                     self.write_new_slot(
-                        slot, id_hi, id_lo, fp, gsn, connection_id, batch_id,
+                        slot, id_hi, id_lo, fingerprint, gsn, connection_id, batch_id,
                         currency, entries_count, transfer_datetime,
                         transfer_sequence_id,
                     );
@@ -154,7 +171,7 @@ impl TransferHashTable {
 
         unsafe {
             self.hop_and_insert(
-                home, id_hi, id_lo, fp, gsn, connection_id, batch_id,
+                home, id_hi, id_lo, fingerprint, gsn, connection_id, batch_id,
                 currency, entries_count, transfer_datetime,
                 transfer_sequence_id,
             )
@@ -163,7 +180,7 @@ impl TransferHashTable {
 
     pub unsafe fn lookup(&self, id_hi: u64, id_lo: u64) -> Option<u32> {
         let hash = siphash13(self.seed_k0, self.seed_k1, id_hi, id_lo);
-        let fp = (hash >> 56) as u8;
+        let fingerprint = (hash >> 56) as u8;
         let home = (hash as usize) & self.mask;
 
         let bitmap = self.hop_bitmaps[home];
@@ -179,7 +196,7 @@ impl TransferHashTable {
             let slot_transfer_id_lo = unsafe { (*slot).transfer_id_lo };
 
             if slot_status == SLOT_OCCUPIED
-                && slot_fingerprint == fp
+                && slot_fingerprint == fingerprint
                 && slot_transfer_id_hi == id_hi
                 && slot_transfer_id_lo == id_lo {
                 return Some(pos as u32);
@@ -196,7 +213,7 @@ impl TransferHashTable {
         home: usize,
         id_hi: u64,
         id_lo: u64,
-        fp: u8,
+        fingerprint: u8,
         gsn: u64,
         connection_id: u64,
         batch_id: &[u8; 16],
@@ -229,7 +246,7 @@ impl TransferHashTable {
                 let slot = unsafe { self.slots.add(free_pos) };
                 unsafe {
                     self.write_new_slot(
-                        slot, id_hi, id_lo, fp, gsn, connection_id, batch_id,
+                        slot, id_hi, id_lo, fingerprint, gsn, connection_id, batch_id,
                         currency, entries_count, transfer_datetime, transfer_sequence_id,
                     );
                 }
@@ -334,7 +351,7 @@ impl TransferHashTable {
         slot: *mut TransferSlot,
         id_hi: u64,
         id_lo: u64,
-        fp: u8,
+        fingerprint: u8,
         gsn: u64,
         connection_id: u64,
         batch_id: &[u8; 16],
@@ -347,7 +364,7 @@ impl TransferHashTable {
             transfer_id_hi: id_hi,
             transfer_id_lo: id_lo,
             psl: 0,
-            fingerprint: fp,
+            fingerprint,
             ready: 0,
             decision: 0,
             entries_count,
@@ -483,14 +500,14 @@ mod tests {
     use pipeline::transfer_slot::*;
     use ringbuf::hash_table_slot_status::SLOT_DELETED;
 
-    const K0: u64 = 0x0123456789ABCDEF;
-    const K1: u64 = 0xFEDCBA9876543210;
+    const TRANSFER_HASH_TABLE_SEED_K0: u64 = 0x0123456789ABCDEF;
+    const TRANSFER_HASH_TABLE_SEED_K1: u64 = 0xFEDCBA9876543210;
 
     fn batch_id() -> [u8; 16] { [0u8; 16] }
     fn currency() -> [u8; 16] {
-        let mut buf = [0u8; 16];
-        buf[..3].copy_from_slice(b"EUR");
-        buf
+        let mut currency_code = [0u8; 16];
+        currency_code[..3].copy_from_slice(b"EUR");
+        currency_code
     }
     fn seq_id() -> [u8; 16] { [0u8; 16] }
 
@@ -507,14 +524,14 @@ mod tests {
 
     #[test]
     fn create_empty() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap();
         assert_eq!(tht.count(), 0);
         assert_eq!(tht.capacity(), 64);
     }
 
     #[test]
     fn insert_and_read() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap();
         unsafe {
             let offset = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
             assert_eq!(tht.count(), 1);
@@ -529,18 +546,38 @@ mod tests {
 
     #[test]
     fn idempotent_insert() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap();
         unsafe {
-            let off1 = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
-            let off2 = tht.insert(0, 1, 200, 8, &batch_id(), &currency(), 2, 0, &seq_id());
-            assert_eq!(off1, off2);
+            let first_insert_offset = tht.insert(
+                0,
+                1,
+                100,
+                7,
+                &batch_id(),
+                &currency(),
+                2,
+                0,
+                &seq_id(),
+            );
+            let duplicate_insert_offset = tht.insert(
+                0,
+                1,
+                200,
+                8,
+                &batch_id(),
+                &currency(),
+                2,
+                0,
+                &seq_id(),
+            );
+            assert_eq!(first_insert_offset, duplicate_insert_offset);
             assert_eq!(tht.count(), 1);
         }
     }
 
     #[test]
     fn fill_entry_and_publish() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap();
         unsafe {
             let offset = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
             tht.fill_entry(offset, 0, &make_entry(10, -500, 0, 1));
@@ -556,7 +593,7 @@ mod tests {
 
     #[test]
     fn remove_marks_deleted_and_clears_bitmap() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap();
         unsafe {
             let offset = tht.insert(0, 1, 100, 7, &batch_id(), &currency(), 2, 0, &seq_id());
             tht.publish(offset);
@@ -573,17 +610,37 @@ mod tests {
 
     #[test]
     fn insert_reuses_deleted_slot() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap();
         unsafe {
-            let off1 = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
-            tht.publish(off1);
-            tht.remove(off1);
+            let offset_before_remove = tht.insert(
+                0,
+                1,
+                100,
+                0,
+                &batch_id(),
+                &currency(),
+                2,
+                0,
+                &seq_id(),
+            );
+            tht.publish(offset_before_remove);
+            tht.remove(offset_before_remove);
 
-            let off2 = tht.insert(0, 1, 200, 0, &batch_id(), &currency(), 2, 0, &seq_id());
+            let offset_after_remove = tht.insert(
+                0,
+                1,
+                200,
+                0,
+                &batch_id(),
+                &currency(),
+                2,
+                0,
+                &seq_id(),
+            );
             assert_eq!(tht.count(), 1);
-            assert_eq!(off1, off2);
+            assert_eq!(offset_before_remove, offset_after_remove);
 
-            let slot = tht.slot_ptr(off2);
+            let slot = tht.slot_ptr(offset_after_remove);
             assert_eq!((*slot).gsn, 200);
             assert_eq!((*slot).status, SLOT_OCCUPIED);
         }
@@ -591,11 +648,21 @@ mod tests {
 
     #[test]
     fn multiple_inserts() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap();
         unsafe {
             for i in 1..=10u64 {
-                let off = tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
-                let slot = tht.slot_ptr(off);
+                let transfer_offset = tht.insert(
+                    0,
+                    i,
+                    i * 100,
+                    0,
+                    &batch_id(),
+                    &currency(),
+                    2,
+                    0,
+                    &seq_id(),
+                );
+                let slot = tht.slot_ptr(transfer_offset);
                 assert_eq!((*slot).transfer_id_lo, i);
                 assert_eq!((*slot).gsn, i * 100);
             }
@@ -605,16 +672,26 @@ mod tests {
 
     #[test]
     fn multiple_inserts_and_removes() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap();
         unsafe {
             let mut offsets = Vec::new();
             for i in 1..=10u64 {
-                offsets.push(tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 2, 0, &seq_id()));
+                offsets.push(tht.insert(
+                    0,
+                    i,
+                    i * 100,
+                    0,
+                    &batch_id(),
+                    &currency(),
+                    2,
+                    0,
+                    &seq_id(),
+                ));
             }
             assert_eq!(tht.count(), 10);
 
-            for &off in &offsets[..5] {
-                tht.remove(off);
+            for &transfer_offset in &offsets[..5] {
+                tht.remove(transfer_offset);
             }
             assert_eq!(tht.count(), 5);
         }
@@ -622,18 +699,28 @@ mod tests {
 
     #[test]
     fn offset_stable_after_other_inserts() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap();
         unsafe {
-            let off1 = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
-            tht.fill_entry(off1, 0, &make_entry(10, -500, 0, 1));
-            tht.fill_entry(off1, 1, &make_entry(20, 500, 1, 2));
-            tht.publish(off1);
+            let transfer_offset = tht.insert(
+                0,
+                1,
+                100,
+                0,
+                &batch_id(),
+                &currency(),
+                2,
+                0,
+                &seq_id(),
+            );
+            tht.fill_entry(transfer_offset, 0, &make_entry(10, -500, 0, 1));
+            tht.fill_entry(transfer_offset, 1, &make_entry(20, 500, 1, 2));
+            tht.publish(transfer_offset);
 
             for i in 2..=21u64 {
                 tht.insert(0, i, i * 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
             }
 
-            let slot = tht.slot_ptr(off1);
+            let slot = tht.slot_ptr(transfer_offset);
             assert_eq!((*slot).transfer_id_lo, 1);
             assert_eq!((*slot).gsn, 100);
             assert_eq!((*slot).entries[0].amount, -500);
@@ -643,17 +730,27 @@ mod tests {
 
     #[test]
     fn lookup_finds_element() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap();
         unsafe {
-            let off = tht.insert(0, 42, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
+            let transfer_offset = tht.insert(
+                0,
+                42,
+                100,
+                0,
+                &batch_id(),
+                &currency(),
+                2,
+                0,
+                &seq_id(),
+            );
             let found = tht.lookup(0, 42);
-            assert_eq!(found, Some(off));
+            assert_eq!(found, Some(transfer_offset));
         }
     }
 
     #[test]
     fn lookup_returns_none_for_missing() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap();
         unsafe {
             tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
             assert!(tht.lookup(0, 999).is_none());
@@ -662,53 +759,85 @@ mod tests {
 
     #[test]
     fn overflow_works() {
-        let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 12).unwrap();
         unsafe {
-            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 10, 0, &seq_id());
+            let transfer_offset = tht.insert(
+                0,
+                1,
+                100,
+                0,
+                &batch_id(),
+                &currency(),
+                10,
+                0,
+                &seq_id(),
+            );
             for i in 0..8 {
-                tht.fill_entry(off, i, &make_entry(i as u64 + 10, 100, 0, 1));
+                tht.fill_entry(transfer_offset, i, &make_entry(i as u64 + 10, 100, 0, 1));
             }
-            tht.fill_overflow(off, 0, &make_entry(18, 200, 1, 2));
-            tht.fill_overflow(off, 1, &make_entry(19, 300, 1, 2));
-            tht.publish(off);
+            tht.fill_overflow(transfer_offset, 0, &make_entry(18, 200, 1, 2));
+            tht.fill_overflow(transfer_offset, 1, &make_entry(19, 300, 1, 2));
+            tht.publish(transfer_offset);
 
-            let ovf0 = tht.overflow_ptr(off, 0);
-            assert_eq!((*ovf0).account_id_lo, 18);
+            let first_overflow_entry = tht.overflow_ptr(transfer_offset, 0);
+            assert_eq!((*first_overflow_entry).account_id_lo, 18);
 
-            let e8 = tht.get_entry(off, 8);
-            assert_eq!(e8.account_id_lo, 18);
-            assert_eq!(e8.amount, 200);
+            let entry_at_index_eight = tht.get_entry(transfer_offset, 8);
+            assert_eq!(entry_at_index_eight.account_id_lo, 18);
+            assert_eq!(entry_at_index_eight.amount, 200);
         }
     }
 
     #[test]
     fn unpublished_slot_has_ready_zero() {
-        let tht = TransferHashTable::new(64, K0, K1, 8).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap();
         unsafe {
-            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 2, 0, &seq_id());
-            let slot = tht.slot_ptr(off);
+            let transfer_offset = tht.insert(
+                0,
+                1,
+                100,
+                0,
+                &batch_id(),
+                &currency(),
+                2,
+                0,
+                &seq_id(),
+            );
+            let slot = tht.slot_ptr(transfer_offset);
             assert_eq!((*slot).ready, 0);
         }
     }
 
     #[test]
     fn get_entry_inline_and_overflow() {
-        let tht = TransferHashTable::new(64, K0, K1, 12).unwrap();
+        let tht = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 12).unwrap();
         unsafe {
-            let off = tht.insert(0, 1, 100, 0, &batch_id(), &currency(), 10, 0, &seq_id());
+            let transfer_offset = tht.insert(
+                0,
+                1,
+                100,
+                0,
+                &batch_id(),
+                &currency(),
+                10,
+                0,
+                &seq_id(),
+            );
             for i in 0..8 {
-                tht.fill_entry(off, i, &make_entry(i as u64 + 10, 100, 0, 1));
+                tht.fill_entry(transfer_offset, i, &make_entry(i as u64 + 10, 100, 0, 1));
             }
-            tht.fill_overflow(off, 0, &make_entry(18, 200, 1, 2));
-            tht.fill_overflow(off, 1, &make_entry(19, 300, 1, 2));
+            tht.fill_overflow(transfer_offset, 0, &make_entry(18, 200, 1, 2));
+            tht.fill_overflow(transfer_offset, 1, &make_entry(19, 300, 1, 2));
 
-            assert_eq!(tht.get_entry(off, 7).account_id_lo, 17);
-            assert_eq!(tht.get_entry(off, 8).account_id_lo, 18);
-            assert_eq!(tht.get_entry(off, 9).account_id_lo, 19);
+            assert_eq!(tht.get_entry(transfer_offset, 7).account_id_lo, 17);
+            assert_eq!(tht.get_entry(transfer_offset, 8).account_id_lo, 18);
+            assert_eq!(tht.get_entry(transfer_offset, 9).account_id_lo, 19);
         }
     }
 }
 
+/// A Miri-friendly THT: a Vec in place of the Arena.
+/// Covers Hopscotch insert, lookup and remove, the bitmap, hop_and_insert,
 /// copy_nonoverlapping, UnsafeCell count.
 ///
 /// cargo +nightly miri test -p ledger -- miri_tht
@@ -771,7 +900,7 @@ mod miri_tests {
 
         unsafe fn insert(&self, id_hi: u64, id_lo: u64) -> u32 {
             let hash = siphash13(self.seed_k0, self.seed_k1, id_hi, id_lo);
-            let fp = (hash >> 56) as u8;
+            let fingerprint = (hash >> 56) as u8;
             let home = (hash as usize) & self.mask;
 
             let bitmap = self.hop_bitmaps[home];
@@ -780,7 +909,7 @@ mod miri_tests {
                 let bit_pos = check_bits.trailing_zeros() as usize;
                 let pos = (home + bit_pos) & self.mask;
                 let slot = self.slots.add(pos);
-                if (*slot).fingerprint == fp
+                if (*slot).fingerprint == fingerprint
                     && (*slot).transfer_id_hi == id_hi
                     && (*slot).transfer_id_lo == id_lo
                     && (*slot).status == SLOT_OCCUPIED
@@ -794,7 +923,7 @@ mod miri_tests {
                 let pos = (home + offset) & self.mask;
                 let slot = self.slots.add(pos);
                 if (*slot).status == SLOT_FREE || (*slot).status == SLOT_DELETED {
-                    self.write_new_slot(slot, id_hi, id_lo, fp);
+                    self.write_new_slot(slot, id_hi, id_lo, fingerprint);
 
                     let bitmaps_ptr = self.hop_bitmaps.as_ptr() as *mut u32;
                     *bitmaps_ptr.add(home) |= 1u32 << offset;
@@ -811,12 +940,12 @@ mod miri_tests {
             slot: *mut TransferSlot,
             id_hi: u64,
             id_lo: u64,
-            fp: u8,
+            fingerprint: u8,
         ) {
             let new_slot = TransferSlot {
                 transfer_id_hi: id_hi,
                 transfer_id_lo: id_lo,
-                fingerprint: fp,
+                fingerprint,
                 status: SLOT_OCCUPIED,
                 entries_count: 2,
                 ..TransferSlot::zeroed()
@@ -826,7 +955,7 @@ mod miri_tests {
 
         unsafe fn lookup(&self, id_hi: u64, id_lo: u64) -> Option<u32> {
             let hash = siphash13(self.seed_k0, self.seed_k1, id_hi, id_lo);
-            let fp = (hash >> 56) as u8;
+            let fingerprint = (hash >> 56) as u8;
             let home = (hash as usize) & self.mask;
 
             let bitmap = self.hop_bitmaps[home];
@@ -838,7 +967,7 @@ mod miri_tests {
                 let slot = self.slots.add(pos);
 
                 if (*slot).status == SLOT_OCCUPIED
-                    && (*slot).fingerprint == fp
+                    && (*slot).fingerprint == fingerprint
                     && (*slot).transfer_id_hi == id_hi
                     && (*slot).transfer_id_lo == id_lo
                 {
@@ -888,12 +1017,12 @@ mod miri_tests {
         }
     }
 
-    const K0: u64 = 0x0123456789ABCDEF;
-    const K1: u64 = 0xFEDCBA9876543210;
+    const TRANSFER_HASH_TABLE_SEED_K0: u64 = 0x0123456789ABCDEF;
+    const TRANSFER_HASH_TABLE_SEED_K1: u64 = 0xFEDCBA9876543210;
 
     #[test]
     fn miri_tht_insert_and_lookup() {
-        let table = MiriTht::new(64, K0, K1);
+        let table = MiriTht::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1);
 
         unsafe {
             let offset = table.insert(100, 200);
@@ -905,7 +1034,7 @@ mod miri_tests {
 
     #[test]
     fn miri_tht_insert_duplicate() {
-        let table = MiriTht::new(64, K0, K1);
+        let table = MiriTht::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1);
 
         unsafe {
             let offset1 = table.insert(100, 200);
@@ -917,7 +1046,7 @@ mod miri_tests {
 
     #[test]
     fn miri_tht_remove() {
-        let table = MiriTht::new(64, K0, K1);
+        let table = MiriTht::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1);
 
         unsafe {
             let offset = table.insert(100, 200);
@@ -931,7 +1060,7 @@ mod miri_tests {
 
     #[test]
     fn miri_tht_fill_and_get_entry() {
-        let table = MiriTht::new(64, K0, K1);
+        let table = MiriTht::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1);
 
         unsafe {
             let offset = table.insert(100, 200);
@@ -953,7 +1082,7 @@ mod miri_tests {
 
     #[test]
     fn miri_tht_multiple_inserts_and_removes() {
-        let table = MiriTht::new(64, K0, K1);
+        let table = MiriTht::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1);
 
         unsafe {
             let mut offsets = Vec::new();
@@ -982,7 +1111,7 @@ mod miri_tests {
 
     #[test]
     fn miri_tht_copy_nonoverlapping_in_write_new_slot() {
-        let table = MiriTht::new(64, K0, K1);
+        let table = MiriTht::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1);
 
         unsafe {
             let offset = table.insert(0xDEAD, 0xBEEF);

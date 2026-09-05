@@ -3,6 +3,9 @@ use std::error::Error;
 use std::fs;
 use serde::Deserialize;
 use uuid::Uuid;
+use protocol::consts::MAX_PAYLOAD_SIZE;
+use protocol::request::BatchRequestHeader;
+use protocol::transfer::TRANSFER_BASE_SIZE;
 use crate::parse::deserialize_instance_id_hex;
 use crate::time_window_config::TimeWindowConfig;
 
@@ -31,6 +34,22 @@ pub struct ServerConfig {
 pub struct WorkersConfig {
     pub count: usize,
     pub tcp_rb_capacity: usize,
+
+    /// How many times a Worker hands the core to the scheduler, and comes
+    /// back to a still-full Incoming Ring Buffer, before it answers the
+    /// client BUSY.
+    ///
+    /// This is the only wait in the system that gives up. Every producer
+    /// behind the ingress holds work the ledger has already taken
+    /// responsibility for and waits as long as it must; the Worker is the
+    /// one place where nothing has been accepted yet and a client is still
+    /// on the line to be told so.
+    ///
+    /// The bound counts scheduler round-trips rather than elapsed time so
+    /// that the same batch meets the same answer on every run. Its
+    /// wall-clock length is whatever the machine makes it, and is a thing
+    /// to measure on the target rather than to promise here.
+    pub pipeline_wait_max_yields: u32,
 }
 
 #[derive(Deserialize)]
@@ -56,6 +75,18 @@ pub struct PartitionsConfig {
 #[serde(rename_all = "kebab-case")]
 pub struct ProtocolConfig {
     pub metadata_size: usize,
+
+    /// How many payload bytes the server will accumulate for one
+    /// message before refusing it.
+    ///
+    /// Judged on the thirteen-byte message header, before any payload
+    /// byte is buffered, and it governs every message type rather than
+    /// batches alone. Deliberately NOT derived from
+    /// `batch-accept.max-transfers-per-batch`: that bound is about how
+    /// much work a complete message asks for, this one about how many
+    /// bytes an incomplete one may pin. Startup refuses a
+    /// configuration in which the two could collide.
+    pub max_message_payload_bytes: usize,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -63,6 +94,22 @@ pub struct ProtocolConfig {
 pub struct BatchAcceptConfig {
     pub all_or_nothing: bool,
     pub partial_reject_by_transfer_sequence_id: bool,
+
+    /// The largest number of transfers one batch may declare.
+    ///
+    /// A client-supplied count is otherwise a `u16`, which admits
+    /// 65 535 transfers against an ingress ring of a few thousand
+    /// slots — a batch the ring can never hold, sent by anyone who can
+    /// open a connection. The bound is what turns that from a way to
+    /// stop the process into an answer the client receives.
+    ///
+    /// Startup refuses a value of zero, and refuses a value whose
+    /// product with the worker count exceeds the ingress ring's
+    /// capacity: every Worker is a producer, so that product is the
+    /// burst the ring must absorb, and a configuration that cannot
+    /// absorb it makes refusal the steady state rather than the
+    /// exception.
+    pub max_transfers_per_batch: usize,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +218,9 @@ impl Config {
         if self.workers.tcp_rb_capacity == 0 {
             return Err("workers.tcp-rb-capacity must be > 0".into());
         }
+        if self.workers.pipeline_wait_max_yields == 0 {
+            return Err("workers.pipeline-wait-max-yields must be > 0".into());
+        }
         if self.decision_maker.count == 0 {
             return Err("decision-maker.count must be > 0".into());
         }
@@ -224,6 +274,50 @@ impl Config {
         }
         if self.pipeline.incoming_rb_batch_size > self.pipeline.incoming_rb_capacity {
             return Err("pipeline.incoming-rb-batch-size must be <= incoming-rb-capacity".into());
+        }
+
+        let incoming_rb_capacity = self.pipeline.incoming_rb_capacity;
+        let worker_count = self.workers.count;
+        let max_transfers_per_batch = self.batch_accept.max_transfers_per_batch;
+        if max_transfers_per_batch == 0 {
+            return Err(format!(
+                "batch-accept.max-transfers-per-batch must be > 0 \
+                 (workers.count is {worker_count}, \
+                 pipeline.incoming-rb-capacity is {incoming_rb_capacity})"
+            ).into());
+        }
+        let simultaneous_burst =
+            max_transfers_per_batch.saturating_mul(worker_count);
+        if simultaneous_burst > incoming_rb_capacity {
+            return Err(format!(
+                "batch-accept.max-transfers-per-batch is {max_transfers_per_batch} \
+                 and {worker_count} workers can each claim that much at once, \
+                 which is {simultaneous_burst} against \
+                 pipeline.incoming-rb-capacity {incoming_rb_capacity}; \
+                 refusal would be the steady state rather than the exception"
+            ).into());
+        }
+
+        let max_message_payload_bytes = self.protocol.max_message_payload_bytes;
+        let largest_legitimate_batch_payload = BatchRequestHeader::SIZE.saturating_add(
+            max_transfers_per_batch
+                .saturating_mul(TRANSFER_BASE_SIZE + self.protocol.metadata_size),
+        );
+        if max_message_payload_bytes <= largest_legitimate_batch_payload {
+            return Err(format!(
+                "protocol.max-message-payload-bytes is {max_message_payload_bytes}, \
+                 which is not above the {largest_legitimate_batch_payload} bytes the \
+                 largest legitimate batch occupies at \
+                 batch-accept.max-transfers-per-batch {max_transfers_per_batch}; \
+                 an over-count batch would be killed on the message header instead \
+                 of receiving the refusal the ingress is built to send"
+            ).into());
+        }
+        if max_message_payload_bytes > MAX_PAYLOAD_SIZE as usize {
+            return Err(format!(
+                "protocol.max-message-payload-bytes is {max_message_payload_bytes}, \
+                 above the protocol's absolute frame ceiling {MAX_PAYLOAD_SIZE}"
+            ).into());
         }
         if self.storage.flush_timeout_ms == 0 {
             return Err("storage.flush-timeout-ms must be > 0".into());
@@ -327,6 +421,7 @@ server:
 workers:
   count: 4
   tcp-rb-capacity: 1024
+  pipeline-wait-max-yields: 64
 pipeline:
   count: 1
   incoming-rb-capacity: 1024
@@ -338,9 +433,11 @@ partitions:
   partition-rb-batch-size: 64
 protocol:
   metadata-size: 0
+  max-message-payload-bytes: 1048576
 batch-accept:
   all-or-nothing: true
   partial-reject-by-transfer-sequence-id: false
+  max-transfers-per-batch: 256
 decision-maker:
   count: 1
   transfer-hash-table-capacity: 16384
@@ -372,6 +469,7 @@ storage:
         let path = write_temp_config("valid", VALID_YAML);
         let config = Config::load(&path).expect("should load");
         assert_eq!(config.workers.count, 4);
+        assert_eq!(config.workers.pipeline_wait_max_yields, 64);
         assert_eq!(config.pipeline.count, 1);
         assert_eq!(config.pipeline.incoming_rb_capacity, 1024);
         assert_eq!(config.pipeline.incoming_rb_batch_size, 64);
@@ -394,6 +492,8 @@ storage:
         assert_eq!(config.storage.max_ls_file_size_mb, 256);
         assert!(config.batch_accept.all_or_nothing);
         assert!(!config.batch_accept.partial_reject_by_transfer_sequence_id);
+        assert_eq!(config.batch_accept.max_transfers_per_batch, 256);
+        assert_eq!(config.protocol.max_message_payload_bytes, 1_048_576);
         assert!(config.storage.posting_metadata.enabled);
         assert_eq!(config.storage.posting_metadata.record_size, 256);
         assert_eq!(config.storage.checkpoint_prealloc_multiplier, 4);
@@ -437,6 +537,116 @@ storage:
         let path = write_temp_config("zero-workers", &yaml);
         let result = Config::load(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_zero_pipeline_wait_max_yields() {
+        let yaml = VALID_YAML.replace(
+            "pipeline-wait-max-yields: 64",
+            "pipeline-wait-max-yields: 0",
+        );
+        let config: Config = serde_yaml::from_str(&yaml).expect("yaml must parse");
+        assert!(
+            config.validate().is_err(),
+            "an allowance of zero would refuse every batch on the first full ring",
+        );
+    }
+
+    #[test]
+    fn validate_zero_max_transfers_per_batch() {
+        let yaml = VALID_YAML.replace(
+            "max-transfers-per-batch: 256",
+            "max-transfers-per-batch: 0",
+        );
+        let config: Config = serde_yaml::from_str(&yaml).expect("yaml must parse");
+        let error = config.validate().expect_err("a bound of zero must refuse to start");
+        let message = error.to_string();
+        assert!(
+            message.contains("must be > 0"),
+            "the message must state the rule: {message}",
+        );
+        assert!(
+            message.contains("workers.count is 4"),
+            "the message must name the worker count: {message}",
+        );
+        assert!(
+            message.contains("1024"),
+            "the message must name the ring capacity it is judged against: {message}",
+        );
+    }
+
+    #[test]
+    fn validate_max_transfers_per_batch_above_the_worker_aggregate_share() {
+        let yaml = VALID_YAML.replace(
+            "max-transfers-per-batch: 256",
+            "max-transfers-per-batch: 512",
+        );
+        let config: Config = serde_yaml::from_str(&yaml).expect("yaml must parse");
+        let error = config
+            .validate()
+            .expect_err("four workers claiming 512 each cannot fit a 1024-slot ring");
+        let message = error.to_string();
+        assert!(
+            message.contains("512"),
+            "the message must name the configured bound: {message}",
+        );
+        assert!(
+            message.contains("2048"),
+            "the message must name the simultaneous burst: {message}",
+        );
+        assert!(
+            message.contains("1024"),
+            "the message must name the ring capacity: {message}",
+        );
+    }
+
+    #[test]
+    fn validate_max_transfers_per_batch_at_the_worker_aggregate_share_is_allowed() {
+        let config: Config = serde_yaml::from_str(VALID_YAML).expect("yaml must parse");
+        assert_eq!(config.batch_accept.max_transfers_per_batch, 256);
+        assert_eq!(config.workers.count, 4);
+        assert_eq!(config.pipeline.incoming_rb_capacity, 1024);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_message_payload_budget_below_the_largest_legitimate_batch() {
+        let yaml = VALID_YAML.replace(
+            "max-message-payload-bytes: 1048576",
+            "max-message-payload-bytes: 20000",
+        );
+        let config: Config = serde_yaml::from_str(&yaml).expect("yaml must parse");
+        let error = config
+            .validate()
+            .expect_err("a budget under the largest legitimate batch must refuse to start");
+        let message = error.to_string();
+        assert!(message.contains("20000"), "the message must name the budget: {message}");
+        assert!(
+            message.contains("28690"),
+            "the message must name the largest legitimate batch payload: {message}",
+        );
+    }
+
+    #[test]
+    fn validate_message_payload_budget_above_the_absolute_ceiling() {
+        let yaml = VALID_YAML.replace(
+            "max-message-payload-bytes: 1048576",
+            "max-message-payload-bytes: 33554432",
+        );
+        let config: Config = serde_yaml::from_str(&yaml).expect("yaml must parse");
+        let error = config
+            .validate()
+            .expect_err("a budget above the protocol ceiling must refuse to start");
+        assert!(error.to_string().contains("33554432"));
+    }
+
+    #[test]
+    fn validate_message_payload_budget_leaves_room_for_the_batch_bound() {
+        let config: Config = serde_yaml::from_str(VALID_YAML).expect("yaml must parse");
+        let largest_legitimate_batch_payload = 18 + 256 * 112;
+        assert_eq!(largest_legitimate_batch_payload, 28_690);
+        assert!(config.protocol.max_message_payload_bytes > largest_legitimate_batch_payload);
+        assert!(config.validate().is_ok());
     }
 
     #[test]

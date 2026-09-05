@@ -5,7 +5,6 @@ use std::collections::HashSet;
 use common::crc32c::crc32c;
 use crate::time_utils::{now_ns, format_utc_timestamp};
 
-// --- Constants ---
 
 /// File-header magic: "SLTSPGLr" — Solidus Ledger Tampering Segment Page Global Log record.
 pub const TAMPERING_LOG_MAGIC: u64 = 0x534C545350474C72;
@@ -26,7 +25,6 @@ const MAX_CONSECUTIVE_BAD_ENTRIES: usize = 16;
 /// See ADR-017 §Amendment 2026-05-09.
 pub const ZERO_INSTANCE_ID: [u8; 16] = [0u8; 16];
 
-// --- Enums ---
 
 /// Recovery-path error type for `TamperingLog`.
 ///
@@ -102,19 +100,24 @@ pub enum TamperingKind {
     SegmentRejected     = 9,
 }
 
-impl TamperingKind {
-    pub fn from_u8(value: u8) -> Option<Self> {
+/// Canonical conversion from on-disk discriminant byte. Returns `Err(())`
+/// for unrecognised values; callers treat unknown kinds as a conservative
+/// compromise indicator (insert into `CompromisedFileSet`).
+impl TryFrom<u8> for TamperingKind {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, ()> {
         match value {
-            1 => Some(Self::Signature),
-            2 => Some(Self::Crc),
-            3 => Some(Self::Deleted),
-            4 => Some(Self::ImmutableRemoved),
-            5 => Some(Self::Replaced),
-            6 => Some(Self::Moved),
-            7 => Some(Self::Restored),
-            8 => Some(Self::ForensicAccess),
-            9 => Some(Self::SegmentRejected),
-            _ => None,
+            1 => Ok(Self::Signature),
+            2 => Ok(Self::Crc),
+            3 => Ok(Self::Deleted),
+            4 => Ok(Self::ImmutableRemoved),
+            5 => Ok(Self::Replaced),
+            6 => Ok(Self::Moved),
+            7 => Ok(Self::Restored),
+            8 => Ok(Self::ForensicAccess),
+            9 => Ok(Self::SegmentRejected),
+            _ => Err(()),
         }
     }
 }
@@ -131,15 +134,17 @@ pub enum DetectionSource {
     OperatorCli         = 5,
 }
 
-impl DetectionSource {
-    pub fn from_u8(value: u8) -> Option<Self> {
+impl TryFrom<u8> for DetectionSource {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, ()> {
         match value {
-            1 => Some(Self::Inotify),
-            2 => Some(Self::PeriodicRecheck),
-            3 => Some(Self::VerifyAtFirstOpen),
-            4 => Some(Self::Startup),
-            5 => Some(Self::OperatorCli),
-            _ => None,
+            1 => Ok(Self::Inotify),
+            2 => Ok(Self::PeriodicRecheck),
+            3 => Ok(Self::VerifyAtFirstOpen),
+            4 => Ok(Self::Startup),
+            5 => Ok(Self::OperatorCli),
+            _ => Err(()),
         }
     }
 }
@@ -150,7 +155,6 @@ enum SegmentFileKind {
     Archive
 }
 
-// --- TamperingLogFileHeader ---
 
 /// 64-byte segment header per ADR-017 §Decision (as amended 2026-05-09).
 ///
@@ -192,6 +196,17 @@ pub struct TamperingLogFileHeader {
     /// CRC32C over bytes `[0..SIZE-4)` = `[0..60)`. Always last field per I-001.
     pub checksum: u32,
 }
+const _: () = assert!(
+    std::mem::size_of::<TamperingLogFileHeader>()
+        == size_of::<u64>() * 3
+                + size_of::<u32>() * 3
+                + size_of::<[u8; 16]>()
+                + size_of::<[u8; 12]>(),
+    "TamperingLogFileHeader is larger than its fields: the compiler inserted alignment \
+     padding. Declare it as an explicit field so the layout is stated, and \
+     so the checksum stays the record's final bytes",
+);
+
 
 const _: () = assert!(
     std::mem::offset_of!(TamperingLogFileHeader, checksum)
@@ -201,6 +216,23 @@ const _: () = assert!(
 
 impl TamperingLogFileHeader {
     pub const SIZE: usize = std::mem::size_of::<Self>();
+
+    /// All-zero instance for the Preference-B read shape (I-043): the caller
+    /// fills it via `read_exact(header.as_bytes_mut())`, so the bytes land in
+    /// their final aligned home with no intermediate buffer and no
+    /// `read_unaligned` copy.
+    pub fn zeroed() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self as *mut Self as *mut u8,
+                Self::SIZE
+            )
+        }
+    }
 
     /// Constructs a new header for a fresh segment.
     ///
@@ -229,10 +261,6 @@ impl TamperingLogFileHeader {
     /// (2) `offset_of!(checksum) == SIZE - 4` — enforced by the compile-time
     ///     `assert!` immediately after the struct definition (I-001).
     pub fn compute_checksum(&self) -> u32 {
-        // SAFETY: `self` is repr(C) fully initialised (invariant 1 above).
-        // The raw pointer covers exactly `SIZE - 4` bytes, which equals
-        // `offset_of!(checksum)` (invariant 2 above), so no checksum byte
-        // is included. The CRC intrinsic is safe on any byte sequence.
         unsafe {
             crc32c(
                 self as *const Self as *const u8,
@@ -247,11 +275,6 @@ impl TamperingLogFileHeader {
 
     /// Writes the header to `file` and calls `fdatasync`.
     pub fn write_to(&self, file: &mut File) -> std::io::Result<()> {
-        // SAFETY: `self` is a fully-initialized `repr(C, align(64))` struct.
-        // `SIZE` equals `std::mem::size_of::<Self>()`. The resulting byte
-        // slice is valid for the lifetime of `self` and has exactly `SIZE`
-        // bytes. `from_raw_parts` on a `repr(C)` struct is sound when all
-        // padding bytes are zero-initialized (guaranteed by `new()`).
         let bytes = unsafe {
             std::slice::from_raw_parts(self as *const Self as *const u8, Self::SIZE)
         };
@@ -260,7 +283,6 @@ impl TamperingLogFileHeader {
     }
 }
 
-// --- TamperingLogEntry ---
 
 /// 128-byte tampering event record per ADR-017 §Decision.
 ///
@@ -312,6 +334,20 @@ pub struct TamperingLogEntry {
     /// CRC32C over bytes `[0..SIZE-4)` = `[0..124)`. Always last field per I-001.
     pub checksum: u32,
 }
+const _: () = assert!(
+    std::mem::size_of::<TamperingLogEntry>()
+        == size_of::<u32>() * 2
+                + size_of::<u8>() * 2
+                + size_of::<[u8; 2]>()
+                + size_of::<u64>() * 2
+                + size_of::<[u8; 64]>()
+                + size_of::<[u8; 16]>() * 2
+                + size_of::<[u8; 4]>(),
+    "TamperingLogEntry is larger than its fields: the compiler inserted alignment \
+     padding. Declare it as an explicit field so the layout is stated, and \
+     so the checksum stays the record's final bytes",
+);
+
 
 const _: () = assert!(
     std::mem::offset_of!(TamperingLogEntry, checksum)
@@ -321,6 +357,22 @@ const _: () = assert!(
 
 impl TamperingLogEntry {
     pub const SIZE: usize = std::mem::size_of::<Self>();
+
+    /// All-zero instance for the Preference-B read shape (I-043); filled by
+    /// the caller via `read_exact(entry.as_bytes_mut())` or, for an in-memory
+    /// slice of exactly `SIZE` bytes, `copy_from_slice`.
+    pub fn zeroed() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self as *mut Self as *mut u8,
+                Self::SIZE
+            )
+        }
+    }
 
     pub fn new(
         file_seq: u64,
@@ -375,10 +427,6 @@ impl TamperingLogEntry {
     /// (2) `offset_of!(checksum) == SIZE - 4 = 124` — enforced by the
     ///     compile-time `assert!` immediately after the struct definition (I-001).
     pub fn compute_checksum(&self) -> u32 {
-        // SAFETY: `self` is repr(C) fully initialised (invariant 1 above).
-        // The raw pointer covers exactly `SIZE - 4 = 124` bytes, which equals
-        // `offset_of!(checksum)` (invariant 2 above). No checksum byte is
-        // included. The CRC intrinsic is safe on any byte sequence.
         unsafe {
             crc32c(
                 self as *const Self as *const u8,
@@ -398,7 +446,6 @@ impl TamperingLogEntry {
     }
 }
 
-// --- TamperingLog ---
 
 pub struct TamperingLog {
     directory: PathBuf,
@@ -418,25 +465,72 @@ pub struct TamperingLog {
 }
 
 impl TamperingLog {
+    /// Opens a `tampering*.log` segment file for append.
+    ///
+    /// On Unix the file is opened with `O_NOFOLLOW`: if the path's final
+    /// component is a symlink, the open fails with `ELOOP` instead of
+    /// following it. This closes a symlink-redirect surface on the
+    /// integrity log — an attacker who can plant a symlink at
+    /// `tampering.log` could otherwise redirect appends to a file of
+    /// their choosing, with no CRC or magic failure to signal it.
+    /// `O_NOFOLLOW` rejects only a final-component symlink; for a
+    /// regular file the behaviour is identical to a plain open.
+    ///
+    /// **For defence:** `O_NOFOLLOW` guards the *path resolution* step,
+    /// not the file contents. Its semantics — reject a final-component
+    /// symlink with `ELOOP`, behave identically to a plain open for a
+    /// regular file — are the `open(2)` contract (R-029). The reason to
+    /// set it here is the symlink-redirect threat: an attacker with
+    /// storage-directory write access who plants a symlink at
+    /// `tampering.log` would otherwise silently redirect appends, with no
+    /// CRC or magic failure. This is hardening within the ADR-016 layered
+    /// file-integrity model, but it is NOT mandated by ADR-016 §Decision
+    /// (which specifies `chattr +i` as L1 and inotify as L2, and exempts
+    /// `tampering.log` from L1/L3 for circular-trust reasons). It does not
+    /// replace the per-entry CRC32C or the `instance_id` provenance check.
+    ///
+    /// Two scope boundaries are deliberate:
+    /// - `O_NOFOLLOW` rejects only a *final-component* symlink. A
+    ///   symlinked *parent directory* is still followed; full path
+    ///   hardening would need `openat2(RESOLVE_NO_SYMLINKS)`. Replacing
+    ///   a parent directory requires directory-rename privilege — a
+    ///   higher bar than planting one file — so this residual is
+    ///   accepted here.
+    /// - This helper is used only for the *write* path
+    ///   (`open` / `rotate`). The read-only archive opens
+    ///   (`find_max_segment_seq`, `load_compromised_set`,
+    ///   `scan_segment_into`) deliberately keep plain `File::open`:
+    ///   applying `O_NOFOLLOW` there would make a symlinked archive
+    ///   fail to open and be *silently skipped*, dropping its tamper
+    ///   events from `CompromisedFileSet` — a worse failure than the
+    ///   redirect it would prevent. Read-path archive content integrity
+    ///   against an attacker with storage-directory write access is
+    ///   delegated, per ADR-017, to the Phase 3 Meta Chain and the
+    ///   external Guard (the log cannot self-protect — circular trust).
+    fn open_segment_file(path: &Path) -> std::io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.read(true).create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        options.open(path)
+    }
+
     /// Opens (or creates) the active `tampering.log` in `directory`.
     ///
     /// If the file is new (zero length) a fresh header is written and fsynced.
     /// `instance_id` is written into every header. `max_size_mb` controls
-    /// rotation threshold.
-    ///
-    /// # FLAG (GAP1): O_NOFOLLOW not set. A symlink at tampering.log would
-    /// redirect writes to the symlink target. TODO: use raw `open(2)` with
-    /// O_NOFOLLOW | O_CREAT | O_WRONLY | O_APPEND on Linux.
+    /// the rotation threshold. The file is opened via `open_segment_file`,
+    /// which sets `O_NOFOLLOW` on Unix (GAP1 closed — symlink-redirect
+    /// surface removed).
     pub fn open(directory: &str, max_size_mb: usize, instance_id: [u8; 16]) -> std::io::Result<Self> {
         let directory = PathBuf::from(directory);
         std::fs::create_dir_all(&directory)?;
 
         let current_path = directory.join("tampering.log");
-        let mut file = OpenOptions::new()
-            .read(true)
-            .create(true)
-            .append(true)
-            .open(&current_path)?;
+        let mut file = Self::open_segment_file(&current_path)?;
 
         let file_len = file.metadata()?.len();
         let (current_size, current_file_seq, next_file_seq) = if file_len == 0 {
@@ -444,10 +538,6 @@ impl TamperingLog {
             header.write_to(&mut file)?;
             (TamperingLogFileHeader::SIZE as u64, 1u64, 2u64)
         } else {
-            // Determine current and next seq from existing segments.
-            // `find_max_segment_seq` scans all tampering*.log headers to find
-            // the highest `file_seq` currently on disk. That seq belongs to the
-            // currently-open `tampering.log` (which has the highest seq).
             let max_seq = Self::find_max_segment_seq(&directory);
             (file_len, max_seq, max_seq + 1)
         };
@@ -465,38 +555,32 @@ impl TamperingLog {
     }
 
     fn find_max_segment_seq(directory: &Path) -> u64 {
-        let mut max = 0u64;
-        if let Ok(entries) = std::fs::read_dir(directory) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with("tampering") && name.ends_with(".log") {
-                        if let Ok(mut f) = File::open(&path) {
-                            let mut buf = [0u8; TamperingLogFileHeader::SIZE];
-                            if f.read_exact(&mut buf).is_ok() {
-                                // SAFETY: `buf` is a stack-allocated byte array of
-                                // exactly `SIZE` bytes filled by `read_exact`.
-                                // `read_unaligned` handles any stack alignment;
-                                // the copy is valid because all `SIZE` bytes are
-                                // initialised by `read_exact`. The resulting struct
-                                // is checked by `verify_checksum` before use.
-                                let hdr = unsafe {
-                                    std::ptr::read_unaligned(
-                                        buf.as_ptr() as *const TamperingLogFileHeader
-                                    )
-                                };
-                                if hdr.magic == TAMPERING_LOG_MAGIC && hdr.verify_checksum() {
-                                    if hdr.file_seq > max {
-                                        max = hdr.file_seq;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        let mut max_file_seq = 0u64;
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return max_file_seq;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("tampering") || !name.ends_with(".log") {
+                continue;
+            }
+            let Ok(mut segment_file) = File::open(&path) else {
+                continue;
+            };
+
+            let mut header = TamperingLogFileHeader::zeroed();
+            if segment_file.read_exact(header.as_bytes_mut()).is_ok()
+                && header.magic == TAMPERING_LOG_MAGIC
+                && header.verify_checksum()
+                && header.file_seq > max_file_seq
+            {
+                max_file_seq = header.file_seq;
             }
         }
-        max
+        max_file_seq
     }
 
     /// Appends `entry` to the active segment, fsyncing before returning.
@@ -515,11 +599,6 @@ impl TamperingLog {
             self.rotate()?;
         }
 
-        // SAFETY: `entry` is a fully-initialized `repr(C)` struct constructed
-        // by `TamperingLogEntry::new_with_operator`, which zero-fills all
-        // padding bytes. `SIZE` equals `std::mem::size_of::<TamperingLogEntry>()`.
-        // The byte slice is valid for the lifetime of `entry`. Single-writer
-        // discipline (I-012) ensures no concurrent mutation of `entry`.
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 entry as *const TamperingLogEntry as *const u8,
@@ -535,50 +614,18 @@ impl TamperingLog {
     fn rotate(&mut self) -> std::io::Result<()> {
         self.current_file.sync_all()?;
 
-        // D-fix-1 (2026-05-09 round 12): use the CURRENT file's own `file_seq`
-        // for the rotated archive name. Before this fix, `rotate()` used
-        // `next_file_seq` for the filename but wrote `next_file_seq + 1` into
-        // the new header — so the archived file's filename did NOT match its
-        // header `file_seq`. Operators inspecting the directory would see a
-        // misleading name. Replay reads the header `file_seq` for ordering, so
-        // correctness was not affected, but operator tooling and the principle
-        // of least surprise require filename == header.file_seq (ADR-017 §Decision).
         let timestamp = format_utc_timestamp(now_ns());
         let rotated_name = format!("tampering-{}-{}.log", self.current_file_seq, timestamp);
         let rotated_path = self.directory.join(&rotated_name);
         std::fs::rename(&self.current_path, &rotated_path)?;
 
-        self.current_file = OpenOptions::new()
-            .read(true)
-            .create(true)
-            .append(true)
-            .open(&self.current_path)?;
+        self.current_file = Self::open_segment_file(&self.current_path)?;
 
         let new_seq = self.next_file_seq;
         self.next_file_seq += 1;
         let header = TamperingLogFileHeader::new(new_seq, self.instance_id);
 
-        // D-fix-2 (2026-05-09 round 12): crash-recovery for partial header write.
-        //
-        // Without this guard, the window between `rename` and a successful
-        // `header.write_to` leaves `tampering.log` as an empty file. On next
-        // startup, `open()` would see `file_len == 0` and write a FRESH header
-        // with seq = 1 — silently overwriting the rotation event and restarting
-        // the seq counter. The rotated archive (`tampering-{current_file_seq}-<ts>.log`)
-        // is preserved and will be correctly replayed, but the gap in the active
-        // file's seq lineage would confuse `find_max_segment_seq` on the next
-        // rotation.
-        //
-        // Recovery: remove the empty / partially-written `tampering.log` on
-        // header-write failure. On next startup, `open()` sees NO active log
-        // (file absent) and creates a fresh one via `create(true)`. The archived
-        // file is intact and will be replayed. `next_file_seq` was already bumped;
-        // on restart `find_max_segment_seq` will re-discover the correct max and
-        // `next_file_seq` will be correctly re-initialised.
         if let Err(e) = header.write_to(&mut self.current_file) {
-            // Best-effort removal: if this also fails, the empty file remains,
-            // but it carries no valid magic so `scan_segment_into` will skip it
-            // on replay. The rotated archive is unaffected.
             let _ = std::fs::remove_file(&self.current_path);
             return Err(e);
         }
@@ -623,12 +670,6 @@ impl TamperingLog {
             return Ok(HashSet::new());
         }
 
-        // Collect ARCHIVE segments only — the current segment is scanned
-        // separately and unconditionally below. An archive whose header
-        // cannot be read is dropped here with no entry in `archives`
-        // (ADR-017 §J2 — a corrupt archive is a missing-data warning,
-        // not a hard error). The current segment is never dropped this
-        // way.
         let mut archives: Vec<(u64, std::path::PathBuf)> = Vec::new();
         for dir_entry in std::fs::read_dir(&self.directory)? {
             let dir_entry = dir_entry?;
@@ -643,28 +684,17 @@ impl TamperingLog {
             if path == self.current_path {
                 continue;
             }
-            // Read the header to get file_seq for ordering.
-            if let Ok(mut segment_file) = File::open(&path) {
-                let mut header_buf = [0u8; TamperingLogFileHeader::SIZE];
-                if segment_file.read_exact(&mut header_buf).is_ok() {
-                    // SAFETY: `header_buf` is a stack-allocated byte array
-                    // of exactly `TamperingLogFileHeader::SIZE` bytes,
-                    // fully initialised by `read_exact`. `read_unaligned`
-                    // handles any stack alignment. Only `magic` and
-                    // `file_seq` are used here; the header is not trusted
-                    // further without the CRC check done in
-                    // `scan_segment_into`.
-                    let header = unsafe {
-                        std::ptr::read_unaligned(
-                            header_buf.as_ptr() as *const TamperingLogFileHeader
-                        )
-                    };
-                    if header.magic == TAMPERING_LOG_MAGIC {
-                        archives.push(
-                            (header.file_seq, path)
-                        );
-                    }
-                }
+            let Ok(mut segment_file) = File::open(&path) else {
+                continue;
+            };
+            let mut header = TamperingLogFileHeader::zeroed();
+            if segment_file.read_exact(header.as_bytes_mut()).is_err() {
+                continue;
+            }
+            if header.magic == TAMPERING_LOG_MAGIC {
+                archives.push(
+                    (header.file_seq, path)
+                );
             }
         }
         archives.sort_by_key(|(file_seq, _)| *file_seq);
@@ -745,9 +775,8 @@ impl TamperingLog {
             }
         };
 
-        // Read and validate the header.
-        let mut header_buf = [0u8; TamperingLogFileHeader::SIZE];
-        if segment_file.read_exact(&mut header_buf).is_err() {
+        let mut header = TamperingLogFileHeader::zeroed();
+        if segment_file.read_exact(header.as_bytes_mut()).is_err() {
             if segment_file_kind == SegmentFileKind::Current {
                 return Err(
                     Self::current_segment_halt(
@@ -759,14 +788,6 @@ impl TamperingLog {
             eprintln!("[tampering-log] WARNING: truncated header in {path:?}, skipping");
             return Ok(());
         }
-        // SAFETY: `header_buf` is a stack-allocated byte array of exactly
-        // `TamperingLogFileHeader::SIZE` bytes, fully initialised by
-        // `read_exact`. `read_unaligned` handles any stack alignment. The
-        // copy is valid; `verify_checksum` detects corruption before any
-        // field is trusted.
-        let header = unsafe {
-            std::ptr::read_unaligned(header_buf.as_ptr() as *const TamperingLogFileHeader)
-        };
         if header.magic != TAMPERING_LOG_MAGIC {
             if segment_file_kind == SegmentFileKind::Current {
                 return Err(
@@ -791,18 +812,10 @@ impl TamperingLog {
             eprintln!("[tampering-log] WARNING: header CRC failure in {path:?}, skipping");
             return Ok(());
         }
-        // H2: the header `instance_id` does not match this server's
-        // configured identity. ZERO_INSTANCE_ID on either side disables
-        // the check (backward compat / identity not yet configured).
         if instance_id != ZERO_INSTANCE_ID
             && header.instance_id != ZERO_INSTANCE_ID
             && header.instance_id != instance_id {
             if segment_file_kind == SegmentFileKind::Current {
-                // The live `tampering.log` carries a foreign identity:
-                // the instance_id was reconfigured for an existing data
-                // directory, or the live log was swapped. There is no
-                // safe silent answer — trusting it adopts foreign
-                // history, skipping it loses the real live events.
                 return Err(
                     Self::current_segment_halt(
                         path,
@@ -813,11 +826,6 @@ impl TamperingLog {
                     )
                 );
             }
-            // Archive segment: H2 rejection. Besides the ERROR log,
-            // append a SegmentRejected event to the current segment so
-            // forensics has a structural record, not just log lines. The
-            // `planted_file_rejections` counter is deferred to step 20
-            // (Metrics); alarm-channel reaction policy to 13-gs.
             eprintln!(
                 "[tampering-log] ERROR: SECURITY: instance_id mismatch in archive {path:?} \
                  — segment belongs to a different server instance; possible planted-file attack. \
@@ -839,22 +847,15 @@ impl TamperingLog {
                 DetectionSource::Startup,
                 rejected_name,
             );
-            // Append to the current segment. The single-writer invariant
-            // (I-012, I-041 §3) holds: the recovery thread is the sole
-            // TamperingLog writer before FileWatcher workers spawn
-            // (I-042 §8).
             self.append(&entry)?;
             compromised.insert(header.file_seq);
             return Ok(());
         }
 
-        // Replay entries per I-041 §9 / ADR-017 §J2. Bad-entry tolerance
-        // applies to every segment, the current one included — only the
-        // header / identity of the current segment is strict.
         let mut consecutive_bad = 0usize;
         loop {
-            let mut entry_buf = [0u8; TamperingLogEntry::SIZE];
-            match segment_file.read_exact(&mut entry_buf) {
+            let mut entry = TamperingLogEntry::zeroed();
+            match segment_file.read_exact(entry.as_bytes_mut()) {
                 Ok(()) => {}
                 Err(ref error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(error) => {
@@ -862,14 +863,6 @@ impl TamperingLog {
                     break;
                 }
             }
-            // SAFETY: `entry_buf` is a stack-allocated byte array of
-            // exactly `TamperingLogEntry::SIZE` bytes, fully initialised
-            // by `read_exact`. `read_unaligned` handles any stack
-            // alignment. The copy is valid; `verify_checksum` detects
-            // corruption before any field is trusted.
-            let entry = unsafe {
-                std::ptr::read_unaligned(entry_buf.as_ptr() as *const TamperingLogEntry)
-            };
             if entry.magic != TAMPERING_ENTRY_MAGIC || !entry.verify_checksum() {
                 consecutive_bad += 1;
                 if consecutive_bad >= MAX_CONSECUTIVE_BAD_ENTRIES {
@@ -878,21 +871,18 @@ impl TamperingLog {
                     );
                     break;
                 }
-                // J2: skip the bad entry, continue at next fixed-size offset.
                 continue;
             }
             consecutive_bad = 0;
 
-            match TamperingKind::from_u8(entry.kind) {
-                Some(TamperingKind::Restored) => {
-                    // Per I-041 §10: Restored clears prior compromise for this file_seq.
+            match TamperingKind::try_from(entry.kind) {
+                Ok(TamperingKind::Restored) => {
                     compromised.remove(&entry.file_seq);
                 }
-                Some(_) => {
+                Ok(_) => {
                     compromised.insert(entry.file_seq);
                 }
-                None => {
-                    // Unknown kind (future format extension) — conservative.
+                Err(_) => {
                     compromised.insert(entry.file_seq);
                 }
             }
@@ -944,8 +934,6 @@ mod tests {
 
     #[test]
     fn test_tampering_log_entry_checksum_is_at_offset_124() {
-        // I-001: checksum must be at SIZE-4.
-        // _tail_pad absorbs trailing compiler padding so checksum lands at 124.
         assert_eq!(
             std::mem::offset_of!(TamperingLogEntry, checksum),
             124,
@@ -1053,7 +1041,7 @@ mod tests {
     #[test]
     fn test_tampering_log_rotation_on_size_overflow() {
         let dir = unique_test_dir("rotate");
-        const MAX_SIZE_BYTES: u64 = 4 * 1024; // header + 31 entries before rotation
+        const MAX_SIZE_BYTES: u64 = 4 * 1024;
         let mut log = TamperingLog::open(&dir, 1, zero_instance_id()).unwrap();
         log.max_size_bytes = MAX_SIZE_BYTES;
 
@@ -1080,8 +1068,6 @@ mod tests {
         );
 
         let compromised = log.load_compromised_set(zero_instance_id()).unwrap();
-        // Variant C scans archives AND the current segment, so all 40
-        // distinct file_seq values (0..40, no Restored) are merged.
         assert_eq!(compromised.len(), 40, "load must merge entries across all segments");
         for i in 0..40u64 {
             assert!(compromised.contains(&i), "missing file_seq {}", i);
@@ -1099,12 +1085,11 @@ mod tests {
         );
         log.append(&good).unwrap();
 
-        // Manually write a bad entry (tampered file_seq, stale checksum).
         let mut bad = TamperingLogEntry::new(
             2, 200, TamperingKind::Crc,
             DetectionSource::Inotify, "bad.ls",
         );
-        bad.file_seq = 99; // tamper after checksum computed
+        bad.file_seq = 99;
         let bad_bytes = unsafe {
             std::slice::from_raw_parts(
                 &bad as *const TamperingLogEntry as *const u8,
@@ -1115,7 +1100,6 @@ mod tests {
         log.current_file.write_all(bad_bytes).unwrap();
         log.current_file.sync_data().unwrap();
 
-        // Good entry after the bad one.
         let good2 = TamperingLogEntry::new(
             3, 300, TamperingKind::Signature,
             DetectionSource::Inotify, "good2.ls",
@@ -1135,8 +1119,6 @@ mod tests {
         let id_a = [0x11u8; 16];
         let id_b = [0x22u8; 16];
 
-        // Run 1: write an entry under instance id_a; leave it as the
-        // current (never-rotated) `tampering.log`.
         {
             let mut log = TamperingLog::open(&dir, 64, id_a).unwrap();
             let entry = TamperingLogEntry::new(
@@ -1146,9 +1128,6 @@ mod tests {
             log.append(&entry).unwrap();
         }
 
-        // Run 2: open under a different instance id_b. The current
-        // `tampering.log` header still carries id_a — load_compromised_set
-        // must halt recovery (variant C: foreign identity on the live log).
         let mut log = TamperingLog::open(&dir, 64, id_b).unwrap();
         let result = log.load_compromised_set(id_b);
         assert!(
@@ -1159,21 +1138,21 @@ mod tests {
     }
 
     #[test]
-    fn test_tampering_kind_from_u8_roundtrip() {
-        assert_eq!(TamperingKind::from_u8(1), Some(TamperingKind::Signature));
-        assert_eq!(TamperingKind::from_u8(7), Some(TamperingKind::Restored));
-        assert_eq!(TamperingKind::from_u8(8), Some(TamperingKind::ForensicAccess));
-        assert_eq!(TamperingKind::from_u8(0), None);
-        assert_eq!(TamperingKind::from_u8(9), Some(TamperingKind::SegmentRejected));
-        assert_eq!(TamperingKind::from_u8(10), None);
+    fn test_tampering_kind_try_from_roundtrip() {
+        assert_eq!(TamperingKind::try_from(1), Ok(TamperingKind::Signature));
+        assert_eq!(TamperingKind::try_from(7), Ok(TamperingKind::Restored));
+        assert_eq!(TamperingKind::try_from(8), Ok(TamperingKind::ForensicAccess));
+        assert_eq!(TamperingKind::try_from(0), Err(()));
+        assert_eq!(TamperingKind::try_from(9), Ok(TamperingKind::SegmentRejected));
+        assert_eq!(TamperingKind::try_from(10), Err(()));
     }
 
     #[test]
-    fn test_detection_source_from_u8_roundtrip() {
-        assert_eq!(DetectionSource::from_u8(1), Some(DetectionSource::Inotify));
-        assert_eq!(DetectionSource::from_u8(5), Some(DetectionSource::OperatorCli));
-        assert_eq!(DetectionSource::from_u8(0), None);
-        assert_eq!(DetectionSource::from_u8(6), None);
+    fn test_detection_source_try_from_roundtrip() {
+        assert_eq!(DetectionSource::try_from(1), Ok(DetectionSource::Inotify));
+        assert_eq!(DetectionSource::try_from(5), Ok(DetectionSource::OperatorCli));
+        assert_eq!(DetectionSource::try_from(0), Err(()));
+        assert_eq!(DetectionSource::try_from(6), Err(()));
     }
 
     /// Verifies D-fix-1 (2026-05-09 round 12): the rotated archive filename's
@@ -1185,11 +1164,10 @@ mod tests {
     #[test]
     fn test_tampering_log_rotation_filename_matches_header_file_seq() {
         let dir = unique_test_dir("rotate-seq-match");
-        const MAX_SIZE_BYTES: u64 = 4 * 1024; // header + 31 entries before rotation
+        const MAX_SIZE_BYTES: u64 = 4 * 1024;
         let mut log = TamperingLog::open(&dir, 1, zero_instance_id()).unwrap();
         log.max_size_bytes = MAX_SIZE_BYTES;
 
-        // Write enough entries to trigger one rotation.
         for i in 0..32u64 {
             let entry = TamperingLogEntry::new(
                 i, i * 1000, TamperingKind::Crc,
@@ -1199,7 +1177,6 @@ mod tests {
         }
         drop(log);
 
-        // Find the rotated archive file (matches "tampering-N-*.log" pattern).
         let mut archive_files: Vec<_> = std::fs::read_dir(&dir).unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -1213,29 +1190,20 @@ mod tests {
         let archive_path = archive_files.pop().unwrap().path();
         let archive_name = archive_path.file_name().unwrap().to_str().unwrap().to_owned();
 
-        // Extract the seq from the filename: "tampering-{seq}-{timestamp}.log"
         let parts: Vec<&str> = archive_name.splitn(3, '-').collect();
         assert_eq!(parts.len(), 3, "archive name must be tampering-N-timestamp.log");
         let filename_seq: u64 = parts[1].parse().expect("filename seq must be a u64");
 
-        // Read the archived file's header to get header.file_seq.
-        let mut f = std::fs::File::open(&archive_path).unwrap();
+        let mut archive_file = std::fs::File::open(&archive_path).unwrap();
         use std::io::Read as _;
-        let mut buf = [0u8; TamperingLogFileHeader::SIZE];
-        f.read_exact(&mut buf).unwrap();
-        // SAFETY: `buf` is a stack-allocated byte array of exactly
-        // `TamperingLogFileHeader::SIZE` bytes, fully initialised by `read_exact`.
-        // `read_unaligned` handles any stack alignment. The header is validated
-        // by `verify_checksum` before any field is trusted.
-        let hdr = unsafe {
-            std::ptr::read_unaligned(buf.as_ptr() as *const TamperingLogFileHeader)
-        };
-        assert!(hdr.verify_checksum(), "archived file header must have valid CRC");
+        let mut header = TamperingLogFileHeader::zeroed();
+        archive_file.read_exact(header.as_bytes_mut()).unwrap();
+        assert!(header.verify_checksum(), "archived file header must have valid CRC");
 
         assert_eq!(
-            filename_seq, hdr.file_seq,
+            filename_seq, header.file_seq,
             "rotated archive filename seq ({}) must match header file_seq ({})",
-            filename_seq, hdr.file_seq,
+            filename_seq, header.file_seq,
         );
     }
 
@@ -1264,36 +1232,24 @@ mod tests {
             log.append(&entry).unwrap();
         }
 
-        // After rotation, `tampering.log` must exist with a valid header.
         let active_path = std::path::Path::new(&dir).join("tampering.log");
         assert!(active_path.exists(), "tampering.log must be recreated after rotation");
 
-        let mut f = std::fs::File::open(&active_path).unwrap();
+        let mut active_file = std::fs::File::open(&active_path).unwrap();
         use std::io::Read as _;
-        let mut buf = [0u8; TamperingLogFileHeader::SIZE];
-        f.read_exact(&mut buf).unwrap();
-        // SAFETY: same invariants as the previous test.
-        let hdr = unsafe {
-            std::ptr::read_unaligned(buf.as_ptr() as *const TamperingLogFileHeader)
-        };
-        assert!(hdr.verify_checksum(), "active tampering.log header must have valid CRC after rotation");
-        assert_eq!(hdr.magic, TAMPERING_LOG_MAGIC, "active tampering.log magic must be correct");
+        let mut header = TamperingLogFileHeader::zeroed();
+        active_file.read_exact(header.as_bytes_mut()).unwrap();
+        assert!(header.verify_checksum(), "active tampering.log header must have valid CRC after rotation");
+        assert_eq!(header.magic, TAMPERING_LOG_MAGIC, "active tampering.log magic must be correct");
     }
 
     #[test]
     fn segment_rejected_event_written_on_instance_id_mismatch() {
-        // An alien archive segment is built in a side directory, then
-        // planted into the server's directory — mirrors the H2
-        // planted-file threat. The alien archive must NOT become the
-        // server's current segment (that would trigger a variant-C
-        // current-segment halt instead of an archive rejection).
         let dir = unique_test_dir("seg-reject-write");
         let alien_dir = unique_test_dir("seg-reject-alien-src");
         let server_id: [u8; 16] = [0x42; 16];
         let alien_id: [u8; 16] = [0x99; 16];
 
-        // Build the alien archive: open under alien_id, append an entry,
-        // rotate so the segment becomes an archive file.
         let alien_archive: PathBuf = {
             let mut alien_log = TamperingLog::open(&alien_dir, 1, alien_id)
                 .expect("open alien log");
@@ -1313,16 +1269,12 @@ mod tests {
                 .expect("alien archive file")
         };
 
-        // Open a clean server log (fresh `tampering.log` under server_id),
-        // then plant the alien archive into the same directory.
         let mut server_log = TamperingLog::open(&dir, 1, server_id)
             .expect("open server log");
         let planted = PathBuf::from(&dir)
             .join(alien_archive.file_name().unwrap());
         std::fs::copy(&alien_archive, &planted).expect("plant alien archive");
 
-        // load_compromised_set: the alien ARCHIVE is H2-rejected, the
-        // current segment matches server_id, so recovery completes Ok.
         let compromised = server_log
             .load_compromised_set(server_id)
             .expect("load compromised set");
@@ -1339,18 +1291,13 @@ mod tests {
              file_seq is marked",
         );
 
-        // A SegmentRejected event must sit in the current segment.
         let current_path = PathBuf::from(&dir).join("tampering.log");
         let bytes = std::fs::read(&current_path).expect("read current segment");
         let payload = &bytes[TamperingLogFileHeader::SIZE..];
         let mut found_segment_rejected = false;
         for chunk in payload.chunks_exact(TamperingLogEntry::SIZE) {
-            // SAFETY: `chunk` is exactly `TamperingLogEntry::SIZE` bytes
-            // (guaranteed by `chunks_exact`); `read_unaligned` handles the
-            // arbitrary slice alignment.
-            let entry = unsafe {
-                std::ptr::read_unaligned(chunk.as_ptr() as *const TamperingLogEntry)
-            };
+            let mut entry = TamperingLogEntry::zeroed();
+            entry.as_bytes_mut().copy_from_slice(chunk);
             if entry.magic == TAMPERING_ENTRY_MAGIC
                 && entry.verify_checksum()
                 && entry.kind == TamperingKind::SegmentRejected as u8
@@ -1372,8 +1319,6 @@ mod tests {
         let server_id: [u8; 16] = [0x42; 16];
         let rejected_seq: u64 = 0xDEAD_BEEF;
 
-        // Phase 1: write a SegmentRejected event, then rotate so it lands
-        // in an archive that the next load_compromised_set will replay.
         {
             let mut log = TamperingLog::open(&dir, 1, server_id).expect("open log");
             let entry = TamperingLogEntry::new(
@@ -1387,7 +1332,6 @@ mod tests {
             log.rotate().expect("rotate to archive");
         }
 
-        // Phase 2: a fresh open + replay must lift rejected_seq into the set.
         let mut log = TamperingLog::open(&dir, 1, server_id).expect("reopen log");
         let compromised = log
             .load_compromised_set(server_id)
@@ -1400,11 +1344,85 @@ mod tests {
     }
 
     #[test]
-    fn tampering_kind_segment_rejected_from_u8_roundtrip() {
+    fn tampering_kind_segment_rejected_try_from_roundtrip() {
         assert_eq!(
-            TamperingKind::from_u8(9),
-            Some(TamperingKind::SegmentRejected),
+            TamperingKind::try_from(9),
+            Ok(TamperingKind::SegmentRejected),
         );
         assert_eq!(TamperingKind::SegmentRejected as u8, 9);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod open_segment_file_nofollow_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn make_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "solidus-nofollow-test-{}-{}",
+            std::process::id(),
+            label,
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    /// A symlink planted at `tampering.log` MUST cause `open()` to fail with
+    /// `ELOOP` under `O_NOFOLLOW`, NOT silently redirect appends to the
+    /// symlink target. Against a plain open (no flag) this test would fail —
+    /// the open would succeed by following the link. (`open(2)`
+    /// final-component-symlink semantics, R-029.)
+    #[test]
+    fn open_rejects_symlinked_path_with_eloop() {
+        let dir = make_dir("symlink");
+        let target = dir.join("attacker-controlled.txt");
+        std::fs::write(&target, b"redirected").expect("write target");
+
+        let link = dir.join("tampering.log");
+        symlink(&target, &link).expect("plant symlink");
+
+        let instance_id = [0u8; 16];
+        let result = TamperingLog::open(
+            dir.to_str().unwrap(),
+            1,
+            instance_id,
+        );
+
+        assert!(
+            result.is_err(),
+            "open() MUST reject a symlinked tampering.log under O_NOFOLLOW",
+        );
+        let error = result.err().unwrap();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ELOOP),
+            "expected ELOOP from O_NOFOLLOW, got {error:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// For a regular (non-symlink) path `O_NOFOLLOW` behaves identically to a
+    /// plain open — the normal write path is unaffected. (`open(2)`
+    /// regular-file semantics, R-029.)
+    #[test]
+    fn open_succeeds_on_regular_path() {
+        let dir = make_dir("regular");
+        let instance_id = [0u8; 16];
+
+        let result = TamperingLog::open(
+            dir.to_str().unwrap(),
+            1,
+            instance_id,
+        );
+        assert!(
+            result.is_ok(),
+            "open() on a regular path MUST succeed with O_NOFOLLOW set: {:?}",
+            result.err(),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

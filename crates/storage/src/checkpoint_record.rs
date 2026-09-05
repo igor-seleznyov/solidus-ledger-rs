@@ -5,14 +5,31 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct CheckpointRecord {
     pub first_posting_offset: u64,
     pub posting_count: u64,
-    pub batch_seq: u32,
-    pub checksum: u32,
     pub timestamp_ns: u64,
+    pub batch_seq: u32,
+    /// CRC32C over `[0 .. SIZE - 4)`. Last field so the integrity check is a
+    /// single contiguous pass and the offset never drifts between versions;
+    /// guarded by the `offset_of!` compile-time assert below (I-001,
+    /// Article IV).
+    pub checksum: u32
 }
+const _: () = assert!(
+    std::mem::size_of::<CheckpointRecord>()
+        == size_of::<u64>() * 3
+                + size_of::<u32>() * 2,
+    "CheckpointRecord is larger than its fields: the compiler inserted alignment \
+     padding. Declare it as an explicit field so the layout is stated, and \
+     so the checksum stays the record's final bytes",
+);
+
 
 impl CheckpointRecord {
     pub const SIZE: usize = std::mem::size_of::<CheckpointRecord>();
-    
+
+    pub fn zeroed() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+
     pub fn new(
         first_posting_offset: u64,
         posting_count: u64,
@@ -22,44 +39,48 @@ impl CheckpointRecord {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        
+
         let mut record = Self {
             first_posting_offset,
             posting_count,
+            timestamp_ns,
             batch_seq,
             checksum: 0,
-            timestamp_ns,
         };
-        
-        record.checksum = unsafe {
-            crc32c(
-                &record as *const CheckpointRecord as *const u8,
-                Self::SIZE,
-            )
-        };
-        
+        record.fill_checksum();
         record
     }
-    
-    pub unsafe fn verify_checksum(&self) -> bool {
-        let saved = self.checksum;
-        let self_mut = self as *const CheckpointRecord as *mut CheckpointRecord;
-        unsafe {
-            (*self_mut).checksum = 0;
-        }
-        let computed = unsafe {
-            crc32c(
-                self as *const CheckpointRecord as *const u8,
-                Self::SIZE,
+
+    /// Computes CRC32C over `[0 .. SIZE - 4)`, excluding `checksum`.
+    ///
+    /// Takes `&self`, not `&mut self`, and never zeroes the checksum field:
+    /// the trailing four bytes are simply outside the CRC range. This keeps
+    /// the call sound on a `PROT_READ` mmap, where the old `*const -> *mut`
+    /// temp-zero form was undefined behaviour (I-001, Article IV).
+    pub fn compute_checksum(&self) -> u32 {
+        const PAYLOAD: usize = CheckpointRecord::SIZE - std::mem::size_of::<u32>();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                PAYLOAD,
             )
         };
         unsafe {
-            (*self_mut).checksum = saved;
+            crc32c(bytes.as_ptr(), bytes.len())
         }
-        computed == saved
     }
-    
-    pub unsafe fn as_bytes(&self) -> &[u8] {
+
+    /// Writes `compute_checksum()` into `checksum`; call after filling fields.
+    pub fn fill_checksum(&mut self) {
+        self.checksum = self.compute_checksum();
+    }
+
+    /// Returns `checksum == compute_checksum()`. Used during recovery.
+    pub fn verify_checksum(&self) -> bool {
+        self.checksum == self.compute_checksum()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
                 self as *const CheckpointRecord as *const u8,
@@ -67,14 +88,20 @@ impl CheckpointRecord {
             )
         }
     }
-    
-    pub unsafe fn from_bytes(bytes: &[u8]) -> &CheckpointRecord {
-        assert!(bytes.len() >= Self::SIZE);
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         unsafe {
-            &*(bytes.as_ptr() as *const CheckpointRecord)
+            std::slice::from_raw_parts_mut(
+                self as *mut CheckpointRecord as *mut u8,
+                Self::SIZE,
+            )
         }
     }
 }
+
+const _: () = assert!(
+    std::mem::offset_of!(CheckpointRecord, checksum) == CheckpointRecord::SIZE - std::mem::size_of::<u32>()
+);
 
 #[cfg(test)]
 mod tests {
@@ -90,23 +117,23 @@ mod tests {
     fn layout_offsets() {
         assert_eq!(std::mem::offset_of!(CheckpointRecord, first_posting_offset), 0);
         assert_eq!(std::mem::offset_of!(CheckpointRecord, posting_count), 8);
-        assert_eq!(std::mem::offset_of!(CheckpointRecord, batch_seq), 16);
-        assert_eq!(std::mem::offset_of!(CheckpointRecord, checksum), 20);
-        assert_eq!(std::mem::offset_of!(CheckpointRecord, timestamp_ns), 24);
+        assert_eq!(std::mem::offset_of!(CheckpointRecord, timestamp_ns), 16);
+        assert_eq!(std::mem::offset_of!(CheckpointRecord, batch_seq), 24);
+        assert_eq!(std::mem::offset_of!(CheckpointRecord, checksum), 28);
     }
 
     #[test]
     fn new_computes_checksum() {
         let record = CheckpointRecord::new(4096, 10, 0);
         assert_ne!(record.checksum, 0);
-        assert!(unsafe { record.verify_checksum() });
+        assert!(record.verify_checksum());
     }
 
     #[test]
     fn verify_checksum_detects_corruption() {
         let mut record = CheckpointRecord::new(4096, 10, 0);
-        record.posting_count = 999; // corrupt
-        assert!(!unsafe { record.verify_checksum() });
+        record.posting_count = 999;
+        assert!(!record.verify_checksum());
     }
 
     #[test]
@@ -121,14 +148,15 @@ mod tests {
     #[test]
     fn as_bytes_roundtrip() {
         let record = CheckpointRecord::new(4096, 5, 1);
-        let bytes = unsafe { record.as_bytes() };
+        let bytes = record.as_bytes();
         assert_eq!(bytes.len(), CheckpointRecord::SIZE);
 
-        let restored = unsafe { CheckpointRecord::from_bytes(bytes) };
+        let mut restored = CheckpointRecord::zeroed();
+        restored.as_bytes_mut().copy_from_slice(&bytes[..CheckpointRecord::SIZE]);
         assert_eq!(restored.first_posting_offset, 4096);
         assert_eq!(restored.posting_count, 5);
         assert_eq!(restored.batch_seq, 1);
-        assert!(unsafe { restored.verify_checksum() });
+        assert!(restored.verify_checksum());
     }
 
     #[test]

@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use common::raw_u128_to_u64::raw_u128_to_u64;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
 use pipeline::incoming_slot::IncomingSlot;
@@ -10,24 +9,33 @@ use storage::ls_writer_slot::{LsWriterSlot, LS_MSG_ADD_TO_HEAP};
 use crate::partition_overrides::PartitionAssignmentsOverrides;
 use crate::transfer_hash_table::TransferHashTable;
 
-pub struct LedgerPipelineHandler {
+/// Postings a transfer produces until the rule engine exists.
+///
+/// Every transfer today is a plain two-sided movement — one debit and
+/// one credit — so the count is fixed. Once rules decide the shape of a
+/// transfer, the count comes from the evaluated rule and this constant
+/// disappears; it is named rather than written at the call site so the
+/// assumption is visible where it is made.
+const POSTINGS_PER_TRANSFER: u8 = 2;
+
+pub struct LedgerPipelineHandler<'scope> {
     seed_k0: u64,
     seed_k1: u64,
     partition_mask: usize,
     overrides: PartitionAssignmentsOverrides,
-    transfer_hash_tables: Vec<Arc<TransferHashTable>>,
-    ls_writer_rbs: Vec<Arc<MpscRingBuffer<LsWriterSlot>>>,
+    transfer_hash_tables: &'scope [TransferHashTable],
+    ls_writer_rbs: &'scope [MpscRingBuffer<LsWriterSlot>],
     decision_maker_shard_mask: usize,
 }
 
-impl LedgerPipelineHandler {
+impl<'scope> LedgerPipelineHandler<'scope> {
     pub fn new(
         seed_k0: u64,
         seed_k1: u64,
         num_partitions: usize,
         overrides: PartitionAssignmentsOverrides,
-        transfer_hash_tables: Vec<Arc<TransferHashTable>>,
-        ls_writer_rbs: Vec<Arc<MpscRingBuffer<LsWriterSlot>>>,
+        transfer_hash_tables: &'scope [TransferHashTable],
+        ls_writer_rbs: &'scope [MpscRingBuffer<LsWriterSlot>],
         decision_maker_shards_count: usize,
     ) -> Self {
         assert!(num_partitions.is_power_of_two(), "num_partitions must be a power of two");
@@ -46,12 +54,12 @@ impl LedgerPipelineHandler {
     }
 }
 
-impl PipelineHandler for LedgerPipelineHandler {
+impl<'scope> PipelineHandler for LedgerPipelineHandler<'scope> {
     fn handle(
         &mut self,
         slot: &IncomingSlot,
         gsn: u64,
-        partition_rb: &[Arc<MpscRingBuffer<PartitionSlot>>],
+        partition_rb: &[MpscRingBuffer<PartitionSlot>],
     ) {
         let amount = i64::from_be_bytes(slot.amount);
 
@@ -75,7 +83,7 @@ impl PipelineHandler for LedgerPipelineHandler {
                 slot.connection_id,
                 &slot.batch_id,
                 &slot.currency,
-                2,
+                POSTINGS_PER_TRANSFER,
                 transfer_datetime,
                 &slot.transfer_sequence_id,
             )
@@ -148,10 +156,10 @@ impl PipelineHandler for LedgerPipelineHandler {
     }
 }
 
-impl LedgerPipelineHandler {
+impl<'scope> LedgerPipelineHandler<'scope> {
     fn send_prepare(
         &self,
-        partition_rb: &[Arc<MpscRingBuffer<PartitionSlot>>],
+        partition_rb: &[MpscRingBuffer<PartitionSlot>],
         gsn: u64,
         transfer_id: &[u8; 16],
         account_id: &[u8; 16],
@@ -217,26 +225,10 @@ mod tests {
     use super::*;
     use pipeline::incoming_slot::IncomingSlot;
 
-    const K0: u64 = 0x0123456789ABCDEF;
-    const K1: u64 = 0xFEDCBA9876543210;
-
-    fn make_handler(num_partitions: usize) -> LedgerPipelineHandler {
-        let overrides = PartitionAssignmentsOverrides::empty();
-        let tht = vec![
-            Arc::new(TransferHashTable::new(64, K0, K1, 8).unwrap())
-        ];
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let ls_writer_rbs = vec![ls_writer_rb.clone()];
-        LedgerPipelineHandler::new(
-            K0,
-            K1,
-            num_partitions,
-            overrides,
-            tht,
-            ls_writer_rbs,
-            1
-        )
-    }
+    const PARTITION_SEED_K0: u64 = 0x0123456789ABCDEF;
+    const PARTITION_SEED_K1: u64 = 0xFEDCBA9876543210;
+    const TRANSFER_HASH_TABLE_SEED_K0: u64 = 0x0123456789ABCDEF;
+    const TRANSFER_HASH_TABLE_SEED_K1: u64 = 0xFEDCBA9876543210;
 
     fn make_incoming(debit: [u8; 16], credit: [u8; 16], amount: i64) -> IncomingSlot {
         let mut slot = IncomingSlot::zeroed();
@@ -254,25 +246,22 @@ mod tests {
     #[test]
     fn produces_two_partition_slots() {
         let num_partitions = 16;
-        let partition_rb: Vec<Arc<MpscRingBuffer<PartitionSlot>>> = (0..num_partitions)
-            .map(|_| Arc::new(MpscRingBuffer::new(64).unwrap()))
+        let partition_rbs: Vec<MpscRingBuffer<PartitionSlot>> = (0..num_partitions)
+            .map(|_| MpscRingBuffer::new(64).unwrap())
             .collect();
 
         let overrides = PartitionAssignmentsOverrides::empty();
-        let tht = vec![
-            Arc::new(TransferHashTable::new(64, K0, K1, 8).unwrap())
-        ];
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let ls_writer_rbs = vec![ls_writer_rb.clone()];
+        let tht = vec![TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap()];
+        let ls_writer_rbs = vec![MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()];
 
-        let mut handler = LedgerPipelineHandler::new(K0, K1, num_partitions, overrides, tht.clone(), ls_writer_rbs, 1);
+        let mut handler = LedgerPipelineHandler::new(PARTITION_SEED_K0, PARTITION_SEED_K1, num_partitions, overrides, &tht, &ls_writer_rbs, 1);
 
         let slot = make_incoming(account_id(10), account_id(20), 500);
-        handler.handle(&slot, 1, &partition_rb);
+        handler.handle(&slot, 1, &partition_rbs);
 
         let mut total = 0;
-        for rb in &partition_rb {
-            let batch = rb.drain_batch(64);
+        for partition_rb in &partition_rbs {
+            let batch = partition_rb.drain_batch(64);
             total += batch.len();
             batch.release();
         }
@@ -282,27 +271,24 @@ mod tests {
     #[test]
     fn debit_and_credit_entries() {
         let num_partitions = 16;
-        let partition_rb: Vec<Arc<MpscRingBuffer<PartitionSlot>>> = (0..num_partitions)
-            .map(|_| Arc::new(MpscRingBuffer::new(64).unwrap()))
+        let partition_rbs: Vec<MpscRingBuffer<PartitionSlot>> = (0..num_partitions)
+            .map(|_| MpscRingBuffer::new(64).unwrap())
             .collect();
 
         let overrides = PartitionAssignmentsOverrides::empty();
-        let tht = vec![
-            Arc::new(TransferHashTable::new(64, K0, K1, 8).unwrap())
-        ];
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let ls_writer_rbs = vec![ls_writer_rb.clone()];
+        let tht = vec![TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap()];
+        let ls_writer_rbs = vec![MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()];
 
-        let mut handler = LedgerPipelineHandler::new(K0, K1, num_partitions, overrides, tht, ls_writer_rbs, 1);
+        let mut handler = LedgerPipelineHandler::new(PARTITION_SEED_K0, PARTITION_SEED_K1, num_partitions, overrides, &tht, &ls_writer_rbs, 1);
         let debit_acc = account_id(10);
         let credit_acc = account_id(20);
 
         let slot = make_incoming(debit_acc, credit_acc, 500);
-        handler.handle(&slot, 42, &partition_rb);
+        handler.handle(&slot, 42, &partition_rbs);
 
         let mut entries: Vec<PartitionSlot> = Vec::new();
-        for rb in &partition_rb {
-            let batch = rb.drain_batch(64);
+        for partition_rb in &partition_rbs {
+            let batch = partition_rb.drain_batch(64);
             for i in 0..batch.len() {
                 entries.push(*batch.slot(i));
             }
@@ -326,18 +312,15 @@ mod tests {
     #[test]
     fn same_account_same_partition() {
         let num_partitions = 16;
-        let partition_rb: Vec<Arc<MpscRingBuffer<PartitionSlot>>> = (0..num_partitions)
-            .map(|_| Arc::new(MpscRingBuffer::new(64).unwrap()))
+        let partition_rb: Vec<MpscRingBuffer<PartitionSlot>> = (0..num_partitions)
+            .map(|_| MpscRingBuffer::new(64).unwrap())
             .collect();
 
         let overrides = PartitionAssignmentsOverrides::empty();
-        let tht = vec![
-            Arc::new(TransferHashTable::new(64, K0, K1, 8).unwrap())
-        ];
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let ls_writer_rbs = vec![ls_writer_rb.clone()];
+        let tht = vec![TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap()];
+        let ls_writer_rbs = vec![MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()];
 
-        let mut handler = LedgerPipelineHandler::new(K0, K1, num_partitions, overrides, tht, ls_writer_rbs, 1);
+        let mut handler = LedgerPipelineHandler::new(PARTITION_SEED_K0, PARTITION_SEED_K1, num_partitions, overrides, &tht, &ls_writer_rbs, 1);
         let acc = account_id(42);
 
         let slot1 = make_incoming(acc, account_id(100), 300);
@@ -368,25 +351,22 @@ mod tests {
     #[test]
     fn partition_routing_uses_account_not_transfer() {
         let num_partitions = 16;
-        let partition_rb: Vec<Arc<MpscRingBuffer<PartitionSlot>>> = (0..num_partitions)
-            .map(|_| Arc::new(MpscRingBuffer::new(64).unwrap()))
+        let partition_rbs: Vec<MpscRingBuffer<PartitionSlot>> = (0..num_partitions)
+            .map(|_| MpscRingBuffer::new(64).unwrap())
             .collect();
 
         let overrides = PartitionAssignmentsOverrides::empty();
-        let tht = vec![
-            Arc::new(TransferHashTable::new(64, K0, K1, 8).unwrap())
-        ];
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let ls_writer_rbs = vec![ls_writer_rb.clone()];
+        let tht = vec![TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap()];
+        let ls_writer_rbs = vec![MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()];
 
-        let mut handler = LedgerPipelineHandler::new(K0, K1, num_partitions, overrides, tht, ls_writer_rbs, 1);
+        let mut handler = LedgerPipelineHandler::new(PARTITION_SEED_K0, PARTITION_SEED_K1, num_partitions, overrides, &tht, &ls_writer_rbs, 1);
 
         let slot = make_incoming(account_id(1), account_id(1000), 100);
-        handler.handle(&slot, 1, &partition_rb);
+        handler.handle(&slot, 1, &partition_rbs);
 
         let mut entries = Vec::new();
-        for rb in &partition_rb {
-            let batch = rb.drain_batch(64);
+        for partition_rb in &partition_rbs {
+            let batch = partition_rb.drain_batch(64);
             for i in 0..batch.len() {
                 entries.push(*batch.slot(i));
             }
@@ -400,8 +380,8 @@ mod tests {
     #[test]
     fn override_routes_to_specified_partition() {
         let num_partitions = 16;
-        let partition_rb: Vec<Arc<MpscRingBuffer<PartitionSlot>>> = (0..num_partitions)
-            .map(|_| Arc::new(MpscRingBuffer::new(64).unwrap()))
+        let partition_rb: Vec<MpscRingBuffer<PartitionSlot>> = (0..num_partitions)
+            .map(|_| MpscRingBuffer::new(64).unwrap())
             .collect();
 
         let target_partition = 5;
@@ -410,13 +390,10 @@ mod tests {
         let mut overrides_map = std::collections::HashMap::new();
         overrides_map.insert(hot_account, target_partition);
         let overrides = PartitionAssignmentsOverrides::from_map(overrides_map);
-        let tht = vec![
-            Arc::new(TransferHashTable::new(64, K0, K1, 8).unwrap())
-        ];
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let ls_writer_rbs = vec![ls_writer_rb.clone()];
+        let tht = vec![TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap()];
+        let ls_writer_rbs = vec![MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()];
 
-        let mut handler = LedgerPipelineHandler::new(K0, K1, num_partitions, overrides, tht, ls_writer_rbs, 1);
+        let mut handler = LedgerPipelineHandler::new(PARTITION_SEED_K0, PARTITION_SEED_K1, num_partitions, overrides, &tht, &ls_writer_rbs, 1);
 
         let slot = make_incoming(hot_account, account_id(100), 500);
         handler.handle(&slot, 1, &partition_rb);
@@ -436,25 +413,22 @@ mod tests {
     #[test]
     fn partition_slot_has_tht_offset_and_shard_id() {
         let num_partitions = 16;
-        let partition_rb: Vec<Arc<MpscRingBuffer<PartitionSlot>>> = (0..num_partitions)
-            .map(|_| Arc::new(MpscRingBuffer::new(64).unwrap()))
+        let partition_rbs: Vec<MpscRingBuffer<PartitionSlot>> = (0..num_partitions)
+            .map(|_| MpscRingBuffer::new(64).unwrap())
             .collect();
 
-        let tht = vec![
-            Arc::new(TransferHashTable::new(64, K0, K1, 8).unwrap())
-        ];
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let ls_writer_rbs = vec![ls_writer_rb.clone()];
+        let tht = vec![TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap()];
+        let ls_writer_rbs = vec![MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()];
 
         let overrides = PartitionAssignmentsOverrides::empty();
-        let mut handler = LedgerPipelineHandler::new(K0, K1, num_partitions, overrides, tht.clone(), ls_writer_rbs, 1);
+        let mut handler = LedgerPipelineHandler::new(PARTITION_SEED_K0, PARTITION_SEED_K1, num_partitions, overrides, &tht, &ls_writer_rbs, 1);
 
         let slot = make_incoming(account_id(10), account_id(20), 500);
-        handler.handle(&slot, 1, &partition_rb);
+        handler.handle(&slot, 1, &partition_rbs);
 
         let mut entries = Vec::new();
-        for rb in &partition_rb {
-            let batch = rb.drain_batch(64);
+        for partition_rb in &partition_rbs {
+            let batch = partition_rb.drain_batch(64);
             for i in 0..batch.len() {
                 entries.push(*batch.slot(i));
             }
@@ -471,24 +445,21 @@ mod tests {
     #[test]
     fn tht_slot_published_after_handle() {
         let num_partitions = 16;
-        let partition_rb: Vec<Arc<MpscRingBuffer<PartitionSlot>>> = (0..num_partitions)
-            .map(|_| Arc::new(MpscRingBuffer::new(64).unwrap()))
+        let partition_rbs: Vec<MpscRingBuffer<PartitionSlot>> = (0..num_partitions)
+            .map(|_| MpscRingBuffer::new(64).unwrap())
             .collect();
 
-        let tht = vec![
-            Arc::new(TransferHashTable::new(64, K0, K1, 8).unwrap())
-        ];
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let ls_writer_rbs = vec![ls_writer_rb.clone()];
+        let tht = vec![TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap()];
+        let ls_writer_rbs = vec![MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()];
         let overrides = PartitionAssignmentsOverrides::empty();
-        let mut handler = LedgerPipelineHandler::new(K0, K1, num_partitions, overrides, tht.clone(), ls_writer_rbs, 1);
+        let mut handler = LedgerPipelineHandler::new(PARTITION_SEED_K0, PARTITION_SEED_K1, num_partitions, overrides, &tht, &ls_writer_rbs, 1);
 
         let slot = make_incoming(account_id(10), account_id(20), 500);
-        handler.handle(&slot, 42, &partition_rb);
+        handler.handle(&slot, 42, &partition_rbs);
 
         let mut tht_offset = 0u32;
-        for rb in &partition_rb {
-            let batch = rb.drain_batch(64);
+        for partition_rb in &partition_rbs {
+            let batch = partition_rb.drain_batch(64);
             if batch.len() > 0 {
                 tht_offset = batch.slot(0).transfer_hash_table_offset;
             }

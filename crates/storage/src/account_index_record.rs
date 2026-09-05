@@ -12,7 +12,6 @@ impl AccountIndexRecord {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 }
 
-// account_index_record.rs
 #[cfg(test)]
 mod tests {
     use super::*;

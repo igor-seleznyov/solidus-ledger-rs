@@ -1,7 +1,6 @@
 use std::mem;
 use common::crc32c::crc32c;
 
-// 'LDSTPSTR' little-endian LeDgerSTorage PoSTing Record
 pub const POSTING_RECORD_MAGIC: u64 = 0x5254_5350_5453_444C;
 
 /// Posting written to the LS file. 128 B, 2 cache lines.
@@ -15,10 +14,9 @@ pub const POSTING_RECORD_MAGIC: u64 = 0x5254_5350_5453_444C;
 /// Future fields MUST go before `checksum` and eat into the reserved budget.
 /// When the reserved budget runs out, bump `LS_FORMAT_VERSION` in `LsFileHeader`
 /// and add version dispatch in the scanner.
-#[repr(C, align(64))]
+#[repr(C, align(8))]
 #[derive(Copy, Clone)]
 pub struct PostingRecord {
-    // ═══ Cache line 0: identity + amounts ═══
     pub magic: u64,
     pub transfer_id_hi: u64,
     pub transfer_id_lo: u64,
@@ -28,7 +26,6 @@ pub struct PostingRecord {
     pub amount: i64,
     pub ordinal: u64,
 
-    // ═══ Cache line 1: timestamps + metadata + checksum ═══
     pub prev_posting_record_offset: u64,
     pub timestamp_ns: u64,
     pub transfer_sequence_id: [u8; 16],
@@ -41,6 +38,20 @@ pub struct PostingRecord {
     pub _pad: [u8; 1],
     pub checksum: u32,
 }
+const _: () = assert!(
+    std::mem::size_of::<PostingRecord>()
+        == size_of::<u64>() * 10
+                + size_of::<i64>()
+                + size_of::<[u8; 16]>() * 2
+                + size_of::<u8>() * 2
+                + size_of::<i8>()
+                + size_of::<[u8; 1]>()
+                + size_of::<u32>(),
+    "PostingRecord is larger than its fields: the compiler inserted alignment \
+     padding. Declare it as an explicit field so the layout is stated, and \
+     so the checksum stays the record's final bytes",
+);
+
 
 impl PostingRecord {
     pub const SIZE: usize = std::mem::size_of::<PostingRecord>();
@@ -77,10 +88,6 @@ impl PostingRecord {
     }
 
     pub fn compute_checksum(&self) -> u32 {
-        // SAFETY: `self` is a valid `PostingRecord` of exactly `SIZE` bytes.
-        // Reading `[0..SIZE - 4)` excludes only the trailing `checksum: u32`
-        // field. The struct is `Copy`, so no drop glue runs concurrently.
-        // No aliasing violation: we hold `&self`, not `&mut self`.
         const PAYLOAD: usize = PostingRecord::SIZE - std::mem::size_of::<u32>();
         let bytes = unsafe {
             std::slice::from_raw_parts(
@@ -126,9 +133,19 @@ mod tests {
         assert_eq!(PostingRecord::SIZE, 128);
     }
 
+    /// The record aligns to eight, not to a cache line.
+    ///
+    /// It travels to the log inside a ring slot, and the ring's container
+    /// fixes the payload at offset 8; a record demanding 64 would push its
+    /// own start past that and break every reader computing the offset
+    /// once. Nothing is lost by relaxing it: the fields already sum to 128
+    /// with natural alignment, so the declared 64 added no padding and no
+    /// byte on disk moves. The cache-line placement the record actually
+    /// depends on — identity fields on the first line — is asserted
+    /// separately and unaffected.
     #[test]
-    fn alignment_is_64() {
-        assert_eq!(std::mem::align_of::<PostingRecord>(), 64);
+    fn alignment_is_8() {
+        assert_eq!(std::mem::align_of::<PostingRecord>(), 8);
     }
 
     #[test]

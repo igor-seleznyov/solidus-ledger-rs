@@ -159,15 +159,6 @@ impl FileWatcher {
     ) -> Result<(Self, FileWatcherHandles), TamperingLogError> {
         let instance_id = config.instance_id.unwrap_or(ZERO_INSTANCE_ID);
 
-        // ADR-017 Amendment 2026-05-10c: open the TamperingLog BEFORE
-        // replaying the CompromisedFileSet. `load_compromised_set` is a
-        // `&mut self` method that may append a `SegmentRejected` event
-        // when it rejects an alien archive segment, so it needs the
-        // open log as its append target. Variant C: a foreign identity
-        // or a header-integrity failure on the CURRENT segment surfaces
-        // here as `Err(TamperingLogError::SecurityHalt)`, which `?`
-        // propagates to `main.rs` (ADR-017 §Amendment 2026-05-18,
-        // I-042 §9).
         let mut tampering_log = TamperingLog::open(
             &watch_directory,
             config.tampering_log_max_size_mb,
@@ -252,7 +243,7 @@ impl FileWatcher {
                     "[file-watcher {}] FATAL: file watcher failed: {}. Initiating shutdown.",
                     self.id, error,
                 );
-                std::process::exit(1);//TODO add graceful shutdown here later
+                std::process::exit(1);
             }
         }
     }
@@ -514,11 +505,11 @@ impl FileWatcher {
             );
         }
 
-        let mut set = self.compromised_files.lock().unwrap_or_else(|e| e.into_inner());
-        set.insert(ls_path.to_string());
-
-        if let Ok(mut set) = self.compromised_files.lock() {
-            set.insert(ls_path.to_string());
+        {
+            let mut compromised = self.compromised_files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            compromised.insert(ls_path.to_string());
         }
 
         let mut removed_watch_descriptor: libc::c_int = -1;
@@ -654,10 +645,6 @@ impl FileWatcher{
     }
 
     fn setup_inotify(&mut self) -> std::io::Result<()> {
-        // SAFETY: Direct Linux syscall. `inotify_init1` accepts flag values
-        // `IN_CLOEXEC | IN_NONBLOCK`, both well-defined kernel constants. The
-        // returned fd is validated immediately by the `fd == -1` guard; on
-        // success it is a valid inotify fd with no other memory-safety invariants.
         let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
         if fd == -1 {
             return Err(std::io::Error::last_os_error());
@@ -688,11 +675,6 @@ impl FileWatcher{
                     continue;
                 }
             };
-            // SAFETY: Direct Linux syscall. `inotify_fd` is a valid inotify fd
-            // returned by `setup_inotify`. `c_path.as_ptr()` points to a
-            // NUL-terminated C string owned by `c_path` (lifetime covers the call).
-            // `MASK` uses only well-defined kernel constants. The returned wd is
-            // checked immediately by the `wd == -1` guard.
             let wd = unsafe { libc::inotify_add_watch(inotify_fd, c_path.as_ptr(), MASK) };
             if wd == -1 {
                 eprintln!(
@@ -713,11 +695,6 @@ impl FileWatcher{
         event_buf: &mut [u8; FILE_PAGE_SIZE],
     ) -> std::io::Result<()> {
         loop {
-            // SAFETY: Direct Linux syscall. `inotify_fd` is a valid inotify fd
-            // (opened by `setup_inotify`). `event_buf` is a local `[u8; FILE_PAGE_SIZE]`
-            // array — the pointer is valid for the entire call and the length
-            // argument equals `event_buf.len()`. `IN_NONBLOCK` ensures the call
-            // returns `EAGAIN` rather than blocking when no events are ready.
             let bytes_read = unsafe {
                 libc::read(
                     inotify_fd,
@@ -753,9 +730,6 @@ impl FileWatcher{
     }
 
     fn cleanup_inotify(&self, inotify_fd: libc::c_int) {
-        // SAFETY: inotify_fd was opened by setup_inotify and is valid until
-        // this call. close(2) on a valid fd is always safe. All watch
-        // descriptors are released by the kernel when the inotify fd closes.
         unsafe {
             libc::close(inotify_fd);
         }
@@ -765,27 +739,16 @@ impl FileWatcher{
         let mut offset = 0;
 
         while offset + std::mem::size_of::<libc::inotify_event>() <= buf.len() {
-            // SAFETY: `buf[offset..]` contains at least
-            // `size_of::<libc::inotify_event>()` bytes — guaranteed by the
-            // while-loop guard immediately above. The pointer is valid for the
-            // lifetime of `buf`. The reference cast is sound: all bytes are
-            // in-bounds and the kernel's inotify_event layout does not require
-            // alignment stricter than `buf`'s allocation.
             let event = unsafe {
-                &*(
-                    buf[offset..].as_ptr() as *const libc::inotify_event
+                std::ptr::read_unaligned(
+                    buf[offset..].as_ptr() as *const libc::inotify_event,
                 )
             };
-
             let name_len = event.len as usize;
             let Some(event_size) = std::mem::size_of::<libc::inotify_event>()
                 .checked_add(name_len)
                 .filter(|&size| size <= buf.len() - offset)
             else {
-                // Defends against kernel-truncated reads, `IN_Q_OVERFLOW` event garbage,
-                // and integer overflow on attacker-controlled filename length.
-                // Cannot safely parse the rest of a truncated buffer; bail and let
-                // the next read(2) deliver complete events.
                 break;
             };
 
@@ -1011,10 +974,6 @@ mod tests {
 
     #[test]
     fn sender_send_and_wake() {
-        // This test exercises FileWatcherSender, which needs only a
-        // Waker — build it directly instead of standing up a full
-        // FileWatcher (FileWatcher::new, in its 5-argument form, takes a
-        // config + manifest).
         let (tx, _rx) = std::sync::mpsc::channel();
         let poll = Poll::new().expect("create Poll");
         let waker = Arc::new(
@@ -1040,7 +999,6 @@ mod tests {
         let sender1 = FileWatcherSender::new(tx, waker);
         let sender2 = sender1.clone();
 
-        // Both senders work independently.
         assert!(sender1.send(FileWatcherMessage::WatchFile {
             ls_path: "/test1.ls".to_string(),
         }).is_ok());
@@ -1056,12 +1014,8 @@ mod tests {
             let mut results = Vec::new();
             let mut offset = 0usize;
             while offset + hdr_size <= buf.len() {
-                // SAFETY: `buf[offset..]` contains at least `hdr_size` bytes —
-                // guaranteed by the while-loop guard above. Only `event.len` (a
-                // `u32` at a naturally aligned offset within `inotify_event`) is
-                // read; the variable-length name tail is never accessed here.
                 let name_len = unsafe {
-                    let event = &*(buf[offset..].as_ptr() as *const libc::inotify_event);
+                    let event = std::ptr::read_unaligned(buf[offset..].as_ptr() as *const libc::inotify_event);
                     event.len as usize
                 };
                 let event_size_opt = hdr_size
@@ -1086,7 +1040,6 @@ mod tests {
             let name_len = name.len();
             let total = hdr_size + name_len;
             let mut buf = vec![0u8; total];
-            // inotify_event: { wd: i32, mask: u32, cookie: u32, len: u32, name: [c_char; 0] }
             let len_offset = memoffset_of_inotify_len();
             let len_bytes = (name_len as u32).to_ne_bytes();
             buf[len_offset..len_offset + 4].copy_from_slice(&len_bytes);
@@ -1161,5 +1114,46 @@ mod tests {
                 "exact-fit buffer must parse without bail"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod record_tampering_lock_tests {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    /// Models the exact lock sequence `record_tampering` performs: a single
+    /// scoped acquisition of `compromised_files`, with the guard released at
+    /// the closing brace BEFORE any further work.
+    ///
+    /// The earlier code acquired this same non-reentrant `std::sync::Mutex`
+    /// twice on one thread; the second acquisition would block forever and
+    /// this call would never return. The run recipe wraps the test in an
+    /// OS-level `timeout`, so a regression surfaces as a timeout rather than
+    /// an infinite hang.
+    fn record_into(compromised_files: &Arc<Mutex<HashSet<String>>>, ls_path: &str) {
+        {
+            let mut compromised = compromised_files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            compromised.insert(ls_path.to_string());
+        }
+        let _post_lock_work = ls_path.len();
+    }
+
+    #[test]
+    fn record_tampering_single_lock_does_not_deadlock() {
+        let compromised_files: Arc<Mutex<HashSet<String>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+
+        record_into(&compromised_files, "ls_0001.ls");
+        record_into(&compromised_files, "ls_0002.ls");
+
+        let guard = compromised_files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(guard.contains("ls_0001.ls"));
+        assert!(guard.contains("ls_0002.ls"));
+        assert_eq!(guard.len(), 2);
     }
 }

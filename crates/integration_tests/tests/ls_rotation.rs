@@ -1,4 +1,4 @@
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use ed25519_dalek::SigningKey;
 use common::make_test_dir::make_test_dir;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
@@ -16,13 +16,13 @@ use storage::ls_sign_file_header::LsSignFileHeader;
 use storage::ls_meta_file_header::LsMetaFileHeader;
 use storage::checkpoint_file_header::CheckpointFileHeader;
 use storage::manifest::Manifest;
+use storage::recovery::recover_checkpoint_state;
 
-const K0: u64 = 0x0123456789ABCDEF;
-const K1: u64 = 0xFEDCBA9876543210;
+const IN_FLIGHT_MIN_HEAP_SEED_K0: u64 = 0x0123456789ABCDEF;
+const IN_FLIGHT_MIN_HEAP_SEED_K1: u64 = 0xFEDCBA9876543210;
 
 static mut TEST_COMMITTED_GSN: u64 = 0;
 
-// --- Helpers ---
 
 fn make_temp_dir(test_name: &str) -> String {
     let dir = make_test_dir();
@@ -36,13 +36,11 @@ fn cleanup_temp_dir(dir: &str) {
 fn make_writer(
     dir: &str,
     max_ls_file_size: usize,
-) -> LsWriter<PortableFlushBackend, NoSigningStrategy, NoMetadataStrategy> {
-    let ls_writer_rb = Arc::new(
-        MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
-    );
-    let flush_done_rb = Arc::new(
-        MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()
-    );
+) -> LsWriter<'static, PortableFlushBackend, NoSigningStrategy, NoMetadataStrategy> {
+    let ls_writer_rb: &'static MpscRingBuffer<LsWriterSlot> =
+        Box::leak(Box::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()));
+    let flush_done_rb: &'static MpscRingBuffer<FlushDoneSlot> =
+        Box::leak(Box::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()));
 
     unsafe { TEST_COMMITTED_GSN = 0; }
     let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
@@ -63,7 +61,7 @@ fn make_writer(
         NoMetadataStrategy,
         dir.to_string(),
         max_ls_file_size,
-        64, K0, K1,
+        64, IN_FLIGHT_MIN_HEAP_SEED_K0, IN_FLIGHT_MIN_HEAP_SEED_K1,
         64, 2, 512,
         16,
         4,
@@ -79,13 +77,11 @@ fn make_writer(
 fn make_writer_with_signing(
     dir: &str,
     max_ls_file_size: usize,
-) -> LsWriter<PortableFlushBackend, Ed25519SigningStrategy, NoMetadataStrategy> {
-    let ls_writer_rb = Arc::new(
-        MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
-    );
-    let flush_done_rb = Arc::new(
-        MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()
-    );
+) -> LsWriter<'static, PortableFlushBackend, Ed25519SigningStrategy, NoMetadataStrategy> {
+    let ls_writer_rb: &'static MpscRingBuffer<LsWriterSlot> =
+        Box::leak(Box::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()));
+    let flush_done_rb: &'static MpscRingBuffer<FlushDoneSlot> =
+        Box::leak(Box::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()));
 
     unsafe { TEST_COMMITTED_GSN = 0; }
     let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
@@ -111,7 +107,7 @@ fn make_writer_with_signing(
         NoMetadataStrategy,
         dir.to_string(),
         max_ls_file_size,
-        64, K0, K1,
+        64, IN_FLIGHT_MIN_HEAP_SEED_K0, IN_FLIGHT_MIN_HEAP_SEED_K1,
         64, 2, 512,
         16,
         4,
@@ -128,13 +124,11 @@ fn make_writer_with_metadata(
     dir: &str,
     max_ls_file_size: usize,
     record_size: usize,
-) -> LsWriter<PortableFlushBackend, NoSigningStrategy, PostingMetadataStrategy> {
-    let ls_writer_rb = Arc::new(
-        MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
-    );
-    let flush_done_rb = Arc::new(
-        MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()
-    );
+) -> LsWriter<'static, PortableFlushBackend, NoSigningStrategy, PostingMetadataStrategy> {
+    let ls_writer_rb: &'static MpscRingBuffer<LsWriterSlot> =
+        Box::leak(Box::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()));
+    let flush_done_rb: &'static MpscRingBuffer<FlushDoneSlot> =
+        Box::leak(Box::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()));
 
     unsafe { TEST_COMMITTED_GSN = 0; }
     let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
@@ -157,7 +151,7 @@ fn make_writer_with_metadata(
         metadata,
         dir.to_string(),
         max_ls_file_size,
-        64, K0, K1,
+        64, IN_FLIGHT_MIN_HEAP_SEED_K0, IN_FLIGHT_MIN_HEAP_SEED_K1,
         64, 2, 512,
         16,
         4,
@@ -238,12 +232,13 @@ fn rotation_ls_header_correct() {
 
     assert!(ls_bytes.len() >= LsFileHeader::SIZE);
 
-    let header = unsafe { LsFileHeader::from_bytes(&ls_bytes) };
+    let mut header = LsFileHeader::zeroed();
+    header.as_bytes_mut().copy_from_slice(&ls_bytes[..LsFileHeader::SIZE]);
     assert_eq!(header.magic, storage::ls_file_header::LS_FILE_MAGIC);
     assert_eq!(header.file_seq, 1);
     assert_eq!(header.signing_enabled, 0);
     assert_eq!(header.metadata_enabled, 0);
-    assert!(unsafe { header.verify_checksum() });
+    assert!(header.verify_checksum());
 
     cleanup_temp_dir(&dir);
 }
@@ -256,18 +251,22 @@ fn rotation_checkpoint_header_linked_file_seq() {
     let first_checkpoint_path = format!("{}.checkpoint", writer.current_ls_file_path());
     let bytes0 = std::fs::read(&first_checkpoint_path)
         .expect("Failed to read first checkpoint");
-    let header0 = unsafe { CheckpointFileHeader::from_bytes(&bytes0) };
+    assert!(bytes0.len() >= CheckpointFileHeader::SIZE);
+    let mut header0 = CheckpointFileHeader::zeroed();
+    header0.as_bytes_mut().copy_from_slice(&bytes0[..CheckpointFileHeader::SIZE]);
     assert_eq!(header0.linked_ls_file_seq, 0);
-    assert!(unsafe { header0.verify_checksum() });
+    assert!(header0.verify_checksum());
 
     writer.rotate();
 
     let second_checkpoint_path = format!("{}.checkpoint", writer.current_ls_file_path());
     let bytes1 = std::fs::read(&second_checkpoint_path)
         .expect("Failed to read second checkpoint");
-    let header1 = unsafe { CheckpointFileHeader::from_bytes(&bytes1) };
+    assert!(bytes1.len() >= CheckpointFileHeader::SIZE);
+    let mut header1 = CheckpointFileHeader::zeroed();
+    header1.as_bytes_mut().copy_from_slice(&bytes1[..CheckpointFileHeader::SIZE]);
     assert_eq!(header1.linked_ls_file_seq, 1);
-    assert!(unsafe { header1.verify_checksum() });
+    assert!(header1.verify_checksum());
 
     cleanup_temp_dir(&dir);
 }
@@ -286,7 +285,6 @@ fn rotation_data_written_to_new_file() {
     let first_path = writer.current_ls_file_path().to_string();
     let first_file_size = std::fs::metadata(&first_path)
         .expect("Failed to stat first LS file").len();
-    // Header page (4096) + data page (4096) = 8192
     assert!(first_file_size >= 8192);
 
     writer.rotate();
@@ -330,7 +328,10 @@ fn auto_rotation_on_max_file_size() {
 
     let new_ls_bytes = std::fs::read(writer.current_ls_file_path())
         .expect("Failed to read new LS file");
-    let new_header = unsafe { LsFileHeader::from_bytes(&new_ls_bytes) };
+    assert!(new_ls_bytes.len() >= LsFileHeader::SIZE);
+    let mut new_header = LsFileHeader::zeroed();
+    new_header.as_bytes_mut()
+        .copy_from_slice(&new_ls_bytes[..LsFileHeader::SIZE]);
     assert_eq!(new_header.file_seq, 1);
 
     cleanup_temp_dir(&dir);
@@ -377,10 +378,13 @@ fn rotation_sign_cross_file_chain() {
     let sign_bytes = std::fs::read(&new_sign_path)
         .expect("Failed to read new sign file");
 
-    let sign_header = unsafe { LsSignFileHeader::from_bytes(&sign_bytes) };
+    assert!(sign_bytes.len() >= LsSignFileHeader::SIZE);
+    let mut sign_header = LsSignFileHeader::zeroed();
+    sign_header.as_bytes_mut()
+        .copy_from_slice(&sign_bytes[..LsSignFileHeader::SIZE]);
     assert_eq!(sign_header.magic, storage::ls_sign_file_header::LS_SIGN_FILE_MAGIC);
     assert_eq!(sign_header.linked_ls_file_seq, 1);
-    assert!(unsafe { sign_header.verify_checksum() });
+    assert!(sign_header.verify_checksum());
 
     assert_eq!(sign_header.genesis_hash, chain_hash_before_rotation);
 
@@ -421,7 +425,6 @@ fn rotation_meta_header_linked_file_seq() {
 
     assert!(meta_bytes.len() >= LsMetaFileHeader::SIZE);
 
-    // linked_ls_file_seq at offset 40
     let linked_seq = u64::from_le_bytes(
         meta_bytes[40..48].try_into().unwrap()
     );
@@ -445,7 +448,9 @@ fn multiple_rotations_handle_reuse() {
 
     let ls_bytes = std::fs::read(writer.current_ls_file_path())
         .expect("Failed to read LS file");
-    let header = unsafe { LsFileHeader::from_bytes(&ls_bytes) };
+    assert!(ls_bytes.len() >= LsFileHeader::SIZE);
+    let mut header = LsFileHeader::zeroed();
+    header.as_bytes_mut().copy_from_slice(&ls_bytes[..LsFileHeader::SIZE]);
     assert_eq!(header.file_seq, 4);
 
     cleanup_temp_dir(&dir);
@@ -467,8 +472,43 @@ fn multiple_rotations_with_signing_handle_reuse() {
 
     let ls_bytes = std::fs::read(writer.current_ls_file_path())
         .expect("Failed to read LS file");
-    let header = unsafe { LsFileHeader::from_bytes(&ls_bytes) };
+    assert!(ls_bytes.len() >= LsFileHeader::SIZE);
+    let mut header = LsFileHeader::zeroed();
+    header.as_bytes_mut().copy_from_slice(&ls_bytes[..LsFileHeader::SIZE]);
     assert_eq!(header.file_seq, 3);
+
+    cleanup_temp_dir(&dir);
+}
+
+#[test]
+fn checkpoint_record_survives_real_file_write_then_recover() {
+    let dir = make_temp_dir("checkpoint-recover-roundtrip");
+    let mut writer = make_writer(&dir, 1024 * 1024);
+
+    let checkpoint_path = format!("{}.checkpoint", writer.current_ls_file_path());
+
+    writer.process_message(&make_add_to_heap_slot(100));
+    writer.process_message(&make_posting_slot(100, 500));
+    writer.process_message(&make_posting_slot(200, 300));
+    writer.process_message(&make_flush_marker_slot(200, 1, 42));
+    writer.submit_flush();
+    writer.poll_and_handle_completions();
+
+    writer.process_message(&make_posting_slot(300, 100));
+    writer.process_message(&make_flush_marker_slot(300, 2, 43));
+    writer.submit_flush();
+    writer.poll_and_handle_completions();
+
+    let recovered = recover_checkpoint_state(&checkpoint_path);
+    let recovered_write_offset = recovered.write_offset;
+    let recovered_batch_seq = recovered.batch_seq;
+
+    assert_eq!(
+        recovered_write_offset,
+        CheckpointFileHeader::DATA_OFFSET as u64
+            + 2 * storage::checkpoint_record::CheckpointRecord::SIZE as u64,
+    );
+    assert_eq!(recovered_batch_seq, 2);
 
     cleanup_temp_dir(&dir);
 }

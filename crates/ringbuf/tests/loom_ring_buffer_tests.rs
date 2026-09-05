@@ -4,6 +4,9 @@ mod loom_ring_buffer_tests {
     use loom::sync::Arc;
     use loom::sync::atomic::{AtomicU64, Ordering, fence};
 
+    /// A stand-in for the MPSC ring buffer's sequence protocol.
+    /// Writer: writes the value, then a release fence and store(sequence).
+    /// Reader: load(sequence) and an acquire fence, then reads the value.
     #[test]
     fn loom_rb_sequence_barrier() {
         loom::model(|| {
@@ -14,15 +17,15 @@ mod loom_ring_buffer_tests {
             let val_w = value.clone();
 
             let writer = loom::thread::spawn(move || {
-                val_w.store(42, Ordering::Relaxed);     // plain write data
-                fence(Ordering::Release);                // release fence
-                seq_w.store(1, Ordering::Relaxed);       // publish sequence
+                val_w.store(42, Ordering::Relaxed);
+                fence(Ordering::Release);
+                seq_w.store(1, Ordering::Relaxed);
             });
 
             let reader = loom::thread::spawn(move || {
                 let seq = sequence.load(Ordering::Relaxed);
                 if seq == 1 {
-                    fence(Ordering::Acquire);             // acquire fence
+                    fence(Ordering::Acquire);
                     assert_eq!(value.load(Ordering::Relaxed), 42);
                 }
             });
@@ -32,6 +35,8 @@ mod loom_ring_buffer_tests {
         });
     }
 
+    /// Two writers claiming through the MPSC claim counter.
+    /// Each writes into its own slot; one reader takes both.
     #[test]
     fn loom_mpsc_two_writers() {
         loom::model(|| {
@@ -47,13 +52,12 @@ mod loom_ring_buffer_tests {
             let s1s = slot1_seq.clone();
             let s1v = slot1_val.clone();
 
-            // Writer 1
             let w1 = loom::thread::spawn(move || {
                 let claimed = cs1.fetch_add(1, Ordering::Relaxed);
                 if claimed == 0 {
                     s0v.store(1000, Ordering::Relaxed);
                     fence(Ordering::Release);
-                    s0s.store(1, Ordering::Relaxed); // publish
+                    s0s.store(1, Ordering::Relaxed);
                 } else {
                     s1v.store(1000, Ordering::Relaxed);
                     fence(Ordering::Release);
@@ -67,7 +71,6 @@ mod loom_ring_buffer_tests {
             let s1s2 = slot1_seq.clone();
             let s1v2 = slot1_val.clone();
 
-            // Writer 2
             let w2 = loom::thread::spawn(move || {
                 let claimed = cs2.fetch_add(1, Ordering::Relaxed);
                 if claimed == 0 {
