@@ -1,20 +1,19 @@
 use std::io;
-use std::sync::Arc;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use crate::ring_buffer::RingBuffer;
 
 const SERVER: Token = Token(0);
 
-pub struct Acceptor {
+pub struct Acceptor<'scope> {
     poll: Poll,
     listener: TcpListener,
-    workers: Vec<Arc<RingBuffer<TcpStream>>>,
+    workers: &'scope [RingBuffer<TcpStream>],
     next_worker: usize
 }
 
-impl Acceptor {
-    pub fn new(addr: &str, queues: Vec<Arc<RingBuffer<TcpStream>>>) -> io::Result<Self> {
+impl<'scope> Acceptor<'scope> {
+    pub fn new(addr: &str, queues: &'scope [RingBuffer<TcpStream>]) -> io::Result<Self> {
         let poll = Poll::new()?;
         let addr = addr.parse().unwrap();
         let mut listener = TcpListener::bind(addr)?;

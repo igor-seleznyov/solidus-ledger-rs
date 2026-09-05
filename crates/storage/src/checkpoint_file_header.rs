@@ -2,7 +2,6 @@ use common::crc32c::crc32c;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::checkpoint_record::CheckpointRecord;
 
-// 'LDSTCKPT'
 pub const CHECKPOINT_FILE_MAGIC: u64 = 0x5450_4B43_5453_444C;
 
 #[repr(C)]
@@ -16,6 +15,17 @@ pub struct CheckpointFileHeader {
     pub data_offset: u32,
     pub checksum: u32,
 }
+const _: () = assert!(
+    std::mem::size_of::<CheckpointFileHeader>()
+        == size_of::<u64>() * 3
+                + size_of::<u16>()
+                + size_of::<[u8; 2]>()
+                + size_of::<u32>() * 3,
+    "CheckpointFileHeader is larger than its fields: the compiler inserted alignment \
+     padding. Declare it as an explicit field so the layout is stated, and \
+     so the checksum stays the record's final bytes",
+);
+
 
 impl CheckpointFileHeader {
     pub const SIZE: usize = std::mem::size_of::<Self>();
@@ -27,7 +37,7 @@ impl CheckpointFileHeader {
 
     pub fn new(linked_ls_file_seq: u64) -> Self {
         let created_at_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
 
@@ -42,47 +52,38 @@ impl CheckpointFileHeader {
             checksum: 0,
         };
 
-        header.checksum = unsafe {
-            crc32c(
-                &header as *const CheckpointFileHeader as *const u8,
-                Self::SIZE,
-            )
-        };
-
+        header.fill_checksum();
         header
     }
 
-    pub unsafe fn verify_checksum(&self) -> bool {
-        let saved = self.checksum;
-        let self_mut = self as *const CheckpointFileHeader as *mut CheckpointFileHeader;
-        unsafe {
-            (*self_mut).checksum = 0;
-        }
-        let computed = unsafe {
-            crc32c(
-                self as *const CheckpointFileHeader as *const u8,
-                Self::SIZE,
+    /// CRC over `[0..SIZE - 4)`, excluding the trailing `checksum` field by range.
+    pub fn compute_checksum(&self) -> u32 {
+        const PAYLOAD: usize = CheckpointFileHeader::SIZE - std::mem::size_of::<u32>();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                PAYLOAD,
             )
         };
         unsafe {
-            (*self_mut).checksum = saved;
+            crc32c(bytes.as_ptr(), bytes.len())
         }
-        computed == saved
     }
 
-    pub unsafe fn as_bytes(&self) -> &[u8] {
+    pub fn fill_checksum(&mut self) {
+        self.checksum = self.compute_checksum();
+    }
+
+    pub fn verify_checksum(&self) -> bool {
+        self.checksum == self.compute_checksum()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
                 self as *const CheckpointFileHeader as *const u8,
                 Self::SIZE,
             )
-        }
-    }
-
-    pub unsafe fn from_bytes(bytes: &[u8]) -> &CheckpointFileHeader {
-        assert!(bytes.len() >= Self::SIZE);
-        unsafe {
-            &*(bytes.as_ptr() as *const CheckpointFileHeader)
         }
     }
 
@@ -95,6 +96,10 @@ impl CheckpointFileHeader {
         }
     }
 }
+
+const _: () = assert!(
+    std::mem::offset_of!(CheckpointFileHeader, checksum) == CheckpointFileHeader::SIZE - std::mem::size_of::<u32>()
+);
 
 #[cfg(test)]
 mod tests {
@@ -121,14 +126,14 @@ mod tests {
     fn new_computes_checksum() {
         let header = CheckpointFileHeader::new(0);
         assert_ne!(header.checksum, 0);
-        assert!(unsafe { header.verify_checksum() });
+        assert!(header.verify_checksum());
     }
 
     #[test]
     fn verify_checksum_detects_corruption() {
         let mut header = CheckpointFileHeader::new(0);
         header.linked_ls_file_seq = 999;
-        assert!(!unsafe { header.verify_checksum() });
+        assert!(!header.verify_checksum());
     }
 
     #[test]
@@ -148,18 +153,50 @@ mod tests {
     #[test]
     fn as_bytes_roundtrip() {
         let header = CheckpointFileHeader::new(42);
-        let bytes = unsafe { header.as_bytes() };
+        let bytes = header.as_bytes();
         assert_eq!(bytes.len(), CheckpointFileHeader::SIZE);
 
-        let restored = unsafe { CheckpointFileHeader::from_bytes(bytes) };
+        let mut restored = CheckpointFileHeader::zeroed();
+        restored.as_bytes_mut().copy_from_slice(&bytes[..CheckpointFileHeader::SIZE]);
         assert_eq!(restored.magic, CHECKPOINT_FILE_MAGIC);
         assert_eq!(restored.linked_ls_file_seq, 42);
-        assert!(unsafe { restored.verify_checksum() });
+        assert!(restored.verify_checksum());
     }
 
     #[test]
     fn format_version_is_one() {
         let header = CheckpointFileHeader::new(0);
         assert_eq!(header.format_version, 1);
+    }
+
+    #[test]
+    fn canonical_crc_survives_serialize_then_read_back_into_aligned_self() {
+        let header = CheckpointFileHeader::new(7);
+
+        let bytes: Vec<u8> = header.as_bytes().to_vec();
+        assert_eq!(bytes.len(), CheckpointFileHeader::SIZE);
+
+        assert!(bytes.len() >= CheckpointFileHeader::SIZE);
+        let mut restored = CheckpointFileHeader::zeroed();
+        restored.as_bytes_mut().copy_from_slice(&bytes[..CheckpointFileHeader::SIZE]);
+
+        assert_eq!(restored.magic, CHECKPOINT_FILE_MAGIC);
+        assert_eq!(restored.linked_ls_file_seq, 7);
+        assert_eq!(restored.checksum, header.checksum);
+        assert!(restored.verify_checksum());
+    }
+
+    #[test]
+    fn canonical_crc_rejects_single_byte_corruption_after_read_back() {
+        let header = CheckpointFileHeader::new(7);
+        let mut bytes: Vec<u8> = header.as_bytes().to_vec();
+
+        bytes[24] ^= 0xFF;
+
+        assert!(bytes.len() >= CheckpointFileHeader::SIZE);
+        let mut restored = CheckpointFileHeader::zeroed();
+        restored.as_bytes_mut().copy_from_slice(&bytes[..CheckpointFileHeader::SIZE]);
+
+        assert!(!restored.verify_checksum());
     }
 }

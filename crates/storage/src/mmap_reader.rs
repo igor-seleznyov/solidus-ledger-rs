@@ -176,7 +176,7 @@ mod tests {
         }
 
         let reader = MmapReader::open(&path).unwrap();
-        reader.slice(3, 10); // 3 + 10 = 13 > 5
+        reader.slice(3, 10);
     }
 
     #[test]
@@ -195,7 +195,7 @@ mod tests {
         }
 
         let result = MmapReader::open(&path);
-        assert!(result.is_err()); // Cannot mmap empty file
+        assert!(result.is_err());
 
         cleanup(&dir);
     }

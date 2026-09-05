@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use common::raw_u128_to_u64::raw_u128_to_u64;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
 use pipeline::coordinator_slot::{
@@ -16,26 +15,26 @@ use storage::ls_writer_slot::{LsWriterSlot, LS_MSG_POSTING};
 use crate::account_slot::AccountSlot;
 use crate::partition_version_table::PartitionVersionTable;
 
-pub struct PartitionActor {
+pub struct PartitionActor<'scope> {
     id: usize,
-    partition_rb: Arc<MpscRingBuffer<PartitionSlot>>,
+    partition_rb: &'scope MpscRingBuffer<PartitionSlot>,
     partition_accounts_hash_table: PartitionAccountsHashTable,
     partition_version_table: PartitionVersionTable,
-    coordinator_rbs: Vec<Arc<MpscRingBuffer<CoordinatorSlot>>>,
+    coordinator_rbs: &'scope [MpscRingBuffer<CoordinatorSlot>],
     partition_version_table_tail: *mut u64,
-    ls_writer_rbs: Vec<Arc<MpscRingBuffer<LsWriterSlot>>>,
+    ls_writer_rbs: &'scope [MpscRingBuffer<LsWriterSlot>],
     batch_size: usize,
 }
 
-impl PartitionActor {
+impl<'scope> PartitionActor<'scope> {
     pub fn new(
         id: usize,
-        partition_rb: Arc<MpscRingBuffer<PartitionSlot>>,
+        partition_rb: &'scope MpscRingBuffer<PartitionSlot>,
         partition_accounts_hash_table: PartitionAccountsHashTable,
         partition_version_table: PartitionVersionTable,
-        coordinator_rbs: Vec<Arc<MpscRingBuffer<CoordinatorSlot>>>,
+        coordinator_rbs: &'scope [MpscRingBuffer<CoordinatorSlot>],
         partition_version_table_tail: *mut u64,
-        ls_writer_rbs: Vec<Arc<MpscRingBuffer<LsWriterSlot>>>,
+        ls_writer_rbs: &'scope [MpscRingBuffer<LsWriterSlot>],
         batch_size: usize,
     ) -> Self {
         Self {
@@ -237,10 +236,10 @@ impl PartitionActor {
         ls_slot.posting.ordinal = unsafe { (*account).ordinal };
         ls_slot.posting.prev_posting_record_offset = unsafe { (*account).ls_offset };
 
-        ls_slot.posting.timestamp_ns = 0;// TODO: from THT
-        ls_slot.posting.transfer_sequence_id = [0u8; 16];// TODO: from THT
-        ls_slot.posting.currency = [0u8; 16];// TODO: from THT
-        ls_slot.posting.transfer_posting_records_count = 0;// TODO: from THT entries_count
+        ls_slot.posting.timestamp_ns = 0;
+        ls_slot.posting.transfer_sequence_id = [0u8; 16];
+        ls_slot.posting.currency = [0u8; 16];
+        ls_slot.posting.transfer_posting_records_count = 0;
 
         unsafe {
             ls_slot.posting.compute_checksum();
@@ -251,7 +250,6 @@ impl PartitionActor {
     }
 }
 
-// -----------------------------------------------------------
 
 #[cfg(test)]
 #[cfg(not(miri))]
@@ -272,34 +270,56 @@ mod tests {
         u64_pair_to_bytes(0, val)
     }
 
-    fn make_actor_with_coordinator() -> (
-        PartitionActor,
-        Arc<MpscRingBuffer<PartitionSlot>>,
-        Vec<Arc<MpscRingBuffer<CoordinatorSlot>>>,
-    ) {
-        let rb = Arc::new(MpscRingBuffer::<PartitionSlot>::new(64).unwrap());
-        let coordinator_rb = Arc::new(MpscRingBuffer::<CoordinatorSlot>::new(64).unwrap());
-        let coordinator_rbs = vec![coordinator_rb.clone()];
-        let paht = PartitionAccountsHashTable::new(
-            64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1,
-        ).unwrap();
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let ls_writer_rbs = vec![ls_writer_rb.clone()];
-        let pvt = PartitionVersionTable::new(64, PARTITION_VERSION_TABLE_K0, PARTITION_VERSION_TABLE_K1).unwrap();
-        unsafe { TEST_PVT_TAIL = 0; }
-        let pvt_tail = unsafe { &raw mut TEST_PVT_TAIL };
+    /// Owns the rings an actor borrows, for as long as the test body runs.
+    ///
+    /// The actor holds its rings as shared references now, so something has
+    /// to own them and outlive it. In production that owner is `main`'s
+    /// thread scope; here it is a local whose lifetime is the test body.
+    /// A helper that built the rings and returned the actor cannot work at
+    /// all — the rings would die at the helper's closing brace while the
+    /// actor still pointed at them, which is exactly what the borrow
+    /// checker refuses.
+    struct ActorRingBuffersHolder {
+        partition_rb: MpscRingBuffer<PartitionSlot>,
+        coordinator_rbs: Vec<MpscRingBuffer<CoordinatorSlot>>,
+        ls_writer_rbs: Vec<MpscRingBuffer<LsWriterSlot>>,
+    }
 
-        let actor = PartitionActor::new(
-            0,
-            Arc::clone(&rb),
-            paht,
-            pvt,
-            coordinator_rbs.clone(),
-            pvt_tail,
-            ls_writer_rbs,
-            64
-        );
-        (actor, rb, coordinator_rbs)
+    impl ActorRingBuffersHolder {
+        fn new() -> Self {
+            Self {
+                partition_rb: MpscRingBuffer::<PartitionSlot>::new(64).unwrap(),
+                coordinator_rbs: vec![MpscRingBuffer::<CoordinatorSlot>::new(64).unwrap()],
+                ls_writer_rbs: vec![MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()],
+            }
+        }
+
+        fn actor(&self) -> PartitionActor<'_> {
+            let partition_accounts_hash_table = PartitionAccountsHashTable::new(
+                64,
+                PARTITION_ACCOUNTS_HASH_TABLE_K0,
+                PARTITION_ACCOUNTS_HASH_TABLE_K1,
+            ).unwrap();
+            let partition_version_table = PartitionVersionTable::new(
+                64,
+                PARTITION_VERSION_TABLE_K0,
+                PARTITION_VERSION_TABLE_K1,
+            ).unwrap();
+
+            unsafe { TEST_PVT_TAIL = 0; }
+            let partition_version_table_tail = &raw mut TEST_PVT_TAIL;
+
+            PartitionActor::new(
+                0,
+                &self.partition_rb,
+                partition_accounts_hash_table,
+                partition_version_table,
+                &self.coordinator_rbs,
+                partition_version_table_tail,
+                &self.ls_writer_rbs,
+                64,
+            )
+        }
     }
 
     fn make_partition_slot(
@@ -332,19 +352,10 @@ mod tests {
         slot
     }
 
-    fn make_actor(capacity: usize) -> (PartitionActor, Arc<MpscRingBuffer<PartitionSlot>>) {
-        let rb = Arc::new(MpscRingBuffer::<PartitionSlot>::new(64).unwrap());
-        let partition_accounts_hash_table = PartitionAccountsHashTable::new(capacity, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1).unwrap();
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
-
-        (actor, rb)
-    }
-
     #[test]
     fn credit_prepare_increases_staged_income() {
-        let rb = Arc::new(MpscRingBuffer::<PartitionSlot>::new(64).unwrap());
-        let partition_accounts_hash_table = PartitionAccountsHashTable::new(64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1).unwrap();
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         let slot = make_partition_slot(account_id(1), 500, ENTRY_TYPE_CREDIT, 1);
         actor.handle_prepare(&slot);
@@ -360,9 +371,8 @@ mod tests {
 
     #[test]
     fn debit_prepare_rejected_on_zero_balance() {
-        let rb = Arc::new(MpscRingBuffer::<PartitionSlot>::new(64).unwrap());
-        let partition_accounts_hash_table = PartitionAccountsHashTable::new(64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1).unwrap();
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         let slot = make_partition_slot(account_id(1), 100, ENTRY_TYPE_DEBIT, 1);
         actor.handle_prepare(&slot);
@@ -376,9 +386,8 @@ mod tests {
 
     #[test]
     fn debit_prepare_accepted_with_sufficient_balance() {
-        let rb = Arc::new(MpscRingBuffer::<PartitionSlot>::new(64).unwrap());
-        let partition_accounts_hash_table = PartitionAccountsHashTable::new(64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1).unwrap();
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         unsafe {
             let account = actor.partition_accounts_hash_table.get_or_create(0, 1);
@@ -398,9 +407,8 @@ mod tests {
 
     #[test]
     fn multiple_prepares_accumulate_staged() {
-        let rb = Arc::new(MpscRingBuffer::<PartitionSlot>::new(64).unwrap());
-        let partition_accounts_hash_table = PartitionAccountsHashTable::new(64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1).unwrap();
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         unsafe {
             let account = actor.partition_accounts_hash_table.get_or_create(0, 1);
@@ -413,25 +421,22 @@ mod tests {
 
         unsafe {
             let account = actor.partition_accounts_hash_table.lookup(0, 1).unwrap();
-            assert_eq!((*account).staged_outcome, 1000); // 300 + 400 + 300
+            assert_eq!((*account).staged_outcome, 1000);
             assert_eq!((*account).last_gsn, 3);
         }
     }
 
     #[test]
     fn debit_reject_does_not_modify_staged() {
-        let rb = Arc::new(MpscRingBuffer::<PartitionSlot>::new(64).unwrap());
-        let partition_accounts_hash_table = PartitionAccountsHashTable::new(64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1).unwrap();
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         unsafe {
             let account = actor.partition_accounts_hash_table.get_or_create(0, 1);
             (*account).balance = 100;
         }
 
-        // DEBIT 50 → accept
         actor.handle_prepare(&make_partition_slot(account_id(1), 50, ENTRY_TYPE_DEBIT, 1));
-        // DEBIT 60 → reject (effective = 100 - 50 = 50, 50 < 60)
         actor.handle_prepare(&make_partition_slot(account_id(1), 60, ENTRY_TYPE_DEBIT, 2));
 
         unsafe {
@@ -443,14 +448,11 @@ mod tests {
 
     #[test]
     fn staged_income_increases_effective_balance() {
-        let rb = Arc::new(MpscRingBuffer::<PartitionSlot>::new(64).unwrap());
-        let partition_accounts_hash_table = PartitionAccountsHashTable::new(64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1).unwrap();
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
-        // CREDIT 500 → staged_income = 500
         actor.handle_prepare(&make_partition_slot(account_id(1), 500, ENTRY_TYPE_CREDIT, 1));
 
-        // DEBIT 300 → effective = 0 + 500 - 0 = 500 >= 300 → accept
         actor.handle_prepare(&make_partition_slot(account_id(1), 300, ENTRY_TYPE_DEBIT, 2));
 
         unsafe {
@@ -463,9 +465,8 @@ mod tests {
 
     #[test]
     fn different_accounts_have_isolated_staged() {
-        let rb = Arc::new(MpscRingBuffer::<PartitionSlot>::new(64).unwrap());
-        let partition_accounts_hash_table = PartitionAccountsHashTable::new(64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1).unwrap();
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         actor.handle_prepare(&make_partition_slot(account_id(1), 100, ENTRY_TYPE_CREDIT, 1));
         actor.handle_prepare(&make_partition_slot(account_id(2), 200, ENTRY_TYPE_CREDIT, 2));
@@ -480,9 +481,8 @@ mod tests {
 
     #[test]
     fn dispatch_routes_prepare() {
-        let rb = Arc::new(MpscRingBuffer::<PartitionSlot>::new(64).unwrap());
-        let partition_accounts_hash_table = PartitionAccountsHashTable::new(64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1).unwrap();
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         let slot = make_partition_slot(account_id(1), 500, ENTRY_TYPE_CREDIT, 1);
         actor.dispatch(&slot);
@@ -495,9 +495,8 @@ mod tests {
 
     #[test]
     fn dispatch_commit_does_not_panic() {
-        let rb = Arc::new(MpscRingBuffer::<PartitionSlot>::new(64).unwrap());
-        let partition_accounts_hash_table = PartitionAccountsHashTable::new(64, PARTITION_ACCOUNTS_HASH_TABLE_K0, PARTITION_ACCOUNTS_HASH_TABLE_K1).unwrap();
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         let mut slot = PartitionSlot::zeroed();
         slot.msg_type = MSG_TYPE_COMMIT;
@@ -510,7 +509,8 @@ mod tests {
 
     #[test]
     fn prepare_success_sends_coordinator_message() {
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         unsafe {
             let account = actor.partition_accounts_hash_table.get_or_create(0, 1);
@@ -520,7 +520,7 @@ mod tests {
         let slot = make_partition_slot(account_id(1), 500, ENTRY_TYPE_DEBIT, 1);
         actor.handle_prepare(&slot);
 
-        let batch = coordinator_rbs[0].drain_batch(64);
+        let batch = rings.coordinator_rbs[0].drain_batch(64);
         assert_eq!(batch.len(), 1);
         assert_eq!(batch.slot(0).msg_type, COORD_PREPARE_SUCCESS);
         assert_eq!(batch.slot(0).gsn, 1);
@@ -529,12 +529,13 @@ mod tests {
 
     #[test]
     fn prepare_fail_sends_coordinator_message() {
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         let slot = make_partition_slot(account_id(1), 500, ENTRY_TYPE_DEBIT, 1);
         actor.handle_prepare(&slot);
 
-        let batch = coordinator_rbs[0].drain_batch(64);
+        let batch = rings.coordinator_rbs[0].drain_batch(64);
         assert_eq!(batch.len(), 1);
         assert_eq!(batch.slot(0).msg_type, COORD_PREPARE_FAIL);
         assert_eq!(batch.slot(0).reason, REJECT_INSUFFICIENT_FUNDS);
@@ -544,7 +545,8 @@ mod tests {
 
     #[test]
     fn commit_debit_applies_balance() {
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         unsafe {
             let account = actor.partition_accounts_hash_table.get_or_create(0, 1);
@@ -557,13 +559,13 @@ mod tests {
 
         unsafe {
             let account = actor.partition_accounts_hash_table.lookup(0, 1).unwrap();
-            assert_eq!((*account).balance, 700);        // 1000 - 300
-            assert_eq!((*account).staged_outcome, 0);   // 300 - 300
+            assert_eq!((*account).balance, 700);
+            assert_eq!((*account).staged_outcome, 0);
             assert_eq!((*account).ordinal, 1);
             assert_eq!((*account).last_gsn, 1);
         }
 
-        let batch = coordinator_rbs[0].drain_batch(64);
+        let batch = rings.coordinator_rbs[0].drain_batch(64);
         assert_eq!(batch.len(), 1);
         assert_eq!(batch.slot(0).msg_type, COORD_COMMIT_SUCCESS);
         batch.release();
@@ -571,7 +573,8 @@ mod tests {
 
     #[test]
     fn commit_credit_applies_balance() {
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         unsafe {
             let account = actor.partition_accounts_hash_table.get_or_create(0, 1);
@@ -584,12 +587,12 @@ mod tests {
 
         unsafe {
             let account = actor.partition_accounts_hash_table.lookup(0, 1).unwrap();
-            assert_eq!((*account).balance, 700);        // 500 + 200
-            assert_eq!((*account).staged_income, 0);    // 200 - 200
+            assert_eq!((*account).balance, 700);
+            assert_eq!((*account).staged_income, 0);
             assert_eq!((*account).ordinal, 1);
         }
 
-        let batch = coordinator_rbs[0].drain_batch(64);
+        let batch = rings.coordinator_rbs[0].drain_batch(64);
         assert_eq!(batch.len(), 1);
         assert_eq!(batch.slot(0).msg_type, COORD_COMMIT_SUCCESS);
         batch.release();
@@ -597,7 +600,8 @@ mod tests {
 
     #[test]
     fn rollback_debit_undoes_staged() {
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         unsafe {
             let account = actor.partition_accounts_hash_table.get_or_create(0, 1);
@@ -611,11 +615,11 @@ mod tests {
         unsafe {
             let account = actor.partition_accounts_hash_table.lookup(0, 1).unwrap();
             assert_eq!((*account).balance, 1000);
-            assert_eq!((*account).staged_outcome, 0);   // 300 - 300
+            assert_eq!((*account).staged_outcome, 0);
             assert_eq!((*account).ordinal, 0);
         }
 
-        let batch = coordinator_rbs[0].drain_batch(64);
+        let batch = rings.coordinator_rbs[0].drain_batch(64);
         assert_eq!(batch.len(), 1);
         assert_eq!(batch.slot(0).msg_type, COORD_ROLLBACK_SUCCESS);
         batch.release();
@@ -623,7 +627,8 @@ mod tests {
 
     #[test]
     fn rollback_credit_undoes_staged() {
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         unsafe {
             let account = actor.partition_accounts_hash_table.get_or_create(0, 1);
@@ -640,7 +645,7 @@ mod tests {
             assert_eq!((*account).ordinal, 0);
         }
 
-        let batch = coordinator_rbs[0].drain_batch(64);
+        let batch = rings.coordinator_rbs[0].drain_batch(64);
         assert_eq!(batch.len(), 1);
         assert_eq!(batch.slot(0).msg_type, COORD_ROLLBACK_SUCCESS);
         batch.release();
@@ -648,14 +653,14 @@ mod tests {
 
     #[test]
     fn full_cycle_prepare_commit() {
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         unsafe {
             let account = actor.partition_accounts_hash_table.get_or_create(0, 1);
             (*account).balance = 1000;
         }
 
-        // PREPARE DEBIT 300
         actor.handle_prepare(&make_partition_slot(account_id(1), 300, ENTRY_TYPE_DEBIT, 1));
 
         unsafe {
@@ -664,12 +669,10 @@ mod tests {
             assert_eq!((*account).balance, 1000);
         }
 
-        // drain PREPARE_OK
-        let batch = coordinator_rbs[0].drain_batch(64);
+        let batch = rings.coordinator_rbs[0].drain_batch(64);
         assert_eq!(batch.slot(0).msg_type, COORD_PREPARE_SUCCESS);
         batch.release();
 
-        // COMMIT DEBIT 300
         actor.handle_commit(&make_commit_slot(account_id(1), 300, ENTRY_TYPE_DEBIT, 1));
 
         unsafe {
@@ -679,28 +682,25 @@ mod tests {
             assert_eq!((*account).ordinal, 1);
         }
 
-        // drain COMMIT_OK
-        let batch = coordinator_rbs[0].drain_batch(64);
+        let batch = rings.coordinator_rbs[0].drain_batch(64);
         assert_eq!(batch.slot(0).msg_type, COORD_COMMIT_SUCCESS);
         batch.release();
     }
 
     #[test]
     fn full_cycle_prepare_rollback() {
-        let (mut actor, _, coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         unsafe {
             let account = actor.partition_accounts_hash_table.get_or_create(0, 1);
             (*account).balance = 1000;
         }
 
-        // PREPARE DEBIT 300
         actor.handle_prepare(&make_partition_slot(account_id(1), 300, ENTRY_TYPE_DEBIT, 1));
 
-        // drain PREPARE_OK
-        coordinator_rbs[0].drain_batch(64).release();
+        rings.coordinator_rbs[0].drain_batch(64).release();
 
-        // ROLLBACK
         actor.handle_rollback(&make_rollback_slot(account_id(1), 300, ENTRY_TYPE_DEBIT, 1));
 
         unsafe {
@@ -713,7 +713,8 @@ mod tests {
 
     #[test]
     fn commit_records_version_in_pvt() {
-        let (mut actor, _, _coordinator_rbs) = make_actor_with_coordinator();
+        let rings = ActorRingBuffersHolder::new();
+        let mut actor = rings.actor();
 
         unsafe {
             let account = actor.partition_accounts_hash_table.get_or_create(0, 1);

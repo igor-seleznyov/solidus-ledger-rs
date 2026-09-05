@@ -114,7 +114,7 @@ the LS); `ordinal` itself is taken from PAHT and incremented on COMMIT.
 - 8-10-1: Index Builder thread infrastructure — mpsc channel, IndexBuilderTask, LS Writer sends task at rotation ✅
 - 8-10-2: LS scan refactoring (PostingScanVisitor trait, scan_ls_postings), two-pass Index Builder (CountingVisitor + PlacingVisitor + compute_offsets), durable structures (AccountIndexRecord 40B, OrdinalIndexEntry 16B, TimestampIndexEntry 16B, IndexFileHeader 64B) ✅
 - 8-10-3: Index file writing — index_writer.rs, per-account sort + batch write .posting-accounts / .ordinal / .timestamp, IndexFileHeader with three magics (LDSTIDXA/LDSTIDXO/LDSTIDXT) ✅
-- 8-10-3-rf: In-memory accumulation — LS Writer накапливает index entries в Arena (mmap+mlock) на hot path (~3ns per posting, zero page fault). При ротации copy Arena→Vec, move через channel в Index Builder. Без scan LS файла при построении индексов ✅
+- 8-10-3-rf: In-memory accumulation — the LS Writer accumulates index entries in the Arena (mmap + mlock) on the hot path, about 3 ns per posting and no page faults. At rotation the Arena is copied into a Vec and moved to the Index Builder over a channel, so building the indexes never has to scan the LS file ✅
 - 8-10-3-miri: Miri tests for IndexBufferEntry (Arena-style ptr write/read/copy/reset, 6 tests) and PostingScanVisitor (copy_nonoverlapping unaligned→aligned, 3 tests) ✅
 - 8-10-4a: MmapReader — read-only file mmap (PROT_READ, MAP_PRIVATE, no mlock, OS page cache, MADV_SEQUENTIAL) ✅
 - 8-10-4b: Page-aligned binary search in .posting-accounts — two-level (page-level first/last check → record-level binary search), MmapReader, compare_account_id ✅
@@ -125,6 +125,70 @@ the LS); `ordinal` itself is taken from PAHT and incremented on COMMIT.
 ## In Progress
 
 ### Step 8: LS Writer + Persistence (continued) ← current
+
+**Landed since the last publication.** Everything in this block is in the tree,
+builds, and is covered by the suite; the entries further down that it overlaps
+are kept for the reasoning they carry, not as a statement of what is left.
+
+- **Canonical CRC and derived layout, finished.** Every `repr(C)` type that
+  carries a checksum now computes it over `&self` with no mutation, no stack
+  copy and no `*mut` cast, and `checksum` sits last in all of them. The field
+  positions are no longer written down beside the struct — they are read out of
+  the type with `offset_of!` and pinned by compile-time assertions, so a field
+  that moves either moves its own offset with it or fails the build. Applied to
+  the wire transfer, both ring-buffer headers and eleven on-disk structures.
+  This closed a whole defect class: an eight-byte ingress corruption traced to a
+  single hand-written offset that had drifted from the struct it described.
+
+- **Cross-thread publication moved from volatile to atomics.** The barrier
+  architecture is unchanged — a release fence before the batch and an acquire
+  fence after it, with relaxed accesses in between — but the accesses are now
+  atomic operations rather than `read_volatile` / `write_volatile`. Volatile
+  across threads sits outside the memory model and neither Miri nor Loom can
+  reason about it; after the migration both tools check the shipped lines
+  themselves. On x86-64 the instructions are identical.
+
+- **The ring owns its slot type.** A claimed slot used to hand out `&mut T` over
+  the whole slot including the sequence cell at offset zero, which races with a
+  concurrent poll of that cell. The ring now wraps the payload
+  (`RbSlot<P> { sequence, payload }`) and hands out `&mut P` by field
+  projection, so no expressible reference covers the sequence bytes. The five
+  payload types lost their `sequence` field.
+
+- **Structured concurrency.** Rings are owned as locals of a `thread::scope` in
+  `main` and borrowed by the components for the scope's lifetime, replacing
+  `Arc`. A ring can no longer outlive or be dropped from under its readers, and
+  the check costs nothing at run time.
+
+- **Ingress admission bounds.** A batch header is a client-supplied count, and
+  two values of it used to end the process: zero reached a claim of zero slots,
+  and any count above the ring's capacity tripped an assertion — one well-formed
+  message from a handshaked client stopped the ledger. Both are refused now,
+  before any per-transfer work, against a configured
+  `batch-accept.max-transfers-per-batch` whose relation to the ring capacity and
+  to the worker count is checked at startup. A separate byte budget on the
+  message header refuses an oversized frame before a single payload byte is
+  buffered.
+
+- **Back-pressure reaches the client.** A full ingress ring is answered with a
+  retryable refusal on the synchronous response instead of an unbounded wait;
+  the connection stays open and the client may resend unchanged. The batch
+  status became a closed `enum` with explicit wire values rather than a scatter
+  of loose constants, so a status the server cannot name is a build failure
+  instead of two outcomes that look alike on the wire.
+
+- **Nothing allocates per batch on the ingress path any more.** The per-frame
+  copy of the whole payload is gone — the frame is read in place — and the
+  batch response is now built directly in the connection's reusable buffer:
+  the head is reserved, rejects are appended as they are found, and the count is
+  filled in at the end from the buffer's own length, so it cannot disagree with
+  the records behind it.
+
+- **Portable CRC32C.** Hardware SSE4.2 and a table-based software path behind a
+  one-branch dispatcher chosen once at startup. Miri's target has no SSE4.2, so
+  before this every checksummed type was unverifiable; the software path is also
+  the foundation for non-x86 support.
+
 - 8-10-5: Integration tests (rotation → index build → lookup)
 - 8-10-6: Signature verification + file integrity protection (split into substeps)
   - 8-10-6a: Verify-at-first-open + SignatureVerificationCache ✅
@@ -245,6 +309,27 @@ the LS); `ordinal` itself is taken from PAHT and incremented on COMMIT.
   file is on disk, then `ls_sign` and `ls_meta` are definitely on disk already.
 
 ## Planned
+
+### Step 8-packed: Packed ingress ring
+Designed, measured and drafted; not in this tree yet.
+
+The ingress ring currently gives each transfer its own padded slot with the
+publication cell inside it, and the Worker copies accepted transfers into those
+slots one at a time. Measured on a throughput bench with producer and consumer
+on separate cores — twenty million messages, three runs — that shape carries
+37.9–38.8 million messages a second.
+
+Two changes were measured separately. Removing the 48 bytes of slot padding, and
+nothing else, gives 58.5–63.0: about two thirds of the available win, and it
+costs nothing at the protocol level. Moving the publication cells into their own
+array so the payloads lie contiguously, storing the per-batch fields once per
+batch, and copying the whole validated batch in a single instruction — rejected
+transfers included, each flagged in the high bit of its own cell so the pipeline
+skips it — gives 84.8.
+
+The accepted cost is that a rejected transfer still occupies a turn, so a stream
+carrying many rejects spends ring capacity that would otherwise serve
+well-behaved clients.
 
 ### Step 9: Rule Engine
 - Configurable chart-of-accounts rules: transfer → N postings

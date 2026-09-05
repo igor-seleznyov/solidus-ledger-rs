@@ -160,7 +160,7 @@ mod tests {
                 record.account_id_hi = 0;
                 record.account_id_lo = i + 1;
                 record.timestamp_ns = 1700000000_000_000_000 + i;
-                unsafe { record.compute_checksum(); }
+                record.fill_checksum();
 
                 let offset = i as usize * PostingRecord::SIZE;
                 unsafe {

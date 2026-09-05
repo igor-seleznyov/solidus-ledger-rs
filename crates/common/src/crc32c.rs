@@ -59,11 +59,6 @@ pub fn init() {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("sse4.2") {
-            // SAFETY: by contract, `init()` runs on the main thread before
-            // any `thread::spawn`. No concurrent writer exists; no reader
-            // exists yet on any other thread. The spawn happens-before
-            // barrier will propagate this write to all subsequently spawned
-            // threads.
             unsafe { USE_HARDWARE_CRC32C = true };
         }
     }
@@ -93,20 +88,10 @@ pub fn init() {
 pub unsafe fn crc32c(data: *const u8, len: usize) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: `USE_HARDWARE_CRC32C` is written only by `init()` from the
-        // main thread before `thread::spawn`. All callers on worker threads
-        // observe the final value via the spawn happens-before barrier. No
-        // concurrent mutation; a `Copy` `bool` read is a plain load, no
-        // reference is formed (the `static_mut_refs` lint does not apply).
         if unsafe { USE_HARDWARE_CRC32C } {
-            // SAFETY: the flag is `true` only after `init()` confirmed
-            // SSE4.2 via `is_x86_feature_detected!`. Caller guarantees
-            // `data..data+len` valid.
             return unsafe { crc32c_hw(data, len) };
         }
     }
-    // SAFETY: caller guarantees `data..data+len` valid; `crc32c_sw` has no
-    // platform requirements.
     unsafe { crc32c_sw(data, len) }
 }
 
@@ -124,7 +109,6 @@ unsafe fn crc32c_sw(data: *const u8, len: usize) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     let mut byte_index = 0usize;
     while byte_index < len {
-        // SAFETY: `byte_index < len`; caller guarantees `data..data+len` valid.
         let byte = unsafe { *data.add(byte_index) };
         let table_index = ((crc ^ (byte as u32)) & 0xFF) as usize;
         crc = (crc >> 8) ^ CRC32C_TABLE[table_index];
@@ -148,24 +132,18 @@ unsafe fn crc32c_sw(data: *const u8, len: usize) -> u32 {
 unsafe fn crc32c_hw(data: *const u8, len: usize) -> u32 {
     let mut crc: u64 = 0xFFFF_FFFF;
     let mut cursor = data;
-    // SAFETY: `data` is valid per contract; `data.add(len & !7) <= data.add(len)`.
     let end_of_aligned_chunks = unsafe { data.add(len & !7) };
     let end_of_buffer = unsafe { data.add(len) };
 
     while cursor < end_of_aligned_chunks {
-        // SAFETY: `cursor < end_of_aligned_chunks <= data.add(len)`; the 8-byte
-        // read is within the valid range. `read_unaligned` handles non-8-aligned data.
         crc = unsafe {
             _mm_crc32_u64(crc, std::ptr::read_unaligned(cursor as *const u64))
         };
-        // SAFETY: `cursor < end_of_aligned_chunks`; advance by 8 stays in range.
         cursor = unsafe { cursor.add(8) };
     }
 
     while cursor < end_of_buffer {
-        // SAFETY: `cursor < end_of_buffer = data.add(len)`; single byte is in range.
         crc = unsafe { _mm_crc32_u8(crc as u32, *cursor) as u64 };
-        // SAFETY: `cursor < end_of_buffer`; advance by 1 stays in range.
         cursor = unsafe { cursor.add(1) };
     }
 
@@ -259,8 +237,6 @@ mod tests {
         for input in [b"" as &[u8], b"A", b"12345678", &[0u8; 64], &[0xABu8; 128], b"hello, world!"] {
             unsafe {
                 let crc_sw = crc32c_sw(input.as_ptr(), input.len());
-                // SAFETY: `is_x86_feature_detected!("sse4.2")` returned true;
-                // `input` is a valid readable slice.
                 let crc_hw = crc32c_hw(input.as_ptr(), input.len());
                 assert_eq!(
                     crc_sw,

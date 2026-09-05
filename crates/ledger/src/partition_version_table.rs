@@ -433,13 +433,10 @@ mod tests {
             pvt.record_version(0, 1, 200, 4500);
             pvt.record_version(0, 1, 300, 4000);
 
-            // committed_gsn=200 → balance at gsn=200
             assert_eq!(pvt.read_balance(0, 1, 200), Some(4500));
 
-            // committed_gsn=100 → balance at gsn=100
             assert_eq!(pvt.read_balance(0, 1, 100), Some(5000));
 
-            // committed_gsn=300 → balance at gsn=300
             assert_eq!(pvt.read_balance(0, 1, 300), Some(4000));
 
             assert_eq!(pvt.read_balance(0, 1, 150), Some(5000));
@@ -474,8 +471,8 @@ mod tests {
             let slot = pvt.lookup(0, 1).unwrap();
             assert_eq!((*slot).count, 8);
 
-            assert_eq!(pvt.read_balance(0, 1, 800), Some(600)); // 1000 - 8*50
-            assert_eq!(pvt.read_balance(0, 1, 100), Some(950)); // 1000 - 1*50
+            assert_eq!(pvt.read_balance(0, 1, 800), Some(600));
+            assert_eq!(pvt.read_balance(0, 1, 100), Some(950));
         }
     }
 
@@ -531,8 +528,8 @@ mod tests {
 
             assert_eq!(pvt.read_balance(0, 1, 2000), Some(20000));
             assert_eq!(pvt.read_balance(0, 1, 100), Some(1000));
-            assert_eq!(pvt.read_balance(0, 1, 900), Some(9000));  // overflow block 1
-            assert_eq!(pvt.read_balance(0, 1, 1700), Some(17000)); // overflow block 2
+            assert_eq!(pvt.read_balance(0, 1, 900), Some(9000));
+            assert_eq!(pvt.read_balance(0, 1, 1700), Some(17000));
         }
     }
 
@@ -549,13 +546,12 @@ mod tests {
             pvt.compact(0, 1, 300);
 
             let slot = pvt.lookup(0, 1).unwrap();
-            assert_eq!((*slot).count, 2); // 300 (latest committed) + 400 (pending)
+            assert_eq!((*slot).count, 2);
 
             assert_eq!(pvt.read_balance(0, 1, 300), Some(800));
             assert_eq!(pvt.read_balance(0, 1, 400), Some(700));
-            assert_eq!(pvt.read_balance(0, 1, 200), None); // falls back to 300 which is <= 200? No, 300 > 200
-            // Actually gsn=300 > committed_gsn=200, so not matched
-            assert_eq!(pvt.read_balance(0, 1, 100), None); // gsn=300 > 100, gsn=400 > 100
+            assert_eq!(pvt.read_balance(0, 1, 200), None);
+            assert_eq!(pvt.read_balance(0, 1, 100), None);
         }
     }
 
@@ -571,15 +567,14 @@ mod tests {
             }
 
             let used_blocks = initial_free - pvt.overflow_free_stack.len();
-            assert_eq!(used_blocks, 1); // 1 overflow block allocated
+            assert_eq!(used_blocks, 1);
 
             pvt.compact(0, 1, 1100);
 
             let slot = pvt.lookup(0, 1).unwrap();
-            assert_eq!((*slot).count, 2); // gsn=1100 (latest committed) + gsn=1200 (pending)
-            assert_eq!((*slot).overflow, 0); // overflow freed, 2 versions fit in inline
+            assert_eq!((*slot).count, 2);
+            assert_eq!((*slot).overflow, 0);
 
-            // overflow block returned to free stack
             assert_eq!(pvt.overflow_free_stack.len(), initial_free);
         }
     }
@@ -649,6 +644,9 @@ mod tests {
     }
 }
 
+/// A Miri-friendly PVT: a Vec in place of the Arena.
+/// Covers the Robin Hood swap, inline and overflow writes, read_balance
+/// and compact.
 ///
 /// cargo +nightly miri test -p ledger -- miri_pvt
 #[cfg(test)]
@@ -679,7 +677,7 @@ mod miri_tests {
             let mut storage = vec![PartitionVersionTableSlot::zeroed(); capacity];
             let slots = storage.as_mut_ptr();
 
-            let overflow_total = capacity * 8; // 8 VersionRecords per overflow block
+            let overflow_total = capacity * 8;
             let mut overflow_storage = vec![VersionRecord::zeroed(); overflow_total];
             let overflow_base = overflow_storage.as_mut_ptr();
 

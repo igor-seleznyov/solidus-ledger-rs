@@ -1,37 +1,36 @@
-use std::sync::Arc;
-use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
+use crate::transfer_hash_table::TransferHashTable;
 use common::mem_barrier::acquire_load_u8;
+use common::radix_sort::radix_sort_by_id_lo;
 use common::u64_pair_to_bytes::u64_pair_to_bytes;
 use pipeline::coordinator_slot::*;
 use pipeline::partition_slot::*;
 use pipeline::transfer_slot::*;
-use crate::transfer_hash_table::TransferHashTable;
-use common::radix_sort::radix_sort_by_id_lo;
+use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
 use ringbuf::slot::Slot;
-use storage::ls_writer_slot::*;
 use storage::flush_done_slot::FlushDoneSlot;
+use storage::ls_writer_slot::*;
 
-pub struct DecisionMaker {
+pub struct DecisionMaker<'scope> {
     id: usize,
-    coordinator_rb: Arc<MpscRingBuffer<CoordinatorSlot>>,
-    transfer_hash_table: Arc<TransferHashTable>,
-    partition_rbs: Vec<Arc<MpscRingBuffer<PartitionSlot>>>,
-    ls_writer_rb: Arc<MpscRingBuffer<LsWriterSlot>>,
-    flush_done_rb: Arc<MpscRingBuffer<FlushDoneSlot>>,
+    coordinator_rb: &'scope MpscRingBuffer<CoordinatorSlot>,
+    transfer_hash_table: &'scope TransferHashTable,
+    partition_rbs: &'scope [MpscRingBuffer<PartitionSlot>],
+    ls_writer_rb: &'scope MpscRingBuffer<LsWriterSlot>,
+    flush_done_rb: &'scope MpscRingBuffer<FlushDoneSlot>,
     batch_size: usize,
     keys: Vec<u64>,
     indices: Vec<u16>,
     temp: Vec<u16>,
 }
 
-impl DecisionMaker {
+impl<'scope> DecisionMaker<'scope> {
     pub fn new(
         id: usize,
-        coordinator_rb: Arc<MpscRingBuffer<CoordinatorSlot>>,
-        transfer_hash_table: Arc<TransferHashTable>,
-        partition_rbs: Vec<Arc<MpscRingBuffer<PartitionSlot>>>,
-        ls_writer_rb: Arc<MpscRingBuffer<LsWriterSlot>>,
-        flush_done_rb: Arc<MpscRingBuffer<FlushDoneSlot>>,
+        coordinator_rb: &'scope MpscRingBuffer<CoordinatorSlot>,
+        transfer_hash_table: &'scope TransferHashTable,
+        partition_rbs: &'scope [MpscRingBuffer<PartitionSlot>],
+        ls_writer_rb: &'scope MpscRingBuffer<LsWriterSlot>,
+        flush_done_rb: &'scope MpscRingBuffer<FlushDoneSlot>,
         batch_size: usize,
     ) -> Self {
         Self {
@@ -311,8 +310,8 @@ mod tests {
     use super::*;
     use pipeline::transfer_hash_table_entry::TransferHashTableEntry;
 
-    const K0: u64 = 0x0123456789ABCDEF;
-    const K1: u64 = 0xFEDCBA9876543210;
+    const TRANSFER_HASH_TABLE_SEED_K0: u64 = 0x0123456789ABCDEF;
+    const TRANSFER_HASH_TABLE_SEED_K1: u64 = 0xFEDCBA9876543210;
 
     fn account_id(val: u64) -> [u8; 16] {
         u64_pair_to_bytes(0, val)
@@ -335,57 +334,68 @@ mod tests {
         }
     }
 
-    fn setup_dm_with_transfer(
-        num_partitions: usize,
-    ) -> (
-        DecisionMaker,
-        Arc<TransferHashTable>,
-        Arc<MpscRingBuffer<CoordinatorSlot>>,
-        Vec<Arc<MpscRingBuffer<PartitionSlot>>>,
-        Arc<MpscRingBuffer<LsWriterSlot>>,
-        Arc<MpscRingBuffer<FlushDoneSlot>>,
-        u32, // tht_offset
-    ) {
-        let coordinator_rb = Arc::new(
-            MpscRingBuffer::<CoordinatorSlot>::new(64).unwrap(),
-        );
-        let tht = Arc::new(
-            TransferHashTable::new(64, K0, K1, 8).unwrap(),
-        );
-        let partition_rbs: Vec<Arc<MpscRingBuffer<PartitionSlot>>> =
-            (0..num_partitions)
-                .map(|_| Arc::new(MpscRingBuffer::new(64).unwrap()))
-                .collect();
+    /// Owns everything a Decision Maker borrows, for as long as the test
+    /// body runs.
+    ///
+    /// The Decision Maker holds its rings and the transfer table as shared
+    /// references now, so something has to own them and outlive it. In
+    /// production that owner is `main`'s thread scope; here it is a local
+    /// whose lifetime is the test body. A helper that built them and
+    /// returned the Decision Maker cannot work at all — they would die at
+    /// the helper's closing brace while it still pointed at them.
+    struct DecisionMakerRingBuffersHolder {
+        coordinator_rb: MpscRingBuffer<CoordinatorSlot>,
+        transfer_hash_table: TransferHashTable,
+        partition_rbs: Vec<MpscRingBuffer<PartitionSlot>>,
+        ls_writer_rb: MpscRingBuffer<LsWriterSlot>,
+        flush_done_rb: MpscRingBuffer<FlushDoneSlot>,
+        /// Offset of the one transfer staged into the table by `with_transfer`.
+        tht_offset: u32,
+    }
 
-        let ls_writer_rb = Arc::new(
-            MpscRingBuffer::<LsWriterSlot>::new(64).unwrap(),
-        );
-        let flush_done_rb = Arc::new(
-            MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap(),
-        );
+    impl DecisionMakerRingBuffersHolder {
+        /// Builds the rings with one transfer already inserted and published
+        /// into the table, which is the starting state every 2PC test needs.
+        fn with_transfer(num_partitions: usize) -> Self {
+            let transfer_hash_table = TransferHashTable::new(64, TRANSFER_HASH_TABLE_SEED_K0, TRANSFER_HASH_TABLE_SEED_K1, 8).unwrap();
 
-        let tht_offset = unsafe {
-            let off = tht.insert(0, 1, 100, 7, &[0u8; 16], &currency(), 2, 0, &[0u8; 16]);
-            tht.fill_entry(off, 0, &make_entry(10, 500, 0, ENTRY_TYPE_DEBIT));
-            tht.fill_entry(off, 1, &make_entry(20, 500, 1, ENTRY_TYPE_CREDIT));
-            tht.publish(off);
-            off
-        };
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let ls_writer_rbs = vec![ls_writer_rb.clone()];
-        let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+            let tht_offset = unsafe {
+                let transfer_hash_table_offset = transfer_hash_table.insert(
+                    0, 1, 100, 7,
+                    &[0u8; 16],
+                    &currency(),
+                    2, 0,
+                    &[0u8; 16],
+                );
+                transfer_hash_table.fill_entry(transfer_hash_table_offset, 0, &make_entry(10, 500, 0, ENTRY_TYPE_DEBIT));
+                transfer_hash_table.fill_entry(transfer_hash_table_offset, 1, &make_entry(20, 500, 1, ENTRY_TYPE_CREDIT));
+                transfer_hash_table.publish(transfer_hash_table_offset);
+                transfer_hash_table_offset
+            };
 
-        let dm = DecisionMaker::new(
-            0,
-            Arc::clone(&coordinator_rb),
-            Arc::clone(&tht),
-            partition_rbs.iter().map(Arc::clone).collect(),
-            Arc::clone(&ls_writer_rb),
-            Arc::clone(& flush_done_rb),
-            64,
-        );
+            Self {
+                coordinator_rb: MpscRingBuffer::<CoordinatorSlot>::new(64).unwrap(),
+                transfer_hash_table,
+                partition_rbs: (0..num_partitions)
+                    .map(|_| MpscRingBuffer::new(64).unwrap())
+                    .collect(),
+                ls_writer_rb: MpscRingBuffer::<LsWriterSlot>::new(64).unwrap(),
+                flush_done_rb: MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap(),
+                tht_offset,
+            }
+        }
 
-        (dm, tht, coordinator_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset)
+        fn decision_maker(&self) -> DecisionMaker<'_> {
+            DecisionMaker::new(
+                0,
+                &self.coordinator_rb,
+                &self.transfer_hash_table,
+                &self.partition_rbs,
+                &self.ls_writer_rb,
+                &self.flush_done_rb,
+                64,
+            )
+        }
     }
 
     fn make_coord_msg(
@@ -409,17 +419,26 @@ mod tests {
 
     #[test]
     fn all_prepare_success_sends_commit() {
-        let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = setup_dm_with_transfer(4);
+        let rings = DecisionMakerRingBuffersHolder::with_transfer(4);
+        let mut dm = rings.decision_maker();
+        let (tht, coordinator_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = (
+            &rings.transfer_hash_table,
+            &rings.coordinator_rb,
+            &rings.partition_rbs,
+            &rings.ls_writer_rb,
+            &rings.flush_done_rb,
+            rings.tht_offset,
+        );
 
         let msg1 = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
         let msg2 = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
 
-        let mut c1 = coord_rb.claim();
-        *c1.as_mut() = msg1;
-        c1.publish();
-        let mut c2 = coord_rb.claim();
-        *c2.as_mut() = msg2;
-        c2.publish();
+        let mut first_claim = coordinator_rb.claim();
+        *first_claim.as_mut() = msg1;
+        first_claim.publish();
+        let mut second_claim = coordinator_rb.claim();
+        *second_claim.as_mut() = msg2;
+        second_claim.publish();
 
         let batch = dm.coordinator_rb.drain_batch(64);
         let count = batch.len();
@@ -429,14 +448,13 @@ mod tests {
 
         batch.release();
 
-        // THT decision = COMMIT
         unsafe {
             let slot = tht.slot_ptr(tht_offset);
             assert_eq!((*slot).decision, DECISION_COMMIT);
         }
 
         let mut total_commits = 0;
-        for rb in &partition_rbs {
+        for rb in partition_rbs {
             let b = rb.drain_batch(64);
             for i in 0..b.len() {
                 assert_eq!(b.slot(i).msg_type, MSG_TYPE_COMMIT);
@@ -444,20 +462,28 @@ mod tests {
             }
             b.release();
         }
-        assert_eq!(total_commits, 2); // 2 entries → 2 COMMIT messages
+        assert_eq!(total_commits, 2);
     }
 
     #[test]
     fn prepare_fail_sends_rollback() {
-        let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = setup_dm_with_transfer(4);
+        let rings = DecisionMakerRingBuffersHolder::with_transfer(4);
+        let mut dm = rings.decision_maker();
+        let (tht, coordinator_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = (
+            &rings.transfer_hash_table,
+            &rings.coordinator_rb,
+            &rings.partition_rbs,
+            &rings.ls_writer_rb,
+            &rings.flush_done_rb,
+            rings.tht_offset,
+        );
 
-        // 1 PREPARE_OK + 1 PREPARE_FAIL
-        let mut c1 = coord_rb.claim();
-        *c1.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
-        c1.publish();
-        let mut c2 = coord_rb.claim();
-        *c2.as_mut() = make_coord_msg(COORD_PREPARE_FAIL, tht_offset, 10, 1);
-        c2.publish();
+        let mut success_vote_claim = coordinator_rb.claim();
+        *success_vote_claim.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
+        success_vote_claim.publish();
+        let mut fail_vote_claim = coordinator_rb.claim();
+        *fail_vote_claim.as_mut() = make_coord_msg(COORD_PREPARE_FAIL, tht_offset, 10, 1);
+        fail_vote_claim.publish();
 
         let batch = dm.coordinator_rb.drain_batch(64);
         let count = batch.len();
@@ -471,7 +497,7 @@ mod tests {
         }
 
         let mut total_rollbacks = 0;
-        for rb in &partition_rbs {
+        for rb in partition_rbs {
             let b = rb.drain_batch(64);
             for i in 0..b.len() {
                 assert_eq!(b.slot(i).msg_type, MSG_TYPE_ROLLBACK);
@@ -484,29 +510,36 @@ mod tests {
 
     #[test]
     fn all_commit_ok_removes_from_tht() {
-        let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = setup_dm_with_transfer(4);
+        let rings = DecisionMakerRingBuffersHolder::with_transfer(4);
+        let mut dm = rings.decision_maker();
+        let (tht, coordinator_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = (
+            &rings.transfer_hash_table,
+            &rings.coordinator_rb,
+            &rings.partition_rbs,
+            &rings.ls_writer_rb,
+            &rings.flush_done_rb,
+            rings.tht_offset,
+        );
 
-        // Phase 1: PREPARE_OK × 2 → COMMIT
         for _ in 0..2 {
-            let mut c = coord_rb.claim();
-            *c.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
-            c.publish();
+            let mut claim = coordinator_rb.claim();
+            *claim.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
+            claim.publish();
         }
         let batch = dm.coordinator_rb.drain_batch(64);
         let count = batch.len();
         dm.process_batch(&batch, count);
         batch.release();
 
-        for rb in &partition_rbs {
+        for rb in partition_rbs {
             let b = rb.drain_batch(64);
             b.release();
         }
 
-        // Phase 2: COMMIT_OK × 2
         for _ in 0..2 {
-            let mut c = coord_rb.claim();
-            *c.as_mut() = make_coord_msg(COORD_COMMIT_SUCCESS, tht_offset, 0, 0);
-            c.publish();
+            let mut claim = coordinator_rb.claim();
+            *claim.as_mut() = make_coord_msg(COORD_COMMIT_SUCCESS, tht_offset, 0, 0);
+            claim.publish();
         }
         let batch = dm.coordinator_rb.drain_batch(64);
         let count = batch.len();
@@ -522,29 +555,36 @@ mod tests {
 
     #[test]
     fn all_rollback_ok_removes_from_tht() {
-        let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = setup_dm_with_transfer(4);
+        let rings = DecisionMakerRingBuffersHolder::with_transfer(4);
+        let mut dm = rings.decision_maker();
+        let (tht, coordinator_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = (
+            &rings.transfer_hash_table,
+            &rings.coordinator_rb,
+            &rings.partition_rbs,
+            &rings.ls_writer_rb,
+            &rings.flush_done_rb,
+            rings.tht_offset,
+        );
 
-        // Phase 1: 1 OK + 1 FAIL → ROLLBACK
-        let mut c1 = coord_rb.claim();
-        *c1.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
-        c1.publish();
-        let mut c2 = coord_rb.claim();
-        *c2.as_mut() = make_coord_msg(COORD_PREPARE_FAIL, tht_offset, 10, 1);
-        c2.publish();
+        let mut success_vote_claim = coordinator_rb.claim();
+        *success_vote_claim.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
+        success_vote_claim.publish();
+        let mut fail_vote_claim = coordinator_rb.claim();
+        *fail_vote_claim.as_mut() = make_coord_msg(COORD_PREPARE_FAIL, tht_offset, 10, 1);
+        fail_vote_claim.publish();
 
         let batch = dm.coordinator_rb.drain_batch(64);
         let count = batch.len();
         dm.process_batch(&batch, count);
         batch.release();
 
-        for rb in &partition_rbs {
+        for rb in partition_rbs {
             rb.drain_batch(64).release();
         }
 
-        // Phase 2: ROLLBACK_OK × 2
-        let mut c = coord_rb.claim();
-        *c.as_mut() = make_coord_msg(COORD_ROLLBACK_SUCCESS, tht_offset, 0, 0);
-        c.publish();
+        let mut claim = coordinator_rb.claim();
+        *claim.as_mut() = make_coord_msg(COORD_ROLLBACK_SUCCESS, tht_offset, 0, 0);
+        claim.publish();
 
         let batch = dm.coordinator_rb.drain_batch(64);
         let count = batch.len();
@@ -556,13 +596,21 @@ mod tests {
 
     #[test]
     fn commit_sends_correct_entry_data() {
-        let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = setup_dm_with_transfer(4);
+        let rings = DecisionMakerRingBuffersHolder::with_transfer(4);
+        let mut dm = rings.decision_maker();
+        let (tht, coordinator_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = (
+            &rings.transfer_hash_table,
+            &rings.coordinator_rb,
+            &rings.partition_rbs,
+            &rings.ls_writer_rb,
+            &rings.flush_done_rb,
+            rings.tht_offset,
+        );
 
-        // PREPARE_OK × 2 → COMMIT
         for _ in 0..2 {
-            let mut c = coord_rb.claim();
-            *c.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
-            c.publish();
+            let mut claim = coordinator_rb.claim();
+            *claim.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
+            claim.publish();
         }
         let batch = dm.coordinator_rb.drain_batch(64);
         let count = batch.len();
@@ -570,7 +618,7 @@ mod tests {
         batch.release();
 
         let mut commits: Vec<PartitionSlot> = Vec::new();
-        for rb in &partition_rbs {
+        for rb in partition_rbs {
             let b = rb.drain_batch(64);
             for i in 0..b.len() {
                 commits.push(*b.slot(i));
@@ -580,26 +628,34 @@ mod tests {
 
         assert_eq!(commits.len(), 2);
 
-        let debit = commits.iter().find(|c| c.entry_type == ENTRY_TYPE_DEBIT).unwrap();
+        let debit = commits.iter().find(|command| command.entry_type == ENTRY_TYPE_DEBIT).unwrap();
         assert_eq!(debit.amount, 500);
         assert_eq!(debit.gsn, 100);
         assert_eq!(debit.msg_type, MSG_TYPE_COMMIT);
         assert_eq!(debit.transfer_hash_table_offset, tht_offset);
-        // account_id reconstructed from hi=0, lo=10
         assert_eq!(debit.account_id, account_id(10));
 
-        let credit = commits.iter().find(|c| c.entry_type == ENTRY_TYPE_CREDIT).unwrap();
+        let credit = commits.iter().find(|command| command.entry_type == ENTRY_TYPE_CREDIT).unwrap();
         assert_eq!(credit.amount, 500);
         assert_eq!(credit.account_id, account_id(20));
     }
 
     #[test]
     fn partial_prepare_no_decision_yet() {
-        let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = setup_dm_with_transfer(4);
+        let rings = DecisionMakerRingBuffersHolder::with_transfer(4);
+        let mut dm = rings.decision_maker();
+        let (tht, coordinator_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = (
+            &rings.transfer_hash_table,
+            &rings.coordinator_rb,
+            &rings.partition_rbs,
+            &rings.ls_writer_rb,
+            &rings.flush_done_rb,
+            rings.tht_offset,
+        );
 
-        let mut c = coord_rb.claim();
-        *c.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
-        c.publish();
+        let mut claim = coordinator_rb.claim();
+        *claim.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
+        claim.publish();
 
         let batch = dm.coordinator_rb.drain_batch(64);
         let count = batch.len();
@@ -615,29 +671,34 @@ mod tests {
 
     #[test]
     fn all_commit_ok_sends_flush_marker_to_ls_writer() {
-        let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) =
-            setup_dm_with_transfer(4);
+        let rings = DecisionMakerRingBuffersHolder::with_transfer(4);
+        let mut dm = rings.decision_maker();
+        let (tht, coordinator_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = (
+            &rings.transfer_hash_table,
+            &rings.coordinator_rb,
+            &rings.partition_rbs,
+            &rings.ls_writer_rb,
+            &rings.flush_done_rb,
+            rings.tht_offset,
+        );
 
-        // Phase 1: PREPARE_OK × 2 → COMMIT
         for _ in 0..2 {
-            let mut c = coord_rb.claim();
-            *c.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
-            c.publish();
+            let mut claim = coordinator_rb.claim();
+            *claim.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
+            claim.publish();
         }
         let batch = dm.coordinator_rb.drain_batch(64);
         dm.process_batch(&batch, batch.len());
         batch.release();
 
-        // Drain COMMIT from partition RBs
-        for rb in &partition_rbs {
+        for rb in partition_rbs {
             rb.drain_batch(64).release();
         }
 
-        // Phase 2: COMMIT_OK × 2
         for _ in 0..2 {
-            let mut c = coord_rb.claim();
-            *c.as_mut() = make_coord_msg(COORD_COMMIT_SUCCESS, tht_offset, 0, 0);
-            c.publish();
+            let mut claim = coordinator_rb.claim();
+            *claim.as_mut() = make_coord_msg(COORD_COMMIT_SUCCESS, tht_offset, 0, 0);
+            claim.publish();
         }
         let batch = dm.coordinator_rb.drain_batch(64);
         dm.process_batch(&batch, batch.len());
@@ -659,28 +720,34 @@ mod tests {
 
     #[test]
     fn flush_done_removes_from_tht() {
-        let (mut dm, tht, coord_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) =
-            setup_dm_with_transfer(4);
+        let rings = DecisionMakerRingBuffersHolder::with_transfer(4);
+        let mut dm = rings.decision_maker();
+        let (tht, coordinator_rb, partition_rbs, ls_writer_rb, flush_done_rb, tht_offset) = (
+            &rings.transfer_hash_table,
+            &rings.coordinator_rb,
+            &rings.partition_rbs,
+            &rings.ls_writer_rb,
+            &rings.flush_done_rb,
+            rings.tht_offset,
+        );
 
-        // Phase 1
         for _ in 0..2 {
-            let mut c = coord_rb.claim();
-            *c.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
-            c.publish();
+            let mut claim = coordinator_rb.claim();
+            *claim.as_mut() = make_coord_msg(COORD_PREPARE_SUCCESS, tht_offset, 0, 0);
+            claim.publish();
         }
         let batch = dm.coordinator_rb.drain_batch(64);
         dm.process_batch(&batch, batch.len());
         batch.release();
 
-        for rb in &partition_rbs {
+        for rb in partition_rbs {
             rb.drain_batch(64).release();
         }
 
-        // Phase 2
         for _ in 0..2 {
-            let mut c = coord_rb.claim();
-            *c.as_mut() = make_coord_msg(COORD_COMMIT_SUCCESS, tht_offset, 0, 0);
-            c.publish();
+            let mut claim = coordinator_rb.claim();
+            *claim.as_mut() = make_coord_msg(COORD_COMMIT_SUCCESS, tht_offset, 0, 0);
+            claim.publish();
         }
         let batch = dm.coordinator_rb.drain_batch(64);
         dm.process_batch(&batch, batch.len());

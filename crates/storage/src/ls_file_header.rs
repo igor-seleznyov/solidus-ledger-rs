@@ -1,7 +1,6 @@
-use common::crc32c::crc32c;
 use crate::consts::FILE_PAGE_SIZE;
+use common::crc32c::crc32c;
 use std::time::{SystemTime, UNIX_EPOCH};
-use pipeline::posting_record::PostingRecord;
 
 pub const LS_FILE_MAGIC: u64 = 0x4752_5453_5247_444C;
 pub const LS_FORMAT_VERSION: u16 = 1;
@@ -48,6 +47,19 @@ pub struct LsFileHeader {
     /// CRC32C over bytes `[0..SIZE - 4)`. MUST remain the last field (I-001).
     pub checksum: u32,
 }
+const _: () = assert!(
+    std::mem::size_of::<LsFileHeader>()
+        == size_of::<u64>() * 4
+                + size_of::<u16>() * 3
+                + size_of::<u8>() * 4
+                + size_of::<u32>() * 5
+                + size_of::<[u8; 2]>()
+                + size_of::<[u8; 32]>() * 2,
+    "LsFileHeader is larger than its fields: the compiler inserted alignment \
+     padding. Declare it as an explicit field so the layout is stated, and \
+     so the checksum stays the record's final bytes",
+);
+
 
 impl LsFileHeader {
     pub const SIZE: usize = 128;
@@ -95,8 +107,6 @@ impl LsFileHeader {
     }
 
     pub fn compute_checksum(&self) -> u32 {
-        // SAFETY: `self` is a valid `LsFileHeader` of exactly `SIZE` bytes.
-        // Bytes `[0..SIZE-4)` exclude only the trailing `checksum: u32`.
         const PAYLOAD: usize = LsFileHeader::SIZE - std::mem::size_of::<u32>();
         let bytes = unsafe {
             std::slice::from_raw_parts(
@@ -119,9 +129,13 @@ impl LsFileHeader {
         page
     }
 
-    pub unsafe fn from_bytes(bytes: &[u8]) -> &LsFileHeader {
-        assert!(bytes.len() >= Self::SIZE);
-        unsafe { &*(bytes.as_ptr() as *const LsFileHeader) }
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self as *mut LsFileHeader as *mut u8,
+                Self::SIZE,
+            )
+        }
     }
 
     fn now_nanos() -> u64 {

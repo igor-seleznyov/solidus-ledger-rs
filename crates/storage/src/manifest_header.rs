@@ -1,8 +1,6 @@
 use common::crc32c::crc32c;
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::manifest_entry::ManifestEntry;
 
-// 'LDSTMNFT' - LeDger STorage MaNiFesT
 pub const MANIFEST_HEADER_MAGIC: u64 = 0x5446_4E4D_5453_444C;
 pub const MANIFEST_FORMAT_VERSION: u16 = 1;
 
@@ -17,9 +15,21 @@ pub struct ManifestHeader {
     pub _pad2: [u8; 2],
     pub created_at_ns: u64,
     pub last_updated_at_ns: u64,
-    pub _reserved: [u8; 20],
+    pub _pad3: [u8; 20],
     pub checksum: u32,
 }
+const _: () = assert!(
+    std::mem::size_of::<ManifestHeader>()
+        == size_of::<u64>() * 3
+                + size_of::<u16>() * 2
+                + size_of::<[u8; 2]>() * 2
+                + size_of::<u32>() * 3
+                + size_of::<[u8; 20]>(),
+    "ManifestHeader is larger than its fields: the compiler inserted alignment \
+     padding. Declare it as an explicit field so the layout is stated, and \
+     so the checksum stays the record's final bytes",
+);
+
 
 impl ManifestHeader {
     pub const SIZE: usize = std::mem::size_of::<Self>();
@@ -40,11 +50,11 @@ impl ManifestHeader {
             _pad2: [0; 2],
             created_at_ns: now_ns,
             last_updated_at_ns: now_ns,
-            _reserved: [0; 20],
+            _pad3: [0; 20],
             checksum: 0,
         };
 
-        unsafe { header.compute_checksum(); }
+        header.fill_checksum();
         header
     }
 
@@ -52,41 +62,38 @@ impl ManifestHeader {
         unsafe { std::mem::zeroed() }
     }
 
-    pub unsafe fn compute_checksum(&mut self) {
-        self.checksum = 0;
+    /// Compute CRC32C over bytes `[0..SIZE - 4)`, excluding `checksum`.
+    /// Safe to call on PROT_READ mmap (no mutation of `self`).
+    ///
+    /// # Safety (internal)
+    ///
+    /// The single `unsafe` block builds a `[0..SIZE - 4)` byte view over
+    /// `self`. Valid because `self` is a live `&ManifestHeader` of exactly
+    /// `SIZE` bytes; the view excludes the trailing `checksum`; no
+    /// mutation occurs, so it is sound on read-only memory.
+    pub fn compute_checksum(&self) -> u32 {
+        const PAYLOAD: usize = ManifestHeader::SIZE - std::mem::size_of::<u32>();
         let bytes = unsafe {
             std::slice::from_raw_parts(
-                self as *const ManifestHeader as *const u8,
-                Self::SIZE,
+                self as *const Self as *const u8,
+                PAYLOAD
             )
         };
-        self.checksum = unsafe {
-            crc32c(bytes.as_ptr(), bytes.len())
-        };
-    }
 
-    pub unsafe fn verify_checksum(&self) -> bool {
-        let saved = self.checksum;
-        let self_mut = self as *const ManifestHeader as *mut ManifestHeader;
         unsafe {
-            (*self_mut).checksum = 0;
-        }
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                self as *const ManifestHeader as *const u8,
-                Self::SIZE,
-            )
-        };
-        let computed = unsafe {
             crc32c(bytes.as_ptr(), bytes.len())
-        };
-        unsafe {
-            (*self_mut).checksum = saved;
-            computed == saved
         }
     }
 
-    pub unsafe fn as_bytes(&self) -> &[u8] {
+    pub fn fill_checksum(&mut self) {
+        self.checksum = self.compute_checksum();
+    }
+
+    pub fn verify_checksum(&self) -> bool {
+        self.checksum == self.compute_checksum()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
                 self as *const ManifestHeader as *const u8,
@@ -95,14 +102,7 @@ impl ManifestHeader {
         }
     }
 
-    pub unsafe fn from_bytes(bytes: &[u8]) -> &ManifestHeader {
-        assert!(bytes.len() >= Self::SIZE, "Buffer too small for ManifestHeader");
-        unsafe {
-            &*(bytes.as_ptr() as *const ManifestHeader)
-        }
-    }
-
-    pub unsafe fn as_bytes_mut(&mut self) -> &mut [u8] {
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         unsafe {
             std::slice::from_raw_parts_mut(
                 self as *mut ManifestHeader as *mut u8,
@@ -111,6 +111,10 @@ impl ManifestHeader {
         }
     }
 }
+
+const _: () = assert!(
+    std::mem::offset_of!(ManifestHeader, checksum) == ManifestHeader::SIZE - std::mem::size_of::<u32>()
+);
 
 #[cfg(test)]
 mod tests {
@@ -132,6 +136,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ManifestHeader, shard_id), 20);
         assert_eq!(std::mem::offset_of!(ManifestHeader, created_at_ns), 24);
         assert_eq!(std::mem::offset_of!(ManifestHeader, last_updated_at_ns), 32);
+        assert_eq!(std::mem::offset_of!(ManifestHeader, _pad3), 40);
         assert_eq!(std::mem::offset_of!(ManifestHeader, checksum), 60);
     }
 
@@ -139,7 +144,7 @@ mod tests {
     fn new_computes_checksum() {
         let header = ManifestHeader::new(0);
         assert_ne!(header.checksum, 0);
-        assert!(unsafe { header.verify_checksum() });
+        assert!(header.verify_checksum());
     }
 
     #[test]
@@ -158,18 +163,19 @@ mod tests {
     fn verify_detects_corruption() {
         let mut header = ManifestHeader::new(0);
         header.entries_count = 999;
-        assert!(!unsafe { header.verify_checksum() });
+        assert!(!header.verify_checksum());
     }
 
     #[test]
     fn as_bytes_roundtrip() {
         let header = ManifestHeader::new(3);
-        let bytes = unsafe { header.as_bytes() };
+        let bytes = header.as_bytes();
         assert_eq!(bytes.len(), ManifestHeader::SIZE);
 
-        let restored = unsafe { ManifestHeader::from_bytes(bytes) };
+        let mut restored = ManifestHeader::zeroed();
+        restored.as_bytes_mut().copy_from_slice(&bytes[..ManifestHeader::SIZE]);
         assert_eq!(restored.magic, MANIFEST_HEADER_MAGIC);
         assert_eq!(restored.shard_id, 3);
-        assert!(unsafe { restored.verify_checksum() });
+        assert!(restored.verify_checksum());
     }
 }

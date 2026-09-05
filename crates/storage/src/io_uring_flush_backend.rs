@@ -318,7 +318,7 @@ mod tests {
         assert!(contents.len() >= 4096);
         assert_eq!(contents[0], 0xAB);
         assert_eq!(contents[127], 0xAB);
-        assert_eq!(contents[128], 0x00); // padding
+        assert_eq!(contents[128], 0x00);
 
         fs::remove_file(&path).ok();
     }
@@ -330,8 +330,6 @@ mod tests {
         let handle = backend.open_file(&path, 256 * 1024 * 1024).unwrap();
 
         let metadata = fs::metadata(&path).unwrap();
-        // fallocate may or may not update file size depending on filesystem
-        // but allocated blocks should be >= 256MB
         backend.close_file(handle);
 
         fs::remove_file(&path).ok();

@@ -7,7 +7,6 @@ impl TimestampIndexEntry {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 }
 
-// timestamp_index_entry.rs
 #[cfg(test)]
 mod tests {
     use super::*;

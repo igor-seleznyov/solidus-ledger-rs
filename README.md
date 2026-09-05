@@ -1,12 +1,19 @@
 # Solidus Ledger
 
 > Financial-grade double-entry ledger engine in Rust.  
-> Target: **1,000,000 TPS** · **sub-millisecond p99 latency** · **single node**
+> Target: **1,000,000 TPS** · **sub-millisecond p99 latency** · **distributed**
 
 ![Rust](https://img.shields.io/badge/rust-1.85+-orange?logo=rust)
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
 ![Status](https://img.shields.io/badge/status-active%20development-green)
+![Topology](https://img.shields.io/badge/topology-distributed%20target-yellow)
+
+The throughput and latency targets above are per node, and the engine runs on a
+single node today. Distribution is the direction the design is built for, not a
+property it already has: replication and multi-node membership are on the
+roadmap below, and nothing in the storage or protocol layout assumes there will
+only ever be one node.
 
 Solidus Ledger is a high-performance financial ledger designed for payment infrastructure
 where correctness and durability are non-negotiable. Every transfer is atomically applied
@@ -28,8 +35,10 @@ io_uring for disk writes on Linux.
   detects any gap or tampering in the record sequence
 - **Linear scaling** — accounts distributed across partitions, each on a dedicated thread;
   more partitions = more throughput, no coordination on the hot path
-- **Correctness verified** — unsafe code tested with Miri; lock-free synchronization
-  verified with Loom under exhaustive thread interleaving
+- **Correctness verified** — unsafe code run under Miri in both borrow models
+  (stacked and tree); lock-free publication protocols checked by Loom over every
+  thread interleaving, each model carrying a negative control that must fail when
+  the protocol is deliberately broken
 
 ---
 
@@ -98,11 +107,14 @@ A ledger is the core of any financial system. It atomically executes postings be
 - Shamir Secret Sharing (3-of-5) for master key protection
 - Signing keys stored only in protected memory (mlock), zeroed on shutdown
 
-**Single-node Scaling via Sharding**
+**Scaling via Sharding**
 - Accounts are distributed across partitions (shards)
 - Each partition is processed by a dedicated thread
 - Hot accounts can be pinned to specific partitions via configuration
-- Linear scaling: more partitions = more throughput
+- Linear scaling within a node: more partitions = more throughput
+- The same partition boundary is the intended seam for distribution: a partition
+  is already a single-writer unit with no coordination on the hot path, so moving
+  one to another node is a transport change rather than a redesign
 
 **Indexes and Search**
 - Immutable indexes built at LS file rotation

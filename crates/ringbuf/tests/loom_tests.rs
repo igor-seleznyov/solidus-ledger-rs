@@ -4,6 +4,9 @@ mod loom_tests {
     use loom::sync::Arc;
     use loom::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
+    /// The Pipeline writes the gsn, then release_store(ready = 1).
+    /// The DM does acquire_load(ready), then reads the gsn.
+    /// Loom checks that wherever ready == 1 is observed, the gsn is 42.
     #[test]
     fn loom_tht_ready_barrier() {
         loom::model(|| {
@@ -13,13 +16,11 @@ mod loom_tests {
             let ready_w = ready.clone();
             let gsn_w = gsn.clone();
 
-            // Pipeline thread (writer)
             let writer = loom::thread::spawn(move || {
-                gsn_w.store(42, Ordering::Relaxed);      // plain write GSN
-                ready_w.store(1, Ordering::Release);      // release barrier
+                gsn_w.store(42, Ordering::Relaxed);
+                ready_w.store(1, Ordering::Release);
             });
 
-            // Decision Maker thread (reader)
             let reader = loom::thread::spawn(move || {
                 if ready.load(Ordering::Acquire) == 1 {
                     assert_eq!(gsn.load(Ordering::Relaxed), 42);
@@ -31,6 +32,9 @@ mod loom_tests {
         });
     }
 
+    /// The same shape over several fields, standing in for a transfer slot.
+    /// The Pipeline writes transfer_id, gsn and entries_count, then ready = 1.
+    /// The DM reads ready, then every field.
     #[test]
     fn loom_tht_ready_barrier_multiple_fields() {
         loom::model(|| {

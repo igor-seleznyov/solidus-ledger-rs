@@ -1,28 +1,25 @@
-use chrono::Local;
-use common::mem_barrier::release_store_u64;
-use pipeline::posting_record::PostingRecord;
-use pipeline::in_flight_min_heap::InFlightMinHeap;
-use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
-use std::sync::Arc;
-use std::sync::mpsc::Sender;
-use std::time::Instant;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use crate::ls_writer_slot::*;
-use crate::flush_done_slot::FlushDoneSlot;
-use crate::flush_backend::FlushBackend;
-use crate::ls_file_header::{LsFileHeader};
-use crate::metadata_strategy::MetadataStrategy;
-use crate::pending_flush::PendingFlush;
-use crate::signing_strategy::SigningStrategy;
-use crate::checkpoint_record::CheckpointRecord;
 use crate::checkpoint_file_header::CheckpointFileHeader;
+use crate::checkpoint_record::CheckpointRecord;
+use crate::flush_backend::FlushBackend;
+use crate::flush_done_slot::FlushDoneSlot;
+use crate::index_builder::{IndexBufferEntry, IndexBuilderTask};
+use crate::ls_file_header::LsFileHeader;
+use crate::ls_writer_slot::*;
 use crate::manifest::Manifest;
 use crate::manifest_entry::ManifestEntry;
+use crate::metadata_strategy::MetadataStrategy;
+use crate::pending_flush::PendingFlush;
 use crate::recovery::recover_checkpoint_state;
 use crate::recovery::recover_ls_state;
+use crate::signing_strategy::SigningStrategy;
+use chrono::Local;
 use common::make_test_dir::make_test_dir;
-use crate::index_builder::{IndexBufferEntry, IndexBuilderTask};
+use common::mem_barrier::release_store_u64;
+use pipeline::in_flight_min_heap::InFlightMinHeap;
+use pipeline::posting_record::PostingRecord;
+use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
+use std::sync::mpsc::Sender;
+use std::time::Instant;
 
 const CLOCK_CHECK_REPEATS_COUNT_INTERVAL: u32 = 100_000;
 
@@ -31,10 +28,10 @@ fn generate_ls_filename(shard_id: usize, file_seq: u64) -> String {
     format!("ls_{}-{}-{}.ls", now.format("%Y%m%d-%H%M%S-%3f"), shard_id, file_seq)
 }
 
-pub struct LsWriter<T: FlushBackend, S: SigningStrategy, M: MetadataStrategy> {
+pub struct LsWriter<'scope, T: FlushBackend, S: SigningStrategy, M: MetadataStrategy> {
     id: usize,
-    ls_writer_rb: Arc<MpscRingBuffer<LsWriterSlot>>,
-    flush_done_rb: Arc<MpscRingBuffer<FlushDoneSlot>>,
+    ls_writer_rb: &'scope MpscRingBuffer<LsWriterSlot>,
+    flush_done_rb: &'scope MpscRingBuffer<FlushDoneSlot>,
     global_committed_gsn: *mut u64,
     backend: T,
     signing_strategy: S,
@@ -106,13 +103,13 @@ pub struct LsWriter<T: FlushBackend, S: SigningStrategy, M: MetadataStrategy> {
     index_builder_tx: Sender<IndexBuilderTask>,
 }
 
-unsafe impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> Send for LsWriter<T, S, M> {}
+unsafe impl<'scope, T: FlushBackend + Send, S: SigningStrategy + Send, M: MetadataStrategy + Send> Send for LsWriter<'scope, T, S, M> {}
 
-impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsWriter<T, S, M> {
+impl<'scope, T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsWriter<'scope, T, S, M> {
     pub fn new(
         id: usize,
-        ls_writer_rb: Arc<MpscRingBuffer<LsWriterSlot>>,
-        flush_done_rb: Arc<MpscRingBuffer<FlushDoneSlot>>,
+        ls_writer_rb: &'scope MpscRingBuffer<LsWriterSlot>,
+        flush_done_rb: &'scope MpscRingBuffer<FlushDoneSlot>,
         global_committed_gsn: *mut u64,
         backend: T,
         signing_strategy: S,
@@ -553,10 +550,9 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         ).expect("FFailed to reopen LS file");
 
         let checkpoint_path = format!("{}.checkpoint", self.current_ls_file_path);
-        let (recovered_checkpoint_offset, recovered_batch_seq) =
-            recover_checkpoint_state(&checkpoint_path);
-        self.checkpoint_write_offset = recovered_checkpoint_offset;
-        self.batch_seq = recovered_batch_seq;
+        let recovered_checkpoint = recover_checkpoint_state(&checkpoint_path);
+        self.checkpoint_write_offset = recovered_checkpoint.write_offset;
+        self.batch_seq = recovered_checkpoint.batch_seq;
 
         let ls_state = recover_ls_state(&self.current_ls_file_path);
         self.write_offset = ls_state.write_offset;
@@ -657,7 +653,7 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         self.write_offset = LsFileHeader::DATA_OFFSET as u64;
 
         let checkpoint_header = CheckpointFileHeader::new(self.file_seq);
-        let checkpoint_header_bytes = unsafe { checkpoint_header.as_bytes() };
+        let checkpoint_header_bytes = checkpoint_header.as_bytes();
 
         self.backend.submit_write(
             self.checkpoint_handle_index,
@@ -787,7 +783,7 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         self.write_offset = LsFileHeader::DATA_OFFSET as u64;
 
         let checkpoint_header = CheckpointFileHeader::new(self.file_seq);
-        let checkpoint_header_bytes = unsafe { checkpoint_header.as_bytes() };
+        let checkpoint_header_bytes = checkpoint_header.as_bytes();
 
         self.backend.submit_write(
             self.checkpoint_handle_index,
@@ -910,7 +906,7 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
         let max_batches = if max_batch_bytes > 0 {
             max_ls_file_size / max_batch_bytes
         } else {
-            1024 //fallback
+            1024
         };
         let base_size = CheckpointFileHeader::SIZE + max_batches * CheckpointRecord::SIZE;
         base_size * checkpoint_prealloc_multiplier
@@ -923,7 +919,7 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
             self.batch_seq,
         );
 
-        let record_bytes = unsafe { record.as_bytes() };
+        let record_bytes = record.as_bytes();
 
         self.backend.submit_write(
             self.checkpoint_handle_index,
@@ -951,94 +947,36 @@ impl<T: FlushBackend, S: SigningStrategy + Send, M: MetadataStrategy + Send> LsW
     pub fn signing_chain_hash(&self) -> Option<&[u8; 32]> {
         self.signing_strategy.chain_hash()
     }
-
-    fn recover_checkpoint_state(checkpoint_path: &str) -> (u64, u32) {
-        let mut file = match File::open(checkpoint_path) {
-            Ok(file) => file,
-            Err(_) => {
-                return (CheckpointFileHeader::DATA_OFFSET as u64, 0);
-            }
-        };
-
-        let mut header = CheckpointFileHeader::zeroed();
-        if file.read_exact(
-            unsafe { header.as_bytes_mut() }
-        ).is_err() {
-            return (CheckpointFileHeader::DATA_OFFSET as u64, 0);
-        }
-
-        if header.magic != crate::checkpoint_file_header::CHECKPOINT_FILE_MAGIC
-            || !unsafe { header.verify_checksum() } {
-            panic!(
-                "Corrupt checkpoint file header: {}",
-                checkpoint_path,
-            );
-        }
-
-        let mut offset = CheckpointFileHeader::DATA_OFFSET as u64;
-        let mut last_batch_seq: u32 = 0;
-        let mut records_count: u64 = 0;
-        let mut buf = [0u8; CheckpointRecord::SIZE];
-
-        loop {
-            if file.seek(SeekFrom::Start(offset)).is_err() {
-                break;
-            }
-            match file.read_exact(&mut buf) {
-                Ok(()) => {}
-                Err(_) => break,
-            }
-
-            let record = unsafe { CheckpointRecord::from_bytes(&buf) };
-            if !unsafe { record.verify_checksum() } {
-                break;
-            }
-
-            last_batch_seq = record.batch_seq;
-            records_count += 1;
-            offset += CheckpointRecord::SIZE as u64;
-        }
-
-        let checkpoint_write_offset = CheckpointFileHeader::DATA_OFFSET as u64
-            + records_count * CheckpointRecord::SIZE as u64;
-
-        let batch_seq = if records_count > 0 {
-            last_batch_seq + 1
-        } else { 0 };
-
-        (checkpoint_write_offset, batch_seq)
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{mpsc, Arc};
-    use ed25519_dalek::SigningKey;
     use super::*;
-    use crate::flush_backend::{FlushBackend, FlushCompletion};
-    use pipeline::posting_record::PostingRecord;
-    use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
+    use crate::checkpoint_file_header::CheckpointFileHeader;
+    use crate::checkpoint_record::CheckpointRecord;
     use crate::consts::FILE_PAGE_SIZE;
     use crate::ed25519_signing_strategy::Ed25519SigningStrategy;
+    use crate::flush_backend::{FlushBackend, FlushCompletion};
     use crate::flush_done_slot::FlushDoneSlot;
-    use crate::ls_writer::LsWriter;
-    use crate::ls_writer_slot::{LsWriterSlot, LS_MSG_ADD_TO_HEAP, LS_MSG_FLUSH_MARKER, LS_MSG_POSTING, LS_MSG_REMOVE_FROM_HEAP};
     use crate::ls_file_header::LsFileHeader;
     use crate::ls_meta_file_header::LsMetaFileHeader;
     use crate::ls_sign_file_header::LsSignFileHeader;
+    use crate::ls_writer::LsWriter;
+    use crate::ls_writer_slot::{LsWriterSlot, LS_MSG_ADD_TO_HEAP, LS_MSG_FLUSH_MARKER, LS_MSG_POSTING, LS_MSG_REMOVE_FROM_HEAP};
+    use crate::manifest_entry::MANIFEST_STATUS_ROTATED;
     use crate::no_metadata_strategy::NoMetadataStrategy;
     use crate::no_signing_strategy::NoSigningStrategy;
+    use crate::portable_flush_backend::PortableFlushBackend;
     use crate::posting_metadata_strategy::PostingMetadataStrategy;
     use crate::signing_state::SigningState;
-    use crate::checkpoint_record::CheckpointRecord;
-    use crate::checkpoint_file_header::CheckpointFileHeader;
-    use crate::manifest_entry::MANIFEST_STATUS_ROTATED;
-    use crate::portable_flush_backend::PortableFlushBackend;
+    use ed25519_dalek::SigningKey;
+    use pipeline::posting_record::PostingRecord;
+    use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
+    use std::sync::{mpsc, Arc};
 
     const K0: u64 = 0x0123456789ABCDEF;
     const K1: u64 = 0xFEDCBA9876543210;
 
-    // --- Mock FlushBackend ---
 
     const MAX_FILES: usize = 8;
 
@@ -1122,7 +1060,30 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    fn make_writer() -> LsWriter<MockFlushBackend, NoSigningStrategy, NoMetadataStrategy> {
+    /// Owns the rings a writer borrows, for as long as the test body runs.
+    ///
+    /// The writer holds its rings as shared references now, so something has
+    /// to own them and outlive it. In production that owner is `main`'s
+    /// thread scope; here it is a local whose lifetime is the test body. A
+    /// helper that built the rings and returned the writer cannot work at
+    /// all — the rings would die at the helper's closing brace while the
+    /// writer still pointed at them, which is why every helper below takes
+    /// the rings rather than making them.
+    struct LsWriterRingBuffersHolder {
+        ls_writer_rb: MpscRingBuffer<LsWriterSlot>,
+        flush_done_rb: MpscRingBuffer<FlushDoneSlot>,
+    }
+
+    impl LsWriterRingBuffersHolder {
+        fn new() -> Self {
+            Self {
+                ls_writer_rb: MpscRingBuffer::<LsWriterSlot>::new(64).unwrap(),
+                flush_done_rb: MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap(),
+            }
+        }
+    }
+
+    fn make_writer(rings: &LsWriterRingBuffersHolder) -> LsWriter<'_, MockFlushBackend, NoSigningStrategy, NoMetadataStrategy> {
         let dir = make_test_dir();
 
         let manifest_path = format!("{}/0.manifest", dir);
@@ -1132,20 +1093,14 @@ mod tests {
 
         let (index_tx, _) = mpsc::channel();
 
-        let ls_writer_rb = Arc::new(
-            MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
-        );
-        let flush_done_rb = Arc::new(
-            MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()
-        );
 
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
 
         let mut writer = LsWriter::new(
             0,
-            ls_writer_rb,
-            flush_done_rb,
+            &rings.ls_writer_rb,
+            &rings.flush_done_rb,
             committed_gsn_ptr,
             MockFlushBackend::new(),
             NoSigningStrategy,
@@ -1160,7 +1115,7 @@ mod tests {
             512,
             16,
             4,
-            0,          // rules_checksum
+            0,
             manifest,
             false,
             index_tx,
@@ -1169,7 +1124,7 @@ mod tests {
         writer
     }
 
-    fn make_writer_with_metadata(record_size: usize) -> LsWriter<MockFlushBackend, NoSigningStrategy, PostingMetadataStrategy> {
+    fn make_writer_with_metadata(rings: &LsWriterRingBuffersHolder, record_size: usize) -> LsWriter<'_, MockFlushBackend, NoSigningStrategy, PostingMetadataStrategy> {
         let dir = make_test_dir();
 
         let manifest_path = format!("{}/0.manifest", dir);
@@ -1177,12 +1132,6 @@ mod tests {
 
         let manifest = Manifest::create(&dir, 0);
 
-        let ls_writer_rb = Arc::new(
-            MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
-        );
-        let flush_done_rb = Arc::new(
-            MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()
-        );
 
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
@@ -1193,8 +1142,8 @@ mod tests {
 
         let mut writer = LsWriter::new(
             0,
-            ls_writer_rb,
-            flush_done_rb,
+            &rings.ls_writer_rb,
+            &rings.flush_done_rb,
             committed_gsn_ptr,
             MockFlushBackend::new(),
             NoSigningStrategy,
@@ -1212,56 +1161,6 @@ mod tests {
         );
         writer.startup();
         writer
-    }
-
-    fn make_writer_with_flush_done_rb() -> (
-        LsWriter<MockFlushBackend, NoSigningStrategy, NoMetadataStrategy>,
-        Arc<MpscRingBuffer<FlushDoneSlot>>,
-    ) {
-        let dir = make_test_dir();
-
-        let manifest_path = format!("{}/0.manifest", dir);
-        std::fs::remove_file(&manifest_path).ok();
-
-        let manifest = Manifest::create(&dir, 0);
-
-        let ls_writer_rb = Arc::new(
-            MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
-        );
-        let flush_done_rb = Arc::new(
-            MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()
-        );
-        let flush_done_rb_clone = Arc::clone(&flush_done_rb);
-
-        unsafe { TEST_COMMITTED_GSN = 0; }
-        let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
-
-        let (index_tx, _) = mpsc::channel();
-
-        let mut writer = LsWriter::new(
-            0,
-            ls_writer_rb,
-            flush_done_rb,
-            committed_gsn_ptr,
-            MockFlushBackend::new(),
-            NoSigningStrategy,
-            NoMetadataStrategy,
-            "/tmp/solidus-test".to_string(),
-            1024 * 1024,
-            64,
-            K0,
-            K1,
-            64, 2, 512,
-            16,
-            4,
-            0,
-            manifest,
-            false,
-            index_tx,
-        );
-        writer.startup();
-
-        (writer, flush_done_rb_clone)
     }
 
 
@@ -1301,7 +1200,7 @@ mod tests {
         slot
     }
 
-    fn make_writer_with_signing() -> LsWriter<MockFlushBackend, Ed25519SigningStrategy, NoMetadataStrategy> {
+    fn make_writer_with_signing(rings: &LsWriterRingBuffersHolder) -> LsWriter<'_, MockFlushBackend, Ed25519SigningStrategy, NoMetadataStrategy> {
         let dir = make_test_dir();
 
         let manifest_path = format!("{}/0.manifest", dir);
@@ -1309,12 +1208,6 @@ mod tests {
 
         let manifest = Manifest::create(&dir, 0);
 
-        let ls_writer_rb = Arc::new(
-            MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
-        );
-        let flush_done_rb = Arc::new(
-            MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()
-        );
 
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
@@ -1328,8 +1221,8 @@ mod tests {
 
         let mut writer = LsWriter::new(
             0,
-            ls_writer_rb,
-            flush_done_rb,
+            &rings.ls_writer_rb,
+            &rings.flush_done_rb,
             committed_gsn_ptr,
             MockFlushBackend::new(),
             signing,
@@ -1349,7 +1242,7 @@ mod tests {
         writer
     }
 
-    fn make_writer_with_max_size(max_size: usize) -> LsWriter<MockFlushBackend, NoSigningStrategy, NoMetadataStrategy> {
+    fn make_writer_with_max_size(rings: &LsWriterRingBuffersHolder, max_size: usize) -> LsWriter<'_, MockFlushBackend, NoSigningStrategy, NoMetadataStrategy> {
         let dir = make_test_dir();
 
         let manifest_path = format!("{}/0.manifest", dir);
@@ -1357,12 +1250,6 @@ mod tests {
 
         let manifest = Manifest::create(&dir, 0);
 
-        let ls_writer_rb = Arc::new(
-            MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
-        );
-        let flush_done_rb = Arc::new(
-            MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()
-        );
 
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
@@ -1371,8 +1258,8 @@ mod tests {
 
         let mut writer = LsWriter::new(
             0,
-            ls_writer_rb,
-            flush_done_rb,
+            &rings.ls_writer_rb,
+            &rings.flush_done_rb,
             committed_gsn_ptr,
             MockFlushBackend::new(),
             NoSigningStrategy,
@@ -1399,7 +1286,8 @@ mod tests {
 
     #[test]
     fn sign_batch_creates_sig_records() {
-        let mut writer = make_writer_with_signing();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer_with_signing(&rings);
 
         let mut slot1 = make_posting_slot(100, 500);
         slot1.posting.transfer_id_hi = 0;
@@ -1419,12 +1307,13 @@ mod tests {
 
     #[test]
     fn initialize_opens_file() {
-        let writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let writer = make_writer(&rings);
         assert!(writer.backend.fds_opened[0]);
         assert!(writer.backend.fds_opened[1]);
         assert_eq!(writer.backend.written.len(), 2);
-        assert_eq!(writer.backend.written[0].2, 0); // offset = 0
-        assert_eq!(writer.backend.written[0].1.len(), 4096); // full page
+        assert_eq!(writer.backend.written[0].2, 0);
+        assert_eq!(writer.backend.written[0].1.len(), 4096);
 
         assert_eq!(writer.backend.written[1].2, 0);
         assert_eq!(writer.backend.written[1].1.len(), CheckpointFileHeader::SIZE);
@@ -1432,7 +1321,8 @@ mod tests {
 
     #[test]
     fn new_initializes_empty_state() {
-        let writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let writer = make_writer(&rings);
         assert_eq!(writer.buffer_len, 0);
         assert_eq!(writer.write_offset, FILE_PAGE_SIZE as u64);
         assert!(!writer.flush_in_flight);
@@ -1443,7 +1333,8 @@ mod tests {
 
     #[test]
     fn process_add_to_heap_adds_to_ifmh() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_add_to_heap_slot(100));
         writer.process_message(&make_add_to_heap_slot(200));
@@ -1454,7 +1345,8 @@ mod tests {
 
     #[test]
     fn process_remove_from_heap_removes_from_ifmh() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_add_to_heap_slot(100));
         writer.process_message(&make_add_to_heap_slot(200));
@@ -1466,7 +1358,8 @@ mod tests {
 
     #[test]
     fn process_posting_appends_to_buffer() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_posting_slot(100, 500));
 
@@ -1475,7 +1368,8 @@ mod tests {
 
     #[test]
     fn process_multiple_postings_accumulates_buffer() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_posting_slot(100, 500));
         writer.process_message(&make_posting_slot(200, 300));
@@ -1486,7 +1380,8 @@ mod tests {
 
     #[test]
     fn process_flush_marker_adds_to_pending() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_flush_marker_slot(100, 1, 42));
 
@@ -1495,7 +1390,8 @@ mod tests {
 
     #[test]
     fn submit_flush_sends_buffer_to_backend() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_posting_slot(100, 500));
         writer.process_message(&make_flush_marker_slot(100, 1, 42));
@@ -1510,7 +1406,8 @@ mod tests {
 
     #[test]
     fn submit_flush_sets_in_flight() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_posting_slot(100, 500));
         writer.submit_flush();
@@ -1521,7 +1418,8 @@ mod tests {
 
     #[test]
     fn submit_flush_moves_pending_to_flush_pending_records() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_flush_marker_slot(100, 1, 42));
         writer.process_message(&make_flush_marker_slot(200, 2, 43));
@@ -1535,7 +1433,8 @@ mod tests {
 
     #[test]
     fn submit_flush_ignores_empty_buffer() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.submit_flush();
 
@@ -1545,7 +1444,8 @@ mod tests {
 
     #[test]
     fn submit_flush_ignores_if_already_in_flight() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_posting_slot(100, 500));
         writer.submit_flush();
@@ -1558,7 +1458,8 @@ mod tests {
 
     #[test]
     fn poll_completions_clears_buffer_and_advances_offset() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_posting_slot(100, 500));
         writer.submit_flush();
@@ -1575,7 +1476,8 @@ mod tests {
 
     #[test]
     fn poll_completions_removes_gsn_from_ifmh() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_add_to_heap_slot(100));
         writer.process_message(&make_add_to_heap_slot(200));
@@ -1591,7 +1493,9 @@ mod tests {
 
     #[test]
     fn poll_completions_sends_flush_done() {
-        let (mut writer, flush_done_rb) = make_writer_with_flush_done_rb();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
+        let flush_done_rb = &rings.flush_done_rb;
 
         writer.process_message(&make_add_to_heap_slot(100));
         writer.process_message(&make_posting_slot(100, 500));
@@ -1613,7 +1517,8 @@ mod tests {
 
     #[test]
     fn poll_completions_advances_committed_gsn() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_add_to_heap_slot(100));
         writer.process_message(&make_add_to_heap_slot(200));
@@ -1623,14 +1528,14 @@ mod tests {
         writer.submit_flush();
         writer.poll_and_handle_completions();
 
-        // committed_gsn = min(IFMH) - 1 = 200 - 1 = 199
         let committed = unsafe { *writer.global_committed_gsn };
         assert_eq!(committed, 199);
     }
 
     #[test]
     fn committed_gsn_equals_last_removed_when_ifmh_empty() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_add_to_heap_slot(100));
         writer.process_message(&make_posting_slot(100, 500));
@@ -1646,7 +1551,8 @@ mod tests {
 
     #[test]
     fn group_commit_multiple_postings_one_flush() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_add_to_heap_slot(100));
         writer.process_message(&make_add_to_heap_slot(200));
@@ -1677,7 +1583,8 @@ mod tests {
 
     #[test]
     fn sequential_flushes_advance_offset() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_add_to_heap_slot(100));
         writer.process_message(&make_posting_slot(100, 500));
@@ -1704,7 +1611,8 @@ mod tests {
 
     #[test]
     fn poll_noop_when_no_flush_in_flight() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.poll_and_handle_completions();
 
@@ -1714,7 +1622,8 @@ mod tests {
 
     #[test]
     fn new_postings_accumulate_during_in_flight() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_posting_slot(100, 500));
         writer.submit_flush();
@@ -1734,14 +1643,14 @@ mod tests {
 
     #[test]
     fn remove_from_heap_advances_committed_gsn() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_add_to_heap_slot(100));
         writer.process_message(&make_add_to_heap_slot(200));
 
         writer.process_message(&make_remove_from_heap_slot(100));
 
-        // committed_gsn = min(IFMH) - 1 = 200 - 1 = 199
         let committed = unsafe { *writer.global_committed_gsn };
         assert_eq!(committed, 199);
     }
@@ -1783,7 +1692,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(LsSignFileHeader, public_key), 32);
         assert_eq!(std::mem::offset_of!(LsSignFileHeader, public_key), 32);
         assert_eq!(std::mem::offset_of!(LsSignFileHeader, genesis_hash), 64);
-        assert_eq!(std::mem::offset_of!(LsSignFileHeader, checksum), 120);
+        assert_eq!(std::mem::offset_of!(LsSignFileHeader, checksum), 124);
     }
 
     #[test]
@@ -1799,19 +1708,21 @@ mod tests {
         assert_eq!(std::mem::offset_of!(LsMetaFileHeader, data_offset), 28);
         assert_eq!(std::mem::offset_of!(LsMetaFileHeader, max_file_size), 32);
         assert_eq!(std::mem::offset_of!(LsMetaFileHeader, linked_ls_file_seq), 40);
-        assert_eq!(std::mem::offset_of!(LsMetaFileHeader, checksum), 120);
+        assert_eq!(std::mem::offset_of!(LsMetaFileHeader, checksum), 124);
     }
 
     #[test]
     fn metadata_enabled_initializes_meta_buffer() {
-        let writer = make_writer_with_metadata(256);
+        let rings = LsWriterRingBuffersHolder::new();
+        let writer = make_writer_with_metadata(&rings, 256);
         assert!(writer.metadata_strategy.is_enabled());
         assert_eq!(writer.metadata_strategy.record_size(), 256);
     }
 
     #[test]
     fn metadata_disabled_no_meta_buffer() {
-        let writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let writer = make_writer(&rings);
         assert!(!writer.metadata_strategy.is_enabled());
     }
 
@@ -1820,7 +1731,7 @@ mod tests {
         let header = LsFileHeader::new(false, 16, 256 * 1024 * 1024, 0, 0, false);
 
         assert_ne!(header.checksum, 0);
-        assert!(unsafe { header.verify_checksum() });
+        assert!(header.verify_checksum());
     }
 
     #[test]
@@ -1830,13 +1741,14 @@ mod tests {
 
         assert_eq!(page.len(), 4096);
         let magic = u64::from_le_bytes(page[0..8].try_into().unwrap());
-        assert_eq!(magic, crate::ls_file_header::LS_FILE_MAGIC); // 'LDGRSTRG'
+        assert_eq!(magic, crate::ls_file_header::LS_FILE_MAGIC);
         assert!(page[128..].iter().all(|&b| b == 0));
     }
 
     #[test]
     fn initialize_writes_header_at_offset_zero() {
-        let writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let writer = make_writer(&rings);
 
         assert!(!writer.backend.written.is_empty());
         let (_, data, offset) = &writer.backend.written[0];
@@ -1851,18 +1763,17 @@ mod tests {
 
     #[test]
     fn checkpoint_record_written_after_flush_completion() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_add_to_heap_slot(100));
         writer.process_message(&make_posting_slot(100, 500));
         writer.process_message(&make_flush_marker_slot(100, 1, 42));
 
         writer.submit_flush();
-        // writes: LS header + checkpoint header + ls flush = 3
         assert_eq!(writer.backend.written.len(), 3);
 
         writer.poll_and_handle_completions();
-        // + checkpoint record = 4
         assert_eq!(writer.backend.written.len(), 4);
 
         let (handle, data, offset) = &writer.backend.written[3];
@@ -1873,7 +1784,8 @@ mod tests {
 
     #[test]
     fn checkpoint_batch_seq_increments() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_posting_slot(100, 500));
         writer.submit_flush();
@@ -1888,7 +1800,8 @@ mod tests {
 
     #[test]
     fn checkpoint_write_offset_advances() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         assert_eq!(writer.checkpoint_write_offset, CheckpointFileHeader::DATA_OFFSET as u64);
 
@@ -1913,7 +1826,8 @@ mod tests {
 
     #[test]
     fn checkpoint_first_posting_offset_correct() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_posting_slot(100, 500));
         writer.submit_flush();
@@ -1923,7 +1837,8 @@ mod tests {
 
     #[test]
     fn checkpoint_posting_count_correct() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_posting_slot(100, 500));
         writer.process_message(&make_posting_slot(200, 300));
@@ -1935,36 +1850,39 @@ mod tests {
 
     #[test]
     fn checkpoint_record_content_correct() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         writer.process_message(&make_posting_slot(100, 500));
         writer.process_message(&make_posting_slot(200, 300));
         writer.submit_flush();
         writer.poll_and_handle_completions();
 
-        let (_, data, _) = &writer.backend.written[3]; // checkpoint record
-        let record = unsafe { CheckpointRecord::from_bytes(data) };
+        let (_, data, _) = &writer.backend.written[3];
+        let mut record = CheckpointRecord::zeroed();
+        record.as_bytes_mut().copy_from_slice(&data[..CheckpointRecord::SIZE]);
 
         assert_eq!(record.first_posting_offset, LsFileHeader::DATA_OFFSET as u64);
         assert_eq!(record.posting_count, 2);
         assert_eq!(record.batch_seq, 0);
-        assert!(unsafe { record.verify_checksum() });
+        assert!(record.verify_checksum());
     }
 
     #[test]
     fn checkpoint_header_written_at_initialize() {
-        let writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let writer = make_writer(&rings);
 
-        // writes[1] = checkpoint header (writes[0] = LS header)
         let (handle, data, offset) = &writer.backend.written[1];
         assert_eq!(*handle, writer.checkpoint_handle_index);
         assert_eq!(data.len(), CheckpointFileHeader::SIZE);
         assert_eq!(*offset, 0u64);
 
-        let header = unsafe { CheckpointFileHeader::from_bytes(data) };
+        let mut header = CheckpointFileHeader::zeroed();
+        header.as_bytes_mut().copy_from_slice(&data[..CheckpointFileHeader::SIZE]);
         assert_eq!(header.magic, crate::checkpoint_file_header::CHECKPOINT_FILE_MAGIC);
         assert_eq!(header.linked_ls_file_seq, 0);
-        assert!(unsafe { header.verify_checksum() });
+        assert!(header.verify_checksum());
     }
 
     #[test]
@@ -2021,26 +1939,29 @@ mod tests {
 
     #[test]
     fn should_rotate_false_when_max_size_zero() {
-        let writer = make_writer(); // max_ls_file_size = 0
+        let rings = LsWriterRingBuffersHolder::new();
+        let writer = make_writer(&rings);
         assert!(!writer.should_rotate());
     }
 
     #[test]
     fn should_rotate_false_when_below_max_size() {
-        let mut writer = make_writer_with_max_size(1024 * 1024); // 1MB
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer_with_max_size(&rings, 1024 * 1024);
         assert!(!writer.should_rotate());
     }
 
     #[test]
     fn should_rotate_true_when_at_max_size() {
-        let mut writer = make_writer_with_max_size(4096);
-        // max_ls_file_size = 4096
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer_with_max_size(&rings, 4096);
         assert!(writer.should_rotate());
     }
 
     #[test]
     fn rotate_opens_new_files() {
-        let mut writer = make_writer_with_max_size(4096);
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer_with_max_size(&rings, 4096);
 
         let old_path = writer.current_ls_file_path.clone();
 
@@ -2056,7 +1977,8 @@ mod tests {
 
     #[test]
     fn rotate_resets_offsets() {
-        let mut writer = make_writer_with_max_size(4096);
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer_with_max_size(&rings, 4096);
 
         writer.write_offset = 8192;
         writer.batch_seq = 5;
@@ -2071,7 +1993,8 @@ mod tests {
 
     #[test]
     fn rotate_increments_file_seq() {
-        let mut writer = make_writer_with_max_size(4096);
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer_with_max_size(&rings, 4096);
         assert_eq!(writer.file_seq, 0);
 
         writer.rotate();
@@ -2083,7 +2006,8 @@ mod tests {
 
     #[test]
     fn rotate_reuses_handle_indices() {
-        let mut writer = make_writer_with_max_size(4096);
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer_with_max_size(&rings, 4096);
 
         let first_ls = writer.ls_handle_index;
         let first_checkpoint = writer.checkpoint_handle_index;
@@ -2101,8 +2025,8 @@ mod tests {
 
     #[test]
     fn auto_rotate_after_flush_completion() {
-        // max_ls_file_size = 4096 + 4096 = 8192
-        let mut writer = make_writer_with_max_size(8192);
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer_with_max_size(&rings, 8192);
 
         let initial_file_seq = writer.file_seq;
 
@@ -2120,8 +2044,8 @@ mod tests {
 
     #[test]
     fn no_rotate_when_below_threshold() {
-        // max_ls_file_size = 8192 + 4096 = 12288
-        let mut writer = make_writer_with_max_size(12288);
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer_with_max_size(&rings, 12288);
 
         let initial_file_seq = writer.file_seq;
 
@@ -2137,7 +2061,7 @@ mod tests {
         let name = generate_ls_filename(0, 0);
         assert!(name.starts_with("ls_"));
         assert!(name.ends_with("-0-0.ls"));
-        assert_eq!(name.len(), 29); // ls_ + YYYYMMDD-HHMMSS-mmm + -0-0.ls
+        assert_eq!(name.len(), 29);
 
         let name2 = generate_ls_filename(2, 15);
         assert!(name2.ends_with("-2-15.ls"));
@@ -2157,15 +2081,15 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ManifestEntry, metadata_enabled), 10);
         assert_eq!(std::mem::offset_of!(ManifestEntry, record_size), 12);
         assert_eq!(std::mem::offset_of!(ManifestEntry, rules_checksum), 16);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, _pad2), 20);
         assert_eq!(std::mem::offset_of!(ManifestEntry, gsn_min), 24);
         assert_eq!(std::mem::offset_of!(ManifestEntry, gsn_max), 32);
         assert_eq!(std::mem::offset_of!(ManifestEntry, timestamp_min_ns), 40);
         assert_eq!(std::mem::offset_of!(ManifestEntry, timestamp_max_ns), 48);
-        assert_eq!(std::mem::offset_of!(ManifestEntry, checksum), 56);
 
-        // cache line 2: filename
-        assert_eq!(std::mem::offset_of!(ManifestEntry, filename), 64);
-
+        assert_eq!(std::mem::offset_of!(ManifestEntry, filename), 56);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, _pad3), 120);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, checksum), 124);
     }
 
     #[test]
@@ -2183,9 +2107,9 @@ mod tests {
         entry.file_seq = 1;
         entry.set_filename("test.ls");
 
-        unsafe { entry.compute_checksum(); }
+        entry.fill_checksum();
         assert_ne!(entry.checksum, 0);
-        assert!(unsafe { entry.verify_checksum() });
+        assert!(entry.verify_checksum());
     }
 
     #[test]
@@ -2205,8 +2129,7 @@ mod tests {
 
         let manifest = Manifest::create(&dir, 0);
 
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+        let rings = LsWriterRingBuffersHolder::new();
 
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
@@ -2214,7 +2137,7 @@ mod tests {
         let (index_tx, _) = mpsc::channel();
 
         let mut writer = LsWriter::new(
-            0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
+            0, &rings.ls_writer_rb, &rings.flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
             dir.to_string(), 1024 * 1024, 64, K0, K1, 64, 2, 512, 16, 4,
             0, manifest, false,index_tx,
@@ -2241,8 +2164,7 @@ mod tests {
 
         let manifest = Manifest::create(&dir, 0);
 
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+        let rings = LsWriterRingBuffersHolder::new();
 
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
@@ -2250,7 +2172,7 @@ mod tests {
         let (index_tx, _) = mpsc::channel();
 
         let mut writer = LsWriter::new(
-            0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
+            0, &rings.ls_writer_rb, &rings.flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
             dir.to_string(), 1024 * 1024, 64, K0, K1, 64, 2, 512, 16, 4,
             0, manifest, false, index_tx,
@@ -2292,8 +2214,7 @@ mod tests {
         entry.set_filename("ls_old-0-0.ls");
         manifest.append_current_entry(&mut entry);
 
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+        let rings = LsWriterRingBuffersHolder::new();
 
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
@@ -2301,7 +2222,7 @@ mod tests {
         let (index_tx, _) = mpsc::channel();
 
         let mut writer = LsWriter::new(
-            0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
+            0, &rings.ls_writer_rb, &rings.flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
             dir.to_string(), 1024, 64, K0, K1, 64, 2, 512, 16, 4,
             0, manifest, false, index_tx,
@@ -2331,11 +2252,13 @@ mod tests {
             use std::io::Write;
             let mut f = std::fs::File::create(&checkpoint_path).unwrap();
             let header = CheckpointFileHeader::new(0);
-            f.write_all(unsafe { header.as_bytes() }).unwrap();
+            f.write_all(header.as_bytes()).unwrap();
             f.sync_all().unwrap();
         }
 
-        let (offset, batch_seq) = crate::recovery::recover_checkpoint_state(&checkpoint_path);
+        let recovered = crate::recovery::recover_checkpoint_state(&checkpoint_path);
+        let offset = recovered.write_offset;
+        let batch_seq = recovered.batch_seq;
 
         assert_eq!(offset, CheckpointFileHeader::DATA_OFFSET as u64);
         assert_eq!(batch_seq, 0);
@@ -2353,34 +2276,37 @@ mod tests {
             let mut f = std::fs::File::create(&checkpoint_path).unwrap();
 
             let header = CheckpointFileHeader::new(0);
-            f.write_all(unsafe { header.as_bytes() }).unwrap();
+            f.write_all(header.as_bytes()).unwrap();
 
-            // 3 checkpoint records
             for i in 0..3u32 {
                 let record = CheckpointRecord::new(
-                    4096 + i as u64 * 4096, // first_posting_offset
-                    32,                      // posting_count
-                    i,                       // batch_seq
+                    4096 + i as u64 * 4096,
+                    32,
+                    i,
                 );
-                f.write_all(unsafe { record.as_bytes() }).unwrap();
+                f.write_all(record.as_bytes()).unwrap();
             }
             f.sync_all().unwrap();
         }
 
-        let (offset, batch_seq) = crate::recovery::recover_checkpoint_state(&checkpoint_path);
+        let recovered = crate::recovery::recover_checkpoint_state(&checkpoint_path);
+        let offset = recovered.write_offset;
+        let batch_seq = recovered.batch_seq;
 
         assert_eq!(
         offset,
         CheckpointFileHeader::DATA_OFFSET as u64 + 3 * CheckpointRecord::SIZE as u64,
     );
-        assert_eq!(batch_seq, 3); // last batch_seq (2) + 1
+        assert_eq!(batch_seq, 3);
 
         cleanup_dir(&dir);
     }
 
     #[test]
     fn recover_checkpoint_state_no_file() {
-        let (offset, batch_seq) = crate::recovery::recover_checkpoint_state("/tmp/nonexistent-checkpoint-file");
+        let recovered = crate::recovery::recover_checkpoint_state("/tmp/nonexistent-checkpoint-file");
+        let offset = recovered.write_offset;
+        let batch_seq = recovered.batch_seq;
 
         assert_eq!(offset, CheckpointFileHeader::DATA_OFFSET as u64);
         assert_eq!(batch_seq, 0);
@@ -2419,7 +2345,6 @@ mod tests {
             use std::io::Write;
             let mut f = std::fs::File::create(&ls_path).unwrap();
 
-            // Header page
             let header = LsFileHeader::new(false, 16, 256 * 1024 * 1024, 0, 0, false);
             let page = header.to_page();
             f.write_all(&page).unwrap();
@@ -2477,7 +2402,7 @@ mod tests {
                 record.set_magic();
                 record.gsn = 1 + i;
                 record.timestamp_ns = 1700000000_000_000_000 + i;
-                unsafe { record.compute_checksum(); }
+                record.fill_checksum();
 
                 let offset = i as usize * PostingRecord::SIZE;
                 unsafe {
@@ -2496,7 +2421,7 @@ mod tests {
                 record.set_magic();
                 record.gsn = 33 + i;
                 record.timestamp_ns = 1700000000_000_000_032 + i;
-                unsafe { record.compute_checksum(); }
+                record.fill_checksum();
 
                 let offset = i as usize * PostingRecord::SIZE;
                 unsafe {
@@ -2513,7 +2438,7 @@ mod tests {
 
         let state = crate::recovery::recover_ls_state(&ls_path);
 
-        assert_eq!(state.postings_count, 37); // 32 + 5
+        assert_eq!(state.postings_count, 37);
         assert_eq!(state.gsn_min, 1);
         assert_eq!(state.gsn_max, 37);
         assert_eq!(
@@ -2568,7 +2493,7 @@ mod tests {
 
             r1.fill_checksum();
 
-            r1.amount = 999; // corrupt after checksum
+            r1.amount = 999;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     &r1 as *const PostingRecord as *const u8,
@@ -2599,8 +2524,7 @@ mod tests {
             std::fs::remove_file(&manifest_path).ok();
             let manifest = Manifest::create(&dir, 0);
 
-            let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-            let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+            let rings = LsWriterRingBuffersHolder::new();
 
             unsafe { TEST_COMMITTED_GSN = 0; }
             let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
@@ -2608,7 +2532,7 @@ mod tests {
             let (index_tx, _) = mpsc::channel();
 
             let mut writer = LsWriter::new(
-                0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
+                0, &rings.ls_writer_rb, &rings.flush_done_rb, committed_gsn_ptr,
                 PortableFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
                 dir.to_string(), 1024 * 1024, 64, K0, K1,
                 64, 2, 512, 16,
@@ -2616,7 +2540,6 @@ mod tests {
             );
             writer.startup();
 
-            // 2 postings
             let mut slot1 = make_posting_slot(100, 500);
             slot1.posting.timestamp_ns = 1700000000_000_000_000;
             slot1.posting.fill_checksum();
@@ -2635,13 +2558,12 @@ mod tests {
             writer.poll_and_handle_completions();
 
             ls_path = writer.current_ls_file_path().to_string();
-        } // writer dropped, files closed
+        }
 
         {
             let manifest = Manifest::open(&dir, 0);
 
-            let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-            let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+            let rings = LsWriterRingBuffersHolder::new();
 
             unsafe { TEST_COMMITTED_GSN = 0; }
             let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
@@ -2649,7 +2571,7 @@ mod tests {
             let (index_tx, _) = mpsc::channel();
 
             let mut writer = LsWriter::new(
-                0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
+                0, &rings.ls_writer_rb, &rings.flush_done_rb, committed_gsn_ptr,
                 PortableFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
                 dir.to_string(), 1024 * 1024, 64, K0, K1,
                 64, 2, 512, 16, 4, 0,
@@ -2702,14 +2624,13 @@ mod tests {
 
         let (index_tx, index_rx) = std::sync::mpsc::channel();
 
-        let ls_writer_rb = Arc::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap());
-        let flush_done_rb = Arc::new(MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap());
+        let rings = LsWriterRingBuffersHolder::new();
 
         unsafe { TEST_COMMITTED_GSN = 0; }
         let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
 
         let mut writer = LsWriter::new(
-            0, ls_writer_rb, flush_done_rb, committed_gsn_ptr,
+            0, &rings.ls_writer_rb, &rings.flush_done_rb, committed_gsn_ptr,
             MockFlushBackend::new(), NoSigningStrategy, NoMetadataStrategy,
             dir.to_string(), 4096, 64, K0, K1, 64, 2, 512, 16, 4,
             0, manifest, false, index_tx,
@@ -2737,7 +2658,8 @@ mod tests {
 
     #[test]
     fn posting_accumulates_index_entries() {
-        let mut writer = make_writer();
+        let rings = LsWriterRingBuffersHolder::new();
+        let mut writer = make_writer(&rings);
 
         let mut slot1 = make_posting_slot(100, 500);
         slot1.posting.account_id_hi = 0;

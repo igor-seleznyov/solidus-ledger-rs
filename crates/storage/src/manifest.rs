@@ -21,7 +21,7 @@ impl Manifest {
             .expect(&format!("failed to create manifest file: {}", path));
 
         let header = ManifestHeader::new(shard_id as u16);
-        let header_bytes = unsafe { header.as_bytes() };
+        let header_bytes = header.as_bytes();
 
         file.write_all(header_bytes)
             .expect("Failed to write manifest header");
@@ -38,16 +38,18 @@ impl Manifest {
             .read(true)
             .write(true)
             .open(&path)
-            .expect(&format!("failed to open manifest file: {}", path));
+            .expect(
+                &format!("failed to open manifest file: {}", path)
+            );
 
         let mut header = ManifestHeader::zeroed();
         file.read_exact(
-            unsafe { header.as_bytes_mut() }
+            header.as_bytes_mut()
         ).expect("Failed to read manifest header");
 
         assert_eq!(header.magic, MANIFEST_HEADER_MAGIC, "Invalid manifest magic");
         assert_eq!(header.format_version, MANIFEST_FORMAT_VERSION, "Unsupported manifest version");
-        assert!(unsafe { header.verify_checksum() }, "Manifest header checksum mismatch");
+        assert!(header.verify_checksum(), "Manifest header checksum mismatch");
 
         Self { file, header, path }
     }
@@ -59,14 +61,12 @@ impl Manifest {
 
     pub fn append_current_entry(&mut self, entry: &mut ManifestEntry) {
         entry.status = MANIFEST_STATUS_CURRENT;
-        unsafe {
-            entry.compute_checksum();
-        }
+        entry.fill_checksum();
 
         let entry_offset = ManifestHeader::SIZE as u64
             + self.header.entries_count as u64 * ManifestEntry::SIZE as u64;
 
-        let entry_bytes = unsafe { entry.as_bytes() };
+        let entry_bytes = entry.as_bytes();
 
         self.file.seek(SeekFrom::Start(entry_offset))
             .expect("Failed to seek manifest entry position");
@@ -76,9 +76,9 @@ impl Manifest {
         self.header.current_entry_index = self.header.entries_count;
         self.header.entries_count += 1;
         self.header.last_updated_at_ns = Self::now_ns();
-        unsafe { self.header.compute_checksum(); }
+        self.header.fill_checksum();
 
-        let header_bytes = unsafe { self.header.as_bytes() };
+        let header_bytes = self.header.as_bytes();
 
         self.file.seek(SeekFrom::Start(0))
             .expect("Failed to seek to header position");
@@ -110,16 +110,16 @@ impl Manifest {
             .expect("Failed to seek to manifest entry for update");
 
         self.file.read_exact(
-            unsafe { entry.as_bytes_mut() }
+            entry.as_bytes_mut()
         ).expect("Failed to read manifest entry for update");
 
         entry.status = MANIFEST_STATUS_ROTATED;
         entry.gsn_max = gsn_max;
         entry.timestamp_max_ns = timestamp_max_ns;
 
-        unsafe { entry.compute_checksum(); }
+        entry.fill_checksum();
 
-        let entry_bytes = unsafe { entry.as_bytes() };
+        let entry_bytes = entry.as_bytes();
 
         self.file.seek(SeekFrom::Start(entry_offset))
             .expect("Failed to seek to entry for write-back");
@@ -127,11 +127,9 @@ impl Manifest {
             .expect("Failed to write update entry");
 
         self.header.last_updated_at_ns = Self::now_ns();
-        unsafe {
-            self.header.compute_checksum();
-        }
+        self.header.fill_checksum();
 
-        let header_bytes = unsafe { self.header.as_bytes() };
+        let header_bytes = self.header.as_bytes();
 
         self.file.seek(SeekFrom::Start(0))
             .expect("Failed to seek to header for update");
@@ -161,14 +159,14 @@ impl Manifest {
         let mut entry = ManifestEntry::zeroed();
         self.file.seek(SeekFrom::Start(entry_offset))
             .expect("Failed to seek to manifest entry for min values update");
-        self.file.read_exact(unsafe { entry.as_bytes_mut() })
+        self.file.read_exact(entry.as_bytes_mut())
             .expect("Failed to read manifest entry for min values update");
         
         entry.gsn_min = gsn_min;
         entry.timestamp_min_ns = timestamp_min_ns;
-        unsafe { entry.compute_checksum(); }
+        entry.fill_checksum();
         
-        let entry_bytes = unsafe { entry.as_bytes() };
+        let entry_bytes = entry.as_bytes();
         
         self.file.seek(SeekFrom::Start(entry_offset))
             .expect("Failed to seek to entry for min values write-back");
@@ -176,11 +174,9 @@ impl Manifest {
             .expect("Failed to write updated entry min values");
         
         self.header.last_updated_at_ns = Self::now_ns();
-        unsafe {
-            self.header.compute_checksum();
-        }
+        self.header.fill_checksum();
         
-        let header_bytes = unsafe { self.header.as_bytes() };
+        let header_bytes = self.header.as_bytes();
         self.file.seek(SeekFrom::Start(0))
             .expect("Failed to seek to header for min values update");
         self.file.write_all(header_bytes)
@@ -205,11 +201,11 @@ impl Manifest {
         self.file.seek(SeekFrom::Start(entry_offset))
             .expect("Failed to seek to entry");
         self.file.read_exact(
-            unsafe { entry.as_bytes_mut() }
+            entry.as_bytes_mut()
         ).expect("Failed to read entry");
 
         assert!(
-            unsafe { entry.verify_checksum() },
+            entry.verify_checksum(),
             "ManifestEntry checksum mismatch at index {}",
             entry_index,
         );
@@ -311,7 +307,7 @@ mod tests {
         let read_back = manifest.read_current_entry();
         assert_eq!(read_back.file_seq, 0);
         assert_eq!(read_back.filename_str(), "ls_20260403-120000-000-0-0.ls");
-        assert!(unsafe { read_back.verify_checksum() });
+        assert!(read_back.verify_checksum());
 
         cleanup(&dir);
     }
@@ -355,7 +351,7 @@ mod tests {
         assert_eq!(finalized.status, MANIFEST_STATUS_ROTATED);
         assert_eq!(finalized.gsn_max, 1000);
         assert_eq!(finalized.timestamp_max_ns, 1700000000_000_000_000);
-        assert!(unsafe { finalized.verify_checksum() });
+        assert!(finalized.verify_checksum());
 
         cleanup(&dir);
     }
@@ -398,9 +394,8 @@ mod tests {
             let mut entry = make_entry(0, "ls_persist-0-0.ls");
             entry.gsn_min = 42;
             manifest.append_current_entry(&mut entry);
-        } // drop → file closed
+        }
 
-        // Reopen
         let mut manifest = Manifest::open(&dir, 0);
         assert_eq!(manifest.entries_count(), 1);
 
@@ -417,7 +412,7 @@ mod tests {
     fn read_entry_out_of_range() {
         let dir = make_temp_dir("out-of-range");
         let mut manifest = Manifest::create(&dir, 0);
-        manifest.read_entry(0); // entries_count = 0
+        manifest.read_entry(0);
         cleanup(&dir);
     }
 
@@ -438,7 +433,7 @@ mod tests {
         let e = manifest.read_entry(0);
         assert_eq!(e.gsn_min, 42);
         assert_eq!(e.timestamp_min_ns, 1700000000_000_000_000);
-        assert!(unsafe { e.verify_checksum() });
+        assert!(e.verify_checksum());
 
         cleanup(&dir);
     }
@@ -480,7 +475,7 @@ mod tests {
         assert_eq!(e.gsn_max, 500);
         assert_eq!(e.timestamp_min_ns, 1700000000_000_000_000);
         assert_eq!(e.timestamp_max_ns, 1700000500_000_000_000);
-        assert!(unsafe { e.verify_checksum() });
+        assert!(e.verify_checksum());
 
         cleanup(&dir);
     }

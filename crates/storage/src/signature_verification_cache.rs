@@ -18,18 +18,20 @@ impl SignatureVerificationCache {
         }
     }
 
+    /// Look up `ls_sign_path` in the cache; if absent, verify and insert.
+    ///
+    /// Uses `HashMap::entry` for a single hash probe rather than the
+    /// `contains_key` + index double-probe pattern. `verify_ls_signatures`
+    /// is called lazily only on cache miss (identical semantics to the
+    /// prior `contains_key` guard).
     pub fn verify_or_cached(&mut self, ls_sign_path: &str) -> SignatureVerifyResult {
-        if !self.entries.contains_key(ls_sign_path) {
-            let result = verify_ls_signatures(ls_sign_path);
-            self.entries.insert(
-                ls_sign_path.to_string(),
-                CacheEntry {
+        self.entries.entry(ls_sign_path.to_string())
+            .or_insert_with(
+                || CacheEntry {
                     verified_at: Instant::now(),
-                    result,
+                    result: verify_ls_signatures(ls_sign_path),
                 }
-            );
-        }
-        self.entries[ls_sign_path].result.clone()
+            ).result.clone()
     }
 
     pub fn invalidate(&mut self, ls_sign_path: &str) {

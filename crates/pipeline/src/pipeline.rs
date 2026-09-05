@@ -1,25 +1,24 @@
-use std::sync::Arc;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
 use crate::incoming_slot::IncomingSlot;
 use crate::partition_slot::PartitionSlot;
 use crate::sequencer::Sequencer;
 use crate::pipeline_handler::PipelineHandler;
 
-pub struct Pipeline<H: PipelineHandler> {
+pub struct Pipeline<'scope, H: PipelineHandler> {
     id: usize,
-    incoming: Arc<MpscRingBuffer<IncomingSlot>>,
+    incoming: &'scope MpscRingBuffer<IncomingSlot>,
     sequencer: Sequencer,
     batch_size: usize,
-    partition_rb: Vec<Arc<MpscRingBuffer<PartitionSlot>>>,
+    partition_rb: &'scope [MpscRingBuffer<PartitionSlot>],
     handler: H,
 }
 
-impl <H: PipelineHandler> Pipeline<H> {
+impl <'scope, H: PipelineHandler> Pipeline<'scope, H> {
     pub fn new(
         id: usize,
-        incoming: Arc<MpscRingBuffer<IncomingSlot>>,
+        incoming: &'scope MpscRingBuffer<IncomingSlot>,
         batch_size: usize,
-        partition_rb: Vec<Arc<MpscRingBuffer<PartitionSlot>>>,
+        partition_rb: &'scope [MpscRingBuffer<PartitionSlot>],
         handler: H,
     ) -> Self {
         Self {
@@ -47,17 +46,7 @@ impl <H: PipelineHandler> Pipeline<H> {
                 let slot = batch.slot(i);
                 let gsn = self.sequencer.next();
 
-/*                println!(
-                    "[pipeline {}] GSN={} transfer_id={:02X?} amount={} debit={:02X?} credit={:02X?}",
-                    self.id,
-                    gsn,
-                    &slot.transfer_id[..4],
-                    i64::from_be_bytes(slot.amount),
-                    &slot.debit_account_id[..4],
-                    &slot.credit_account_id[..4],
-                );
-*/
-                self.handler.handle(slot, gsn, &self.partition_rb);
+                self.handler.handle(slot, gsn, self.partition_rb);
             }
 
             batch.release();

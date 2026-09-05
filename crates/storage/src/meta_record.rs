@@ -1,6 +1,3 @@
-use common::crc32c::crc32c;
-
-// 'LDSTMTDR' little-endian LeDger STorage MeTaData Record
 pub const META_RECORD_MAGIC: u64 = 0x5244_544D_5453_444C;
 
 pub struct MetaRecordWriter {
@@ -140,7 +137,6 @@ mod tests {
         let magic = u64::from_ne_bytes(buffer[0..8].try_into().unwrap());
         assert_eq!(magic, META_RECORD_MAGIC);
 
-        // payload starts at 32 (was 24)
         assert_eq!(buffer[32], 1);
         assert_eq!(buffer[33], 2);
         assert_eq!(buffer[34], 3);

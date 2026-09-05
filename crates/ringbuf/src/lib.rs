@@ -5,3 +5,4 @@ pub mod spsc_ring_buffer;
 pub mod batch;
 pub mod sequence_mem_barrier;
 pub mod hash_table_slot_status;
+pub mod wait;

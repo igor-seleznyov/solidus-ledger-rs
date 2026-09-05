@@ -1,7 +1,5 @@
-use common::crc32c;
 use common::crc32c::crc32c;
 
-// LeDger STorage ManiFest ENtry magic word = 'LDSTMFEN'
 pub const MANIFEST_ENTRY_MAGIC: u64 = 0x4E45_464D_5453_444C;
 
 pub const MANIFEST_STATUS_CURRENT: u8 = 0;
@@ -17,16 +15,27 @@ pub struct ManifestEntry {
     pub _pad1: u8,
     pub record_size: u32,
     pub rules_checksum: u32,
-    pub _ipad2: [u8; 4],
+    pub _pad2: [u8; 4],
     pub gsn_min: u64,
     pub gsn_max: u64,
     pub timestamp_min_ns: u64,
     pub timestamp_max_ns: u64,
-    pub checksum: u32,
-    pub _pad3: [u8; 4],
-
     pub filename: [u8; 64],
+    pub _pad3: [u8; 4],
+    pub checksum: u32,
 }
+const _: () = assert!(
+    std::mem::size_of::<ManifestEntry>()
+        == size_of::<u64>() * 5
+                + size_of::<u8>() * 4
+                + size_of::<u32>() * 3
+                + size_of::<[u8; 4]>() * 2
+                + size_of::<[u8; 64]>(),
+    "ManifestEntry is larger than its fields: the compiler inserted alignment \
+     padding. Declare it as an explicit field so the layout is stated, and \
+     so the checksum stays the record's final bytes",
+);
+
 
 impl ManifestEntry {
     pub const SIZE: usize = std::mem::size_of::<ManifestEntry>();
@@ -52,38 +61,38 @@ impl ManifestEntry {
         std::str::from_utf8(&self.filename[..len])
             .expect("Manifest entry filename is not valid UTF-8")
     }
-    
-    pub unsafe fn compute_checksum(&mut self) {
-        self.checksum = 0;
+
+    /// Compute CRC32C over bytes `[0..SIZE - 4)`, excluding `checksum`.
+    /// Safe to call on PROT_READ mmap (no mutation of `self`).
+    ///
+    /// # Safety (internal)
+    ///
+    /// The single `unsafe` block builds a `[0..SIZE - 4)` byte view over
+    /// `self`. Valid because `self` is a live `&ManifestEntry` of exactly
+    /// `SIZE` bytes; the view excludes the trailing `checksum`; no
+    /// mutation occurs, so it is sound on read-only memory.
+    pub fn compute_checksum(&self) -> u32 {
+        const PAYLOAD: usize = ManifestEntry::SIZE - std::mem::size_of::<u32>();
         let bytes = unsafe {
             std::slice::from_raw_parts(
-                self as *const ManifestEntry as *const u8,
-                Self::SIZE,
+                self as *const Self as *const u8,
+                PAYLOAD,
             )
         };
-        self.checksum = unsafe { crc32c::crc32c(bytes.as_ptr(), bytes.len()) };
+        unsafe {
+            crc32c(bytes.as_ptr(), bytes.len())
+        }
+    }
+
+    pub fn fill_checksum(&mut self) {
+        self.checksum = self.compute_checksum();
+    }
+
+    pub fn verify_checksum(&self) -> bool {
+        self.checksum == self.compute_checksum()
     }
     
-    pub unsafe fn verify_checksum(&self) -> bool {
-        let saved = self.checksum;
-        let self_mut = self as *const ManifestEntry as *mut ManifestEntry;
-        unsafe {
-            (*self_mut).checksum = 0
-        }
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                self as *const ManifestEntry as *const u8,
-                Self::SIZE,
-            )
-        };
-        let computed = unsafe { crc32c::crc32c(bytes.as_ptr(), bytes.len()) };
-        unsafe {
-            (*self_mut).checksum = saved
-        }
-        computed == saved
-    }
-    
-    pub unsafe fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
                 self as *const ManifestEntry as *const u8,
@@ -92,7 +101,7 @@ impl ManifestEntry {
         }
     }
 
-    pub unsafe fn as_bytes_mut(&mut self) -> &mut [u8] {
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         unsafe {
             std::slice::from_raw_parts_mut(
                 self as *mut ManifestEntry as *mut u8,
@@ -101,6 +110,10 @@ impl ManifestEntry {
         }
     }
 }
+
+const _: () = assert!(
+    std::mem::offset_of!(ManifestEntry, checksum) == ManifestEntry::SIZE - std::mem::size_of::<u32>()
+);
 
 #[cfg(test)]
 mod tests {
@@ -115,21 +128,21 @@ mod tests {
 
     #[test]
     fn layout_offsets() {
-        // cache line 1: metadata
         assert_eq!(std::mem::offset_of!(ManifestEntry, file_seq), 0);
         assert_eq!(std::mem::offset_of!(ManifestEntry, status), 8);
         assert_eq!(std::mem::offset_of!(ManifestEntry, signing_enabled), 9);
         assert_eq!(std::mem::offset_of!(ManifestEntry, metadata_enabled), 10);
         assert_eq!(std::mem::offset_of!(ManifestEntry, record_size), 12);
         assert_eq!(std::mem::offset_of!(ManifestEntry, rules_checksum), 16);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, _pad2), 20);
         assert_eq!(std::mem::offset_of!(ManifestEntry, gsn_min), 24);
         assert_eq!(std::mem::offset_of!(ManifestEntry, gsn_max), 32);
         assert_eq!(std::mem::offset_of!(ManifestEntry, timestamp_min_ns), 40);
         assert_eq!(std::mem::offset_of!(ManifestEntry, timestamp_max_ns), 48);
-        assert_eq!(std::mem::offset_of!(ManifestEntry, checksum), 56);
 
-        // cache line 2: filename
-        assert_eq!(std::mem::offset_of!(ManifestEntry, filename), 64);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, filename), 56);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, _pad3), 120);
+        assert_eq!(std::mem::offset_of!(ManifestEntry, checksum), 124);
     }
 
     #[test]
@@ -144,20 +157,20 @@ mod tests {
         let mut entry = ManifestEntry::zeroed();
         entry.file_seq = 5;
         entry.set_filename("test.ls");
-        unsafe { entry.compute_checksum(); }
+        entry.fill_checksum();
 
         assert_ne!(entry.checksum, 0);
-        assert!(unsafe { entry.verify_checksum() });
+        assert!(entry.verify_checksum());
     }
 
     #[test]
     fn checksum_detects_corruption() {
         let mut entry = ManifestEntry::zeroed();
         entry.file_seq = 5;
-        unsafe { entry.compute_checksum(); }
+        entry.fill_checksum();
 
         entry.file_seq = 999;
-        assert!(!unsafe { entry.verify_checksum() });
+        assert!(!entry.verify_checksum());
     }
 
     #[test]

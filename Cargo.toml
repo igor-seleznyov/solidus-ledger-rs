@@ -3,6 +3,9 @@ name = "solidus-ledger-rs"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [workspace]
 members = [
     "crates/common",
@@ -18,13 +21,18 @@ members = [
 
 [workspace.dependencies]
 mio = { version = "1.1.1", features = ["os-poll", "os-ext", "net"]}
-libc = { version = "0.2.183" }
-uuid = { version = "1.22.0", features = ["serde"] }
-io-uring = "0.7.11"
-ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
-sha2 = "0.10.9"
-chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
+libc = { version = "0.2.186" }
+uuid = { version = "1.23.4", features = ["serde"] }
+io-uring = "0.7.13"
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+sha2 = "0.11.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 thiserror = "2.0.18"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+large_stack_arrays = "warn"
+large_stack_frames = "warn"
 
 [dependencies]
 mio.workspace = true

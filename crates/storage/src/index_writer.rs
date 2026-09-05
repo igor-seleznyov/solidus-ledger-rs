@@ -40,7 +40,7 @@ fn write_posting_accounts_file(
         file_seq,
     );
     file.write_all(
-        unsafe { header.as_bytes() }
+        header.as_bytes()
     ).expect("Failed to write posting-accounts header");
 
     if !idx_records.is_empty() {
@@ -79,7 +79,7 @@ fn write_ordinal_file(
         file_seq,
     );
     file.write_all(
-        unsafe { header.as_bytes() }
+        header.as_bytes()
     ).expect("Failed to write ordinal header");
 
     for &(hi, lo) in sorted_keys {
@@ -133,7 +133,7 @@ fn write_timestamp_file(
         file_seq,
     );
     file.write_all(
-        unsafe { header.as_bytes() }
+        header.as_bytes()
     ).expect("Failed to write timestamp header");
 
     for &(hi, lo) in sorted_keys {
@@ -190,15 +190,13 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Helper: builds the minimal test data — three accounts, five postings.
     fn make_test_data() -> (
         Vec<AccountIndexRecord>,
         Vec<(u64, u64)>,
         Vec<IndexBufferEntry>,
         HashMap<(u64, u64), AccountMeta>,
     ) {
-        // account (0,1): 2 postings
-        // account (0,2): 1 posting
-        // account (0,3): 2 postings
 
         let sorted_keys = vec![(0u64, 1u64), (0, 2), (0, 3)];
 
@@ -208,12 +206,9 @@ mod tests {
         accounts.insert((0, 3), AccountMeta { start: 3, count: 2, cursor: 2 });
 
         let buffer = vec![
-            // account (0,1): ordinal 1,0 (unsorted) timestamp 2000,1000
             IndexBufferEntry { account_id_hi: 0, account_id_lo: 1, ordinal: 1, timestamp_ns: 2000, ls_offset: 4224 },
             IndexBufferEntry { account_id_hi: 0, account_id_lo: 1, ordinal: 0, timestamp_ns: 1000, ls_offset: 4096 },
-            // account (0,2): ordinal 0, timestamp 1500
             IndexBufferEntry { account_id_hi: 0, account_id_lo: 2, ordinal: 0, timestamp_ns: 1500, ls_offset: 4352 },
-            // account (0,3): ordinal 1,0 (unsorted) timestamp 3000,500
             IndexBufferEntry { account_id_hi: 0, account_id_lo: 3, ordinal: 1, timestamp_ns: 3000, ls_offset: 4608 },
             IndexBufferEntry { account_id_hi: 0, account_id_lo: 3, ordinal: 0, timestamp_ns: 500, ls_offset: 4480 },
         ];
@@ -280,11 +275,9 @@ mod tests {
         let magic = u64::from_le_bytes(data[0..8].try_into().unwrap());
         assert_eq!(magic, INDEX_MAGIC_ACCOUNTS);
 
-        // entries_count at offset 12
         let entries_count = u32::from_le_bytes(data[12..16].try_into().unwrap());
-        assert_eq!(entries_count, 3); // 3 accounts
+        assert_eq!(entries_count, 3);
 
-        // linked_ls_file_seq at offset 16
         let linked_seq = u64::from_le_bytes(data[16..24].try_into().unwrap());
         assert_eq!(linked_seq, 7);
 
@@ -302,7 +295,6 @@ mod tests {
         let path = format!("{}.posting-accounts", ls_path);
         let data = std::fs::read(&path).unwrap();
 
-        // Header (64) + 3 records × 40 bytes = 184
         assert_eq!(data.len(), IndexFileHeader::SIZE + 3 * AccountIndexRecord::SIZE);
 
         cleanup(&dir);
@@ -355,7 +347,7 @@ mod tests {
         assert_eq!(magic, INDEX_MAGIC_ORDINAL);
 
         let entries_count = u32::from_le_bytes(data[12..16].try_into().unwrap());
-        assert_eq!(entries_count, 5); // 2+1+2 = 5 total postings
+        assert_eq!(entries_count, 5);
 
         cleanup(&dir);
     }
@@ -371,7 +363,6 @@ mod tests {
         let path = format!("{}.ordinal", ls_path);
         let data = std::fs::read(&path).unwrap();
 
-        // Header (64) + 5 entries × 16 bytes = 144
         assert_eq!(data.len(), IndexFileHeader::SIZE + 5 * OrdinalIndexEntry::SIZE);
 
         cleanup(&dir);
@@ -383,13 +374,11 @@ mod tests {
         let ls_path = format!("{}/test.ls", dir);
 
         let (idx_records, sorted_keys, mut buffer, accounts) = make_test_data();
-        // buffer has account (0,1): ordinal 1,0 (unsorted!)
         write_index_files(&ls_path, 0, &idx_records, &sorted_keys, &mut buffer, &accounts);
 
         let path = format!("{}.ordinal", ls_path);
         let data = std::fs::read(&path).unwrap();
 
-        // Account (0,1): 2 entries starting at offset = header_size
         let offset = IndexFileHeader::SIZE;
 
         let ordinal_0 = u64::from_le_bytes(
@@ -411,13 +400,11 @@ mod tests {
         let ls_path = format!("{}/test.ls", dir);
 
         let (idx_records, sorted_keys, mut buffer, accounts) = make_test_data();
-        // buffer has account (0,3): timestamp 3000,500 (unsorted!)
         write_index_files(&ls_path, 0, &idx_records, &sorted_keys, &mut buffer, &accounts);
 
         let path = format!("{}.timestamp", ls_path);
         let data = std::fs::read(&path).unwrap();
 
-        // Account (0,3): 2 entries starting at offset = header + 3 * 16 (after accounts 1 and 2)
         let offset = IndexFileHeader::SIZE + 3 * TimestampIndexEntry::SIZE;
 
         let ts_0 = u64::from_le_bytes(
@@ -459,8 +446,6 @@ mod tests {
         let ls_path = format!("{}/test.ls", dir);
 
         let (idx_records, sorted_keys, mut buffer, accounts) = make_test_data();
-        // account (0,1): buffer has (ord=1, off=4224), (ord=0, off=4096)
-        // After sort by ordinal: (ord=0, off=4096), (ord=1, off=4224)
         write_index_files(&ls_path, 0, &idx_records, &sorted_keys, &mut buffer, &accounts);
 
         let path = format!("{}.ordinal", ls_path);
@@ -468,13 +453,11 @@ mod tests {
 
         let offset = IndexFileHeader::SIZE;
 
-        // entry 0: ordinal=0, ls_offset=4096
         let ls_off_0 = u64::from_le_bytes(
             data[offset + 8..offset + 16].try_into().unwrap()
         );
         assert_eq!(ls_off_0, 4096);
 
-        // entry 1: ordinal=1, ls_offset=4224
         let ls_off_1 = u64::from_le_bytes(
             data[offset + 24..offset + 32].try_into().unwrap()
         );

@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use ringbuf::mpsc_ring_buffer::MpscRingBuffer;
 use storage::ls_writer::LsWriter;
@@ -19,8 +20,8 @@ use storage::index_builder::AccountMeta;
 use storage::index_writer::write_index_files;
 
 
-const K0: u64 = 0x0123456789ABCDEF;
-const K1: u64 = 0xFEDCBA9876543210;
+const IN_FLIGHT_MIN_HEAP_SEED_K0: u64 = 0x0123456789ABCDEF;
+const IN_FLIGHT_MIN_HEAP_SEED_K1: u64 = 0xFEDCBA9876543210;
 
 static mut TEST_COMMITTED_GSN: u64 = 0;
 
@@ -38,17 +39,51 @@ fn cleanup(dir: &str) {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// How much room the tests give the writer by default.
+///
+/// One completion is published per posting, and a claim that finds the
+/// flush-done ring full waits for a consumer rather than failing — which is
+/// right in the running system, where a consumer exists, and fatal in a test
+/// that supplies none. Every test below drives at most 180 postings, so a
+/// ring of this size never fills and the wait is never entered.
+///
+/// The in-flight heap is sized to match rather than left smaller: a heap
+/// that overflows does not stop the run, it declines the excess and prints
+/// a warning, so a test standing on a small heap goes green while most of
+/// what it handed over was never taken.
+const ROOMY_FLUSH_DONE_CAPACITY: usize = 256;
+const ROOMY_IN_FLIGHT_MIN_HEAP_CAPACITY: usize = 256;
+
 fn make_writer(
     dir: &str,
     max_ls_file_size: usize,
     index_tx: mpsc::Sender<IndexBuilderTask>,
-) -> LsWriter<PortableFlushBackend, NoSigningStrategy, NoMetadataStrategy> {
-    let ls_writer_rb = Arc::new(
-        MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()
-    );
-    let flush_done_rb = Arc::new(
-        MpscRingBuffer::<FlushDoneSlot>::new(64).unwrap()
-    );
+) -> LsWriter<'static, PortableFlushBackend, NoSigningStrategy, NoMetadataStrategy> {
+    make_writer_with_capacities(
+        dir,
+        max_ls_file_size,
+        index_tx,
+        ROOMY_FLUSH_DONE_CAPACITY,
+        ROOMY_IN_FLIGHT_MIN_HEAP_CAPACITY,
+    ).0
+}
+
+/// Builds a writer with the room it is given, and hands back the flush-done
+/// ring alongside it so a test can play the consumer the running system has.
+fn make_writer_with_capacities(
+    dir: &str,
+    max_ls_file_size: usize,
+    index_tx: mpsc::Sender<IndexBuilderTask>,
+    flush_done_capacity: usize,
+    in_flight_min_heap_capacity: usize,
+) -> (
+    LsWriter<'static, PortableFlushBackend, NoSigningStrategy, NoMetadataStrategy>,
+    &'static MpscRingBuffer<FlushDoneSlot>,
+) {
+    let ls_writer_rb: &'static MpscRingBuffer<LsWriterSlot> =
+        Box::leak(Box::new(MpscRingBuffer::<LsWriterSlot>::new(64).unwrap()));
+    let flush_done_rb: &'static MpscRingBuffer<FlushDoneSlot> =
+        Box::leak(Box::new(MpscRingBuffer::<FlushDoneSlot>::new(flush_done_capacity).unwrap()));
 
     unsafe { TEST_COMMITTED_GSN = 0; }
     let committed_gsn_ptr = unsafe { &raw mut TEST_COMMITTED_GSN };
@@ -67,7 +102,7 @@ fn make_writer(
         NoMetadataStrategy,
         dir.to_string(),
         max_ls_file_size,
-        64, K0, K1,
+        in_flight_min_heap_capacity, IN_FLIGHT_MIN_HEAP_SEED_K0, IN_FLIGHT_MIN_HEAP_SEED_K1,
         64, 2, 512,
         16,
         4,
@@ -77,7 +112,7 @@ fn make_writer(
         index_tx,
     );
     writer.startup();
-    writer
+    (writer, flush_done_rb)
 }
 
 fn make_posting_slot(
@@ -124,7 +159,7 @@ fn make_flush_marker_slot(gsn: u64, transfer_id_lo: u64, tht_offset: u32) -> LsW
 /// Helper: write postings, flush, rotate, drain channel, build indices synchronously.
 /// Returns (ls_path_before_rotation, task).
 fn write_flush_rotate_build(
-    writer: &mut LsWriter<PortableFlushBackend, NoSigningStrategy, NoMetadataStrategy>,
+    writer: &mut LsWriter<'static, PortableFlushBackend, NoSigningStrategy, NoMetadataStrategy>,
     index_rx: &mpsc::Receiver<IndexBuilderTask>,
     postings: &Vec<LsWriterSlot>,
 ) -> String {
@@ -145,14 +180,10 @@ fn write_flush_rotate_build(
 
     writer.rotate();
 
-    // Drain channel and build indices synchronously (approach C)
     let task = index_rx.recv().expect("Expected index builder task");
 
     let builder_rx_dummy = mpsc::channel::<IndexBuilderTask>();
     let builder = IndexBuilder::new(0, builder_rx_dummy.1, None);
-    // Call build_indices directly — we need to make it pub for this
-    // Alternative: re-implement the build logic in test
-    // For now: use the entries from task to build via index_writer
     {
         if !task.entries.is_empty() {
             let total_count = task.entries.len();
@@ -272,8 +303,102 @@ fn lookup_account_after_rotation() {
     assert!(result.is_some());
     assert_eq!(result.unwrap().records_count, 1);
 
-    // Not found
     assert!(lookup_account(&idx_path, 0, 99).is_none());
+
+    cleanup(&dir);
+}
+
+/// The other regime: a flush-done ring too small for the batch, with the
+/// consumer the running system always has.
+///
+/// The roomy tests above deliberately never fill the ring, so nothing there
+/// reaches the producer's wait for room. That wait is the interesting part:
+/// a producer takes its turn before it checks for room, so a turn it has
+/// taken cannot be handed back, and waiting is the only thing left to do.
+/// The wait is correct exactly as long as somebody drains — which is what
+/// this test supplies and what the roomy tests, by construction, do not
+/// exercise at all.
+///
+/// The consumer stops on a flag rather than on a count, and sweeps the ring
+/// once more after seeing it. Ordering the flag against the completions is
+/// what makes the sweep sufficient: the flag is stored after the last
+/// publication and read before the sweep, so a consumer that sees the flag
+/// sees every completion published before it.
+#[test]
+fn a_full_flush_done_ring_makes_the_writer_wait_for_its_consumer() {
+    const POSTING_COUNT: u64 = 100;
+    const CRAMPED_FLUSH_DONE_CAPACITY: usize = 64;
+
+    let dir = make_temp_dir("flush-done-backpressure");
+    let (index_tx, _index_rx) = mpsc::channel();
+    let (mut writer, flush_done_rb) = make_writer_with_capacities(
+        &dir,
+        1024 * 1024,
+        index_tx,
+        CRAMPED_FLUSH_DONE_CAPACITY,
+        ROOMY_IN_FLIGHT_MIN_HEAP_CAPACITY,
+    );
+
+    assert!(
+        (POSTING_COUNT as usize) > CRAMPED_FLUSH_DONE_CAPACITY,
+        "the batch must outgrow the ring, or the wait is never entered",
+    );
+
+    let producer_finished = Arc::new(AtomicBool::new(false));
+    let completions_taken = Arc::new(AtomicUsize::new(0));
+
+    let consumer = thread::spawn({
+        let producer_finished = Arc::clone(&producer_finished);
+        let completions_taken = Arc::clone(&completions_taken);
+        move || {
+            thread::sleep(std::time::Duration::from_millis(50));
+
+            loop {
+                match flush_done_rb.try_read() {
+                    Some(slot) => {
+                        slot.release();
+                        completions_taken.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => {
+                        if producer_finished.load(Ordering::Acquire) {
+                            while let Some(slot) = flush_done_rb.try_read() {
+                                slot.release();
+                                completions_taken.fetch_add(1, Ordering::Relaxed);
+                            }
+                            break;
+                        }
+                        thread::yield_now();
+                    }
+                }
+            }
+        }
+    });
+
+    for gsn in 0..POSTING_COUNT {
+        let posting = make_posting_slot(
+            100 + gsn,
+            (gsn + 1) as i64 * 100,
+            0,
+            gsn + 1,
+            0,
+            1_000_000_000 + gsn * 1000,
+        );
+        writer.process_message(&make_add_to_heap_slot(posting.gsn));
+        writer.process_message(&posting);
+        writer.process_message(&make_flush_marker_slot(posting.gsn, posting.gsn, 0));
+    }
+
+    writer.submit_flush();
+    writer.poll_and_handle_completions();
+
+    producer_finished.store(true, Ordering::Release);
+    consumer.join().expect("the draining thread must not panic");
+
+    assert_eq!(
+        completions_taken.load(Ordering::Relaxed),
+        POSTING_COUNT as usize,
+        "every posting owes exactly one completion, and none may be lost to the wait",
+    );
 
     cleanup(&dir);
 }
@@ -287,26 +412,24 @@ fn lookup_100_accounts() {
     let mut postings = Vec::new();
     for i in 0..100u64 {
         postings.push(make_posting_slot(
-            100 + i,         // gsn
-            (i + 1) as i64 * 100,  // amount
-            0,               // account_hi
-            i + 1,           // account_lo (1..100)
-            0,               // ordinal
-            1_000_000_000 + i * 1000,  // timestamp
+            100 + i,
+            (i + 1) as i64 * 100,
+            0,
+            i + 1,
+            0,
+            1_000_000_000 + i * 1000,
         ));
     }
 
     let ls_path = write_flush_rotate_build(&mut writer, &index_rx, &postings);
     let idx_path = format!("{}.posting-accounts", ls_path);
 
-    // Lookup every account
     for i in 0..100u64 {
         let result = lookup_account(&idx_path, 0, i + 1);
         assert!(result.is_some(), "Account {} not found", i + 1);
         assert_eq!(result.unwrap().records_count, 1);
     }
 
-    // Not found
     assert!(lookup_account(&idx_path, 0, 0).is_none());
     assert!(lookup_account(&idx_path, 0, 101).is_none());
 
@@ -319,7 +442,6 @@ fn timestamp_range_query_after_rotation() {
     let (index_tx, index_rx) = mpsc::channel();
     let mut writer = make_writer(&dir, 1024 * 1024, index_tx);
 
-    // Account 1: 5 postings with different timestamps
     let postings = vec![
         make_posting_slot(100, 100, 0, 1, 0, 1000),
         make_posting_slot(101, 200, 0, 1, 1, 2000),
@@ -336,19 +458,16 @@ fn timestamp_range_query_after_rotation() {
     let result = lookup_account(&idx_path, 0, 1).unwrap();
     assert_eq!(result.records_count, 5);
 
-    // Full range
     let offsets = query_timestamp_range(
         &ts_path, result.timestamp_file_offset, result.records_count, 1000, 5000,
     );
     assert_eq!(offsets.len(), 5);
 
-    // Partial range: 2000..4000
     let offsets = query_timestamp_range(
         &ts_path, result.timestamp_file_offset, result.records_count, 2000, 4000,
     );
     assert_eq!(offsets.len(), 3);
 
-    // No match: 6000..9000
     let offsets = query_timestamp_range(
         &ts_path, result.timestamp_file_offset, result.records_count, 6000, 9000,
     );
@@ -363,7 +482,6 @@ fn ordinal_range_query_after_rotation() {
     let (index_tx, index_rx) = mpsc::channel();
     let mut writer = make_writer(&dir, 1024 * 1024, index_tx);
 
-    // Account 1: 5 postings
     let postings = vec![
         make_posting_slot(100, 100, 0, 1, 0, 1000),
         make_posting_slot(101, 200, 0, 1, 1, 2000),
@@ -379,13 +497,11 @@ fn ordinal_range_query_after_rotation() {
 
     let result = lookup_account(&idx_path, 0, 1).unwrap();
 
-    // Ordinal range 1..3
     let offsets = query_ordinal_range(
         &ord_path, result.ordinal_file_offset, result.records_count, 1, 3,
     );
     assert_eq!(offsets.len(), 3);
 
-    // Full range
     let offsets = query_ordinal_range(
         &ord_path, result.ordinal_file_offset, result.records_count, 0, 4,
     );
@@ -400,7 +516,6 @@ fn multiple_accounts_with_many_postings() {
     let (index_tx, index_rx) = mpsc::channel();
     let mut writer = make_writer(&dir, 1024 * 1024, index_tx);
 
-    // 3 accounts: account 1 = 100 postings, account 2 = 50 postings, account 3 = 30 postings
     let mut postings = Vec::new();
     let mut gsn = 100u64;
 
@@ -423,33 +538,27 @@ fn multiple_accounts_with_many_postings() {
     let ts_path = format!("{}.timestamp", ls_path);
     let ord_path = format!("{}.ordinal", ls_path);
 
-    // Account 1: 100 postings
     let r1 = lookup_account(&idx_path, 0, 1).unwrap();
     assert_eq!(r1.records_count, 100);
 
-    // Account 2: 50 postings
     let r2 = lookup_account(&idx_path, 0, 2).unwrap();
     assert_eq!(r2.records_count, 50);
 
-    // Account 3: 30 postings
     let r3 = lookup_account(&idx_path, 0, 3).unwrap();
     assert_eq!(r3.records_count, 30);
 
-    // Timestamp range: account 1, first 10
     let offsets = query_timestamp_range(
         &ts_path, r1.timestamp_file_offset, r1.records_count,
         1_000_000, 1_009_000,
     );
     assert_eq!(offsets.len(), 10);
 
-    // Ordinal range: account 2, ordinals 20..39
     let offsets = query_ordinal_range(
         &ord_path, r2.ordinal_file_offset, r2.records_count,
         20, 39,
     );
     assert_eq!(offsets.len(), 20);
 
-    // All ordinals account 3
     let offsets = query_ordinal_range(
         &ord_path, r3.ordinal_file_offset, r3.records_count,
         0, 29,
@@ -484,13 +593,11 @@ fn index_builder_thread_builds_files() {
     let (index_tx, index_rx) = mpsc::channel();
     let mut writer = make_writer(&dir, 1024 * 1024, index_tx);
 
-    // Spawn real Index Builder thread
     let builder_handle = thread::spawn(move || {
         let builder = IndexBuilder::new(0, index_rx, None);
         builder.run();
     });
 
-    // Write postings and rotate
     let postings = vec![
         make_posting_slot(100, 500, 0, 1, 0, 1_000_000_000),
         make_posting_slot(101, 300, 0, 2, 0, 1_000_001_000),
@@ -508,13 +615,10 @@ fn index_builder_thread_builds_files() {
     let ls_path = writer.current_ls_file_path().to_string();
     writer.rotate();
 
-    // Drop writer → drops index_tx → Index Builder thread exits after processing
     drop(writer);
 
-    // Wait for thread to finish (it will process task then exit on channel close)
     builder_handle.join().expect("Index Builder thread panicked");
 
-    // Verify files exist
     assert!(
         std::path::Path::new(&format!("{}.posting-accounts", ls_path)).exists(),
         ".posting-accounts not found"
@@ -528,7 +632,6 @@ fn index_builder_thread_builds_files() {
         ".timestamp not found"
     );
 
-    // Verify lookup works
     let idx_path = format!("{}.posting-accounts", ls_path);
     let r1 = lookup_account(&idx_path, 0, 1);
     assert!(r1.is_some(), "Account 1 not found after thread build");

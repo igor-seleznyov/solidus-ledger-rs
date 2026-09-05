@@ -100,7 +100,7 @@ impl SigningState {
 
         record.set_magic();
 
-        unsafe { record.compute_checksum(); }
+        record.fill_checksum();
 
         record
     }
@@ -151,7 +151,7 @@ impl SigningState {
         record.postings_hash = postings_hash;
         record.signature = signature_bytes;
 
-        unsafe { record.compute_checksum(); }
+        record.fill_checksum();
 
         record
     }
@@ -239,9 +239,7 @@ mod tests {
         assert_ne!(record.signature, [0u8; 64]);
         assert_ne!(record.postings_hash, [0u8; 32]);
 
-        unsafe {
-            assert!(record.verify_checksum());
-        }
+        assert!(record.verify_checksum());
     }
 
     #[test]

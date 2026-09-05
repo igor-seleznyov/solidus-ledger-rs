@@ -7,10 +7,9 @@ pub const MSG_TYPE_PREPARE: u8 = 1;
 pub const MSG_TYPE_COMMIT: u8 = 2;
 pub const MSG_TYPE_ROLLBACK: u8 = 3;
 
-#[repr(C, align(64))]
+#[repr(C, align(8))]
 #[derive(Copy, Clone)]
 pub struct PartitionSlot {
-    pub sequence: u64,
     pub gsn: u64,
     pub transfer_id: [u8; 16],
     pub account_id: [u8; 16],
@@ -22,20 +21,11 @@ pub struct PartitionSlot {
     pub transfer_hash_table_offset: u32,
 }
 
-unsafe impl Slot for PartitionSlot {
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    fn set_sequence(&mut self, seq: u64) {
-        self.sequence = seq;
-    }
-}
+impl Slot for PartitionSlot {}
 
 impl PartitionSlot {
     pub fn zeroed() -> Self {
         Self {
-            sequence: 0,
             gsn: 0,
             transfer_id: [0u8; 16],
             account_id: [0u8; 16],
@@ -55,53 +45,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn size_is_64_bytes() {
+    fn size_is_56_bytes() {
         assert_eq!(
-            std::mem::size_of::<PartitionSlot>(), 64,
-            "PartitionSlot must be exactly 64 bytes (1 cache line)"
+            std::mem::size_of::<PartitionSlot>(), 56,
+            "the payload fills one cache line less the ring's own cell"
         );
     }
 
+    /// The payload aligns to eight, not to a cache line.
+    ///
+    /// The cache-line alignment moved to the ring's container along with
+    /// the publication cell. A payload demanding 64 here would push its own
+    /// start past the container's fixed payload offset of 8 and silently
+    /// break every reader that computes that offset once, which is why the
+    /// container asserts the limit rather than trusting it.
     #[test]
-    fn alignment_is_64() {
-        assert_eq!(
-            std::mem::align_of::<PartitionSlot>(), 64,
-            "PartitionSlot must be cache-line aligned"
-        );
+    fn alignment_is_8() {
+        assert_eq!(std::mem::align_of::<PartitionSlot>(), 8);
     }
 
+    /// What the old `align(64)` on this type was really protecting: one
+    /// message still occupies exactly one cache line inside the ring,
+    /// starting on a cache-line boundary.
     #[test]
-    fn sequence_at_offset_zero() {
-        assert_eq!(
-            std::mem::offset_of!(PartitionSlot, sequence), 0,
-            "sequence must be at offset 0 (Slot trait contract)"
-        );
+    fn composes_into_one_cache_line_inside_the_ring() {
+        type Slot = ringbuf::slot::RbSlot<PartitionSlot>;
+        assert_eq!(std::mem::size_of::<Slot>(), 64);
+        assert_eq!(std::mem::align_of::<Slot>(), 64);
+        assert_eq!(Slot::PAYLOAD_OFFSET, 8);
     }
+
 
     #[test]
     fn field_offsets() {
-        assert_eq!(std::mem::offset_of!(PartitionSlot, gsn), 8);
-        assert_eq!(std::mem::offset_of!(PartitionSlot, transfer_id), 16);
-        assert_eq!(std::mem::offset_of!(PartitionSlot, account_id), 32);
-        assert_eq!(std::mem::offset_of!(PartitionSlot, amount), 48);
-        assert_eq!(std::mem::offset_of!(PartitionSlot, entry_type), 56);
-        assert_eq!(std::mem::offset_of!(PartitionSlot, msg_type), 57);
-        assert_eq!(std::mem::offset_of!(PartitionSlot, shard_id), 58);
-        assert_eq!(std::mem::offset_of!(PartitionSlot, entry_index), 59);
-        assert_eq!(std::mem::offset_of!(PartitionSlot, transfer_hash_table_offset), 60);
+        assert_eq!(std::mem::offset_of!(PartitionSlot, gsn), 0);
+        assert_eq!(std::mem::offset_of!(PartitionSlot, transfer_id), 8);
+        assert_eq!(std::mem::offset_of!(PartitionSlot, account_id), 24);
+        assert_eq!(std::mem::offset_of!(PartitionSlot, amount), 40);
+        assert_eq!(std::mem::offset_of!(PartitionSlot, entry_type), 48);
+        assert_eq!(std::mem::offset_of!(PartitionSlot, msg_type), 49);
+        assert_eq!(std::mem::offset_of!(PartitionSlot, shard_id), 50);
+        assert_eq!(std::mem::offset_of!(PartitionSlot, entry_index), 51);
+        assert_eq!(std::mem::offset_of!(PartitionSlot, transfer_hash_table_offset), 52);
     }
 
-    #[test]
-    fn slot_trait_set_and_get_sequence() {
-        let mut slot = PartitionSlot::zeroed();
-        slot.set_sequence(42);
-        assert_eq!(slot.sequence(), 42);
-    }
 
     #[test]
     fn zeroed_all_fields_zero() {
         let slot = PartitionSlot::zeroed();
-        assert_eq!(slot.sequence, 0);
         assert_eq!(slot.gsn, 0);
         assert_eq!(slot.transfer_id, [0u8; 16]);
         assert_eq!(slot.account_id, [0u8; 16]);

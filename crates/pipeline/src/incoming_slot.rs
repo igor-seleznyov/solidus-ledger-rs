@@ -1,9 +1,8 @@
 use ringbuf::slot::Slot;
 
-#[repr(C, align(64))]
+#[repr(C, align(8))]
 #[derive(Clone, Copy, Debug)]
 pub struct IncomingSlot {
-    pub sequence: u64,
     pub batch_id: [u8; 16],
     pub connection_id: u64,
     pub transfer_id: [u8; 16],
@@ -14,23 +13,14 @@ pub struct IncomingSlot {
     pub currency: [u8; 16],
     pub transfer_sequence_id: [u8; 16],
     pub transfer_datetime: [u8; 8],
-    pub _padding: [u8; 40],
+    pub _padding: [u8; 48],
 }
 
-unsafe impl Slot for IncomingSlot {
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    fn set_sequence(&mut self, seq: u64) {
-        self.sequence = seq;
-    }
-}
+impl Slot for IncomingSlot {}
 
 impl IncomingSlot {
     pub fn zeroed() -> Self {
         Self {
-            sequence: 0,
             batch_id: [0u8; 16],
             connection_id: 0,
             transfer_id: [0u8; 16],
@@ -41,7 +31,7 @@ impl IncomingSlot {
             currency: [0u8; 16],
             transfer_sequence_id: [0u8; 16],
             transfer_datetime: [0u8; 8],
-            _padding: [0u8; 40],
+            _padding: [0u8; 48],
         }
     }
 }
@@ -51,33 +41,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn size_is_192_bytes() {
+    fn size_is_184_bytes() {
         assert_eq!(
-            std::mem::size_of::<IncomingSlot>(), 192,
-            "IncomingSlot must be exactly 192 bytes (3 cache lines)"
+            std::mem::size_of::<IncomingSlot>(), 184,
+            "the payload fills three cache lines less the ring's own cell"
         );
     }
 
+    /// The payload aligns to eight, not to a cache line.
+    ///
+    /// The cache-line alignment moved to the ring's container along with
+    /// the publication cell. A payload demanding 64 here would push its own
+    /// start past the container's fixed payload offset of 8 and silently
+    /// break every reader that computes that offset once, which is why the
+    /// container asserts the limit rather than trusting it.
     #[test]
-    fn alignment_is_64() {
+    fn alignment_is_8() {
         assert_eq!(
-            std::mem::align_of::<IncomingSlot>(), 64,
-            "IncomingSlot must be cache-line aligned (64 bytes)"
+            std::mem::align_of::<IncomingSlot>(), 8
         );
     }
 
+    /// What the old `align(64)` on this type was really protecting: one
+    /// message still occupies exactly three cache lines inside the ring,
+    /// starting on a cache-line boundary.
     #[test]
-    fn sequence_at_offset_zero() {
-        assert_eq!(
-            std::mem::offset_of!(IncomingSlot, sequence), 0,
-            "sequence must be at offset 0 (Slot trait contract)"
-        );
+    fn composes_into_three_cache_lines_inside_the_ring() {
+        type Slot = ringbuf::slot::RbSlot<IncomingSlot>;
+        assert_eq!(std::mem::size_of::<Slot>(), 192);
+        assert_eq!(std::mem::align_of::<Slot>(), 64);
+        assert_eq!(Slot::PAYLOAD_OFFSET, 8);
     }
+
 
     #[test]
     fn zeroed_all_fields_zero() {
         let slot = IncomingSlot::zeroed();
-        assert_eq!(slot.sequence, 0);
         assert_eq!(slot.batch_id, [0u8; 16]);
         assert_eq!(slot.connection_id, 0);
         assert_eq!(slot.transfer_id, [0u8; 16]);
@@ -90,27 +89,11 @@ mod tests {
         assert_eq!(slot.transfer_datetime, [0u8; 8]);
     }
 
-    #[test]
-    fn slot_trait_set_and_get_sequence() {
-        let mut slot = IncomingSlot::zeroed();
-        slot.set_sequence(42);
-        assert_eq!(slot.sequence(), 42);
-        assert_eq!(slot.sequence, 42);
-    }
+
 
     #[test]
-    fn slot_trait_sequence_does_not_affect_other_fields() {
-        let mut slot = IncomingSlot::zeroed();
-        slot.amount = [0, 0, 0, 0, 0, 0, 0x03, 0xE8];
-        slot.connection_id = 7;
-        slot.set_sequence(99);
-        slot.amount = [0, 0, 0, 0, 0, 0, 0x03, 0xE8];
-        assert_eq!(slot.connection_id, 7);
-    }
-
-    #[test]
-    fn transfer_fields_start_at_offset_32() {
-        assert_eq!(std::mem::offset_of!(IncomingSlot, transfer_id), 32);
+    fn transfer_fields_start_at_offset_24() {
+        assert_eq!(std::mem::offset_of!(IncomingSlot, transfer_id), 24);
     }
 
     #[test]
